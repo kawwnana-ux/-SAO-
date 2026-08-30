@@ -19,18 +19,39 @@ import glob
 
 _ja_ginza_dir = os.path.dirname(ja_ginza.__file__)
 
-config_candidates = glob.glob(os.path.join(_ja_ginza_dir, "ja_ginza-*", "config.cfg"))
-if config_candidates:
-    config_path = config_candidates[0]
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_text = f.read()
-    if "split_mode = null" in config_text:
-        config_text = config_text.replace('split_mode = null', 'split_mode = "C"')
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write(config_text)
-
 model_candidates = glob.glob(os.path.join(_ja_ginza_dir, "ja_ginza-*"))
 model_path = [p for p in model_candidates if not p.endswith(".cfg")][0]
+config_path = os.path.join(model_path, "config.cfg")
+
+
+def _fix_split_mode(cfg_path):
+    """config.cfg の split_mode = null を "C" に書き換える。戻り値: 成功したか"""
+    if not os.path.exists(cfg_path):
+        return True
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        config_text = f.read()
+    if "split_mode = null" not in config_text:
+        return True
+    config_text = config_text.replace('split_mode = null', 'split_mode = "C"')
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        f.write(config_text)
+    return True
+
+
+try:
+    _fix_split_mode(config_path)
+except (OSError, PermissionError):
+    # Streamlit Cloud等、インストール済みパッケージのファイルが
+    # 読み取り専用になっている環境向けの保険。
+    # 書き込み可能な場所（/tmp）にモデル一式をコピーしてから書き換える。
+    import shutil
+    writable_model_path = "/tmp/ja_ginza_model_copy"
+    if not os.path.exists(writable_model_path):
+        shutil.copytree(model_path, writable_model_path)
+    model_path = writable_model_path
+    config_path = os.path.join(model_path, "config.cfg")
+    _fix_split_mode(config_path)
+
 nlp = spacy.load(model_path)
 print("GiNZAの読み込みに成功しました！ モデル:", model_path)
 
