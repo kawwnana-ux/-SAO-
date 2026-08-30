@@ -1,0 +1,9 @@
+streamlit
+spacy
+ginza
+ja-ginza
+networkx
+matplotlib
+sentence-transformers
+scipy
+numpy
