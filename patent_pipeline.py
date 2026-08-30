@@ -1454,13 +1454,17 @@ def extract_has_relations(doc, components):
         # 「Ｘは」を拾ってしまう問題を避けられる）。
         # ただし、本当にこの動詞の直前で終わる列挙でなければ
         # 意味がないので、一番近い列挙項目が動詞からそれほど
-        # 離れていない場合だけ採用する
+        # 離れていない場合だけ「最優先」として採用する
         # （そうしないと、文中の別の場所にあるたまたま「と」付きの
         # 語まで全部拾ってしまう）。
-        early_list_targets = [
+        # なお、この距離判定は①の優先分岐だけに使い、後段の
+        # 通常のリスト列挙判定（③）には影響させない
+        # （変数を分けて持つ）。
+        all_list_targets = [
             c for c in components
             if c["end"] < verb.i and _is_list_item_component(doc, c)
         ]
+        early_list_targets = list(all_list_targets)
         if early_list_targets:
             nearest_end = max(c["end"] for c in early_list_targets)
             if verb.i - nearest_end > 15:
@@ -1504,7 +1508,7 @@ def extract_has_relations(doc, components):
             # 「Ａと、Ｂと、Ｃと、…を有する」のような並列列挙のパターン用。
             # 直後に「と」が付くリスト項目だけを対象にする
             # （そうしないと、文中の無関係な名詞まで全部拾ってしまうため）。
-            targets = early_list_targets if early_list_targets else [c for c in components if c["end"] < verb.i]
+            targets = all_list_targets if all_list_targets else [c for c in components if c["end"] < verb.i]
         else:
             owner = root_component
             if owner is not None:
@@ -1512,7 +1516,7 @@ def extract_has_relations(doc, components):
                 # 並列列挙のパターンに対応する（「…ことを特徴とする」のように
                 # 係り先が「こと」等でhead_componentが見つからない場合に
                 # 特によく起きる）。
-                targets = [c for c in early_list_targets if c["text"] != owner["text"]]
+                targets = [c for c in all_list_targets if c["text"] != owner["text"]]
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
