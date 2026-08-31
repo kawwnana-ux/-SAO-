@@ -1,5 +1,9 @@
 import base64
 import matplotlib.pyplot as plt
+import pandas as pd
+import io
+import re
+from collections import Counter
 import streamlit as st
 
 # Matplotlibの日本語文字化け対策
@@ -24,6 +28,8 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = None
 if "dependent_result" not in st.session_state:
     st.session_state.dependent_result = None
+if "stats_df" not in st.session_state:
+    st.session_state.stats_df = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -136,10 +142,247 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+# ============================================================
+# 特許統計分析用ヘルパー
+# ============================================================
+
+def _find_column(df, aliases):
+    """CSVの列名が多少違っても自動認識する。"""
+    normalized = {
+        str(c).strip().lower().replace(" ", "").replace("　", ""): c
+        for c in df.columns
+    }
+    for alias in aliases:
+        key = str(alias).strip().lower().replace(" ", "").replace("　", "")
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _split_multi_value(value):
+    """出願人・FIなどの複数値を汎用的に分割する。"""
+    if pd.isna(value):
+        return []
+    s = str(value).strip()
+    if not s:
+        return []
+    # 全角/半角の区切り文字、改行を統一
+    s = re.sub(r"[；;、,\n\r]+", "|", s)
+    parts = [x.strip() for x in s.split("|") if x.strip()]
+    return parts
+
+
+def _extract_year(value):
+    """日付、YYYY、YYYY-MM-DD、YYYY/MM/DD等から年を抽出。"""
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    m = re.search(r"(19|20)\d{2}", s)
+    return int(m.group(0)) if m else None
+
+
+def _prepare_stats_df(df):
+    """
+    統計分析に使う列を自動認識する。
+    推奨列:
+      出願日, FI, 出願人
+    英語列にも対応:
+      application_date/date, fi, applicant
+    """
+    df = df.copy()
+
+    date_col = _find_column(df, [
+        "出願日", "出願年月日", "出願日付", "application_date",
+        "filing_date", "filingdate", "date"
+    ])
+    fi_col = _find_column(df, [
+        "FI", "筆頭FI", "FI分類", "FIコード", "fi_code", "fi"
+    ])
+    applicant_col = _find_column(df, [
+        "出願人", "出願人名", "出願人名称", "applicant",
+        "applicants", "applicant_name"
+    ])
+
+    if date_col is None:
+        raise ValueError("「出願日」列が見つかりません。例：出願日 / application_date")
+    if fi_col is None:
+        raise ValueError("「FI」列が見つかりません。例：FI / fi")
+    if applicant_col is None:
+        raise ValueError("「出願人」列が見つかりません。例：出願人 / applicant")
+
+    work = pd.DataFrame({
+        "出願年": df[date_col].apply(_extract_year),
+        "FI原文": df[fi_col],
+        "出願人原文": df[applicant_col],
+    })
+
+    work["筆頭FI"] = work["FI原文"].apply(
+        lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
+    )
+    work["筆頭出願人"] = work["出願人原文"].apply(
+        lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
+    )
+
+    work = work.dropna(subset=["出願年"])
+    work["出願年"] = work["出願年"].astype(int)
+    return work, date_col, fi_col, applicant_col
+
+
+def _make_applicant_fi_table(work):
+    """出願人ごとに、その出願に含まれるFIを集計する。"""
+    rows = []
+    for _, row in work.iterrows():
+        applicants = _split_multi_value(row["出願人原文"])
+        fis = _split_multi_value(row["FI原文"])
+        if not applicants or not fis:
+            continue
+        for applicant in applicants:
+            for fi in fis:
+                rows.append({"出願人": applicant, "FI": fi})
+
+    if not rows:
+        return pd.DataFrame(columns=["出願人", "FI", "件数"])
+
+    tmp = pd.DataFrame(rows)
+    result = (
+        tmp.groupby(["出願人", "FI"])
+        .size()
+        .reset_index(name="件数")
+        .sort_values(["出願人", "件数", "FI"], ascending=[True, False, True])
+    )
+    return result
+
+
+def _show_patent_statistics(df):
+    """4種類の特許統計を表示する。"""
+    try:
+        work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    if work.empty:
+        st.warning("出願年を読み取れるデータがありません。")
+        return
+
+    st.success(
+        f"✅ {len(work):,} 件を分析しました。"
+        f"（出願日: {date_col} / FI: {fi_col} / 出願人: {applicant_col}）"
+    )
+
+    # ① 年別出願件数
+    st.markdown("### 📈 ① 年別出願件数推移")
+    yearly = work.groupby("出願年").size().rename("出願件数").sort_index()
+    st.line_chart(yearly, x_label="出願年", y_label="出願件数")
+    st.dataframe(
+        yearly.reset_index(),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ② 筆頭FIランキング
+    st.markdown("### 🏆 ② 筆頭FIランキング")
+    first_fi = (
+        work.dropna(subset=["筆頭FI"])
+        .groupby("筆頭FI")
+        .size()
+        .reset_index(name="出願件数")
+        .sort_values(["出願件数", "筆頭FI"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
+
+    top_n = st.slider(
+        "表示するランキング件数",
+        min_value=5,
+        max_value=30,
+        value=10,
+        key="stats_top_n"
+    )
+    st.bar_chart(
+        first_fi.head(top_n).set_index("筆頭FI")["出願件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label="筆頭FI"
+    )
+    st.dataframe(first_fi.head(top_n), use_container_width=True, hide_index=True)
+
+    # ③ 筆頭出願人ランキング
+    st.markdown("### 🏢 ③ 筆頭出願人ランキング")
+    first_applicant = (
+        work.dropna(subset=["筆頭出願人"])
+        .groupby("筆頭出願人")
+        .size()
+        .reset_index(name="出願件数")
+        .sort_values(["出願件数", "筆頭出願人"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    first_applicant.insert(0, "順位", range(1, len(first_applicant) + 1))
+
+    st.bar_chart(
+        first_applicant.head(top_n).set_index("筆頭出願人")["出願件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label="筆頭出願人"
+    )
+    st.dataframe(
+        first_applicant.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ④ 出願人別出願FIランキング
+    st.markdown("### 🧩 ④ 出願人別出願FIランキング")
+    applicant_fi = _make_applicant_fi_table(work)
+
+    if applicant_fi.empty:
+        st.info("出願人別FIを集計できるデータがありません。")
+        return
+
+    # 出願人ごとに上位FIを表示
+    applicant_choices = sorted(applicant_fi["出願人"].unique())
+    selected_applicant = st.selectbox(
+        "詳しく見る出願人",
+        applicant_choices,
+        key="stats_selected_applicant"
+    )
+
+    selected = applicant_fi[
+        applicant_fi["出願人"] == selected_applicant
+    ].copy()
+    selected.insert(0, "順位", range(1, len(selected) + 1))
+
+    st.bar_chart(
+        selected.head(top_n).set_index("FI")["件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label="FI"
+    )
+    st.dataframe(
+        selected.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.caption(
+        "※「筆頭FI」「筆頭出願人」は、CSVの該当セルに複数値がある場合、"
+        "先頭に記載されたものを筆頭として集計します。"
+        "「出願人別出願FI」は、同一出願に複数の出願人・FIがある場合、"
+        "それぞれの組合せを1件として集計します。"
+    )
+
+
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索", "🪼 従属請求項を展開"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🪸 1つの請求項を解析",
+    "🐚 2つの請求項を比較",
+    "🔦 まとめて検索",
+    "🪼 従属請求項を展開",
+    "📊 特許統計分析",
+])
 
 
 # ============================================================
@@ -147,16 +390,14 @@ tab1, tab2, tab3, tab4 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つ�
 # ============================================================
 with tab1:
     st.subheader("📝 請求項を入力してください")
-    with st.form("single_form"):
-        text = st.text_area(
-            "請求項テキスト",
-            height=220,
-            placeholder="例：第１の基板と、前記第１の基板上に設けられた第２の半導体層と、前記第２の半導体層に接続された電極と、を有する半導体装置。",
-            key="single_text",
-        )
-        submitted = st.form_submit_button("✨ 解析する", type="primary")
+    text = st.text_area(
+        "請求項テキスト",
+        height=220,
+        placeholder="例：第１の基板と、前記第１の基板上に設けられた第２の半導体層と、前記第２の半導体層に接続された電極と、を有する半導体装置。",
+        key="single_text",
+    )
 
-    if submitted:
+    if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
@@ -555,3 +796,71 @@ with tab4:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+
+# ============================================================
+# タブ⑤：CSVによる特許統計分析
+# ============================================================
+with tab5:
+    st.subheader("📊 CSVから特許出願統計を分析")
+    st.caption(
+        "CSVをアップロードするか、CSV本文を貼り付けるだけで、"
+        "年別出願件数・筆頭FI・筆頭出願人・出願人別FIを集計します。"
+    )
+
+    st.markdown(
+        """
+        **推奨CSV列**
+        - `出願日`：例 `2024-03-15`
+        - `FI`：例 `H01L 21/00; H01L 29/00`
+        - `出願人`：例 `株式会社A;株式会社B`
+
+        英語列 `application_date / fi / applicant` も利用できます。
+        既存のCSVに `id` や `text` など他の列があっても問題ありません。
+        """
+    )
+
+    stats_uploaded_csv = st.file_uploader(
+        "📁 統計分析用CSVをアップロード",
+        type=["csv"],
+        key="stats_csv_upload"
+    )
+
+    stats_csv_text = st.text_area(
+        "またはCSV本文をここに貼り付け",
+        height=180,
+        placeholder=(
+            "出願日,FI,出願人\n"
+            "2022-04-01,H01L 21/00,株式会社A\n"
+            "2023-06-12,H01L 29/00;H01L 21/00,株式会社B;株式会社C\n"
+            "2024-01-20,H10B 12/00,株式会社A"
+        ),
+        key="stats_csv_text"
+    )
+
+    if st.button("📊 統計を分析する", type="primary", key="stats_run"):
+        try:
+            if stats_uploaded_csv is not None:
+                content = stats_uploaded_csv.getvalue().decode("utf-8-sig")
+            elif stats_csv_text.strip():
+                content = stats_csv_text
+            else:
+                st.warning("CSVをアップロードするか、CSV本文を貼り付けてください。")
+                content = None
+
+            if content:
+                stats_df = pd.read_csv(io.StringIO(content))
+                st.session_state.stats_df = stats_df
+        except Exception as e:
+            st.error(f"CSVの読み込みに失敗しました: {e}")
+            st.session_state.stats_df = None
+
+    if st.session_state.stats_df is not None:
+        with st.expander("読み込んだCSVを確認する"):
+            st.dataframe(
+                st.session_state.stats_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        _show_patent_statistics(st.session_state.stats_df)
