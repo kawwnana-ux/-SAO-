@@ -42,7 +42,6 @@ try:
     }}
     """
 except Exception:
-    # 画像読み込みエラー時のフォールバックグラデーション
     bg_style = """
     [data-testid="stAppViewContainer"] {
         background: linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
@@ -120,12 +119,13 @@ st.markdown(
         backdrop-filter: blur(8px);
     }}
 
-    /* Matplotlib 画像表示コンテナ（透明化して白枠を排除） */
+    /* Matplotlib 画像表示コンテナ */
     div[data-testid="stImage"] {{
-        background: transparent !important;
+        background: rgba(255, 255, 255, 0.92) !important;
         border-radius: 18px;
-        padding: 0.5rem;
-        border: none !important;
+        padding: 0.8rem;
+        border: 1px solid rgba(100, 210, 255, 0.4) !important;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
     }}
     div[data-testid="stImage"] img {{
         border-radius: 10px;
@@ -182,17 +182,12 @@ with tab1:
 
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
+
+                # 元のきれいな描画コードをそのまま呼び出します
                 fig = plt.figure(figsize=(8, 6))
                 pp.visualize_relations(relations, title="構成要素間関係")
-
-                # 背景色を透明に強制上書き
-                current_fig = plt.gcf()
-                current_fig.patch.set_alpha(0.0)
-                for ax in current_fig.axes:
-                    ax.patch.set_alpha(0.0)
-
-                st.pyplot(current_fig, transparent=True)
-                plt.close(current_fig)
+                st.pyplot(fig)
+                plt.close(fig)
 
             with col2:
                 st.markdown("#### 📋 抽出された関係（SAOトリプル）")
