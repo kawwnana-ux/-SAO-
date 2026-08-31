@@ -1,11 +1,3 @@
-import streamlit as st
-
-try:
-    import graphviz
-    st.success(f"✅ graphvizパッケージは入っています（バージョン: {graphviz.__version__}）")
-except ImportError as e:
-    st.error(f"❌ graphvizパッケージが見つかりません: {e}")
-
 import base64
 import matplotlib.pyplot as plt
 import streamlit as st
