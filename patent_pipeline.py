@@ -2591,6 +2591,7 @@ def _get_embed_model():
     global _embed_model
     if _embed_model is None:
         from sentence_transformers import SentenceTransformer
+        # 多言語対応の定番モデル（日本語も含む。ライブラリとの互換性が良い）
         _embed_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
     return _embed_model
 
@@ -2836,3 +2837,107 @@ def print_full_diagnosis(relations_a, relations_b, name_a="請求項A", name_b="
     print(f"---")
     print(f"総合類似度スコア: {total:.3f}")
     return total
+
+
+
+# ============================================================
+# ⑰ クレームの広さ・狭さのスコア化
+# ============================================================
+# SAOグラフの構造だけから、「このクレームはどれくらい抽象的
+# （広い）か、具体的（狭い）か」を数値化する。
+# 絶対的な尺度ではなく、複数のクレーム同士を相対的に比べるための
+# 指標であることに注意（例：独立項と従属項の比較、改良前後の
+# クレーム案の比較など）。
+
+def compute_claim_scope_score(relations):
+    """
+    次の4つの観点から「狭さスコア」を計算する（各0〜1に正規化して平均）。
+    ・構成要素の数が多いほど → 限定要素が多い → 狭い
+    ・数値スペック（属性）の数が多いほど → 強く限定される → 狭い
+      （数値限定は権利範囲を大きく狭める典型的な手法のため、重めに見る）
+    ・「有する」階層の深さが深いほど → 細部まで規定されている → 狭い
+    ・関係の密度（関係の総数 ÷ 構成要素数）が高いほど →
+      構成要素同士の制約が多い → 狭い
+
+    戻り値: (狭さスコア(0〜1、大きいほど狭い), 内訳のdict)
+    """
+    nodes = set()
+    for r in relations:
+        nodes.add(r["source"])
+        nodes.add(r["target"])
+    num_nodes = len(nodes)
+    num_relations = len(relations)
+
+    type_counts = {}
+    for r in relations:
+        type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+    attribute_count = type_counts.get("attribute", 0)
+
+    prof = _has_tree_profile(relations)
+    max_depth = prof["max_depth"]
+
+    density = num_relations / num_nodes if num_nodes else 0.0
+
+    # 各要素を0〜1程度にならす（上限を決めてクリップする）
+    node_score = min(num_nodes / 20, 1.0)
+    attr_score = min(attribute_count / 3, 1.0)
+    depth_score = min(max_depth / 4, 1.0)
+    density_score = min(density / 2, 1.0)
+
+    narrowness = round(node_score * 0.3 + attr_score * 0.3 + depth_score * 0.2 + density_score * 0.2, 3)
+    breadth = round(1 - narrowness, 3)
+
+    detail = {
+        "構成要素数": num_nodes,
+        "関係の総数": num_relations,
+        "数値スペックの数": attribute_count,
+        "階層の深さ": max_depth,
+        "関係密度": round(density, 2),
+        "内訳スコア": {
+            "構成要素数": round(node_score, 2),
+            "数値スペック": round(attr_score, 2),
+            "階層の深さ": round(depth_score, 2),
+            "関係密度": round(density_score, 2),
+        },
+    }
+    return narrowness, breadth, detail
+
+
+def print_scope_report(relations, name="請求項"):
+    """compute_claim_scope_score() の結果を、人が読みやすい形で表示する"""
+    narrowness, breadth, detail = compute_claim_scope_score(relations)
+
+    print(f"=== {name}：クレームの広さ・狭さ ===")
+    print(f"狭さスコア: {narrowness:.3f}　（広さスコア: {breadth:.3f}）")
+    print(f"  構成要素数: {detail['構成要素数']}")
+    print(f"  関係の総数: {detail['関係の総数']}")
+    print(f"  数値スペックの数: {detail['数値スペックの数']}")
+    print(f"  「有する」階層の深さ: {detail['階層の深さ']}")
+    print(f"  関係密度(関係数/構成要素数): {detail['関係密度']}")
+    print(f"  内訳スコア: {detail['内訳スコア']}")
+
+    return narrowness
+
+
+def compare_claim_scope(relations_list, names=None):
+    """
+    複数の請求項の狭さスコアを一括で計算し、狭い順に並べて表示する。
+    relations_list: [relations, relations, ...]（analyze_claim()の戻り値の2番目）
+    """
+    if names is None:
+        names = [f"請求項{i+1}" for i in range(len(relations_list))]
+
+    rows = []
+    for name, relations in zip(names, relations_list):
+        narrowness, breadth, detail = compute_claim_scope_score(relations)
+        rows.append((name, narrowness, breadth, detail))
+
+    rows.sort(key=lambda x: -x[1])
+
+    print(f"{'請求項':25s} {'狭さ':>8s} {'広さ':>8s} {'要素数':>6s} {'数値':>6s} {'深さ':>6s} {'密度':>6s}")
+    for name, narrowness, breadth, detail in rows:
+        print(f"{name:25s} {narrowness:>8.3f} {breadth:>8.3f} "
+              f"{detail['構成要素数']:>6d} {detail['数値スペックの数']:>6d} "
+              f"{detail['階層の深さ']:>6d} {detail['関係密度']:>6.2f}")
+
+    return rows

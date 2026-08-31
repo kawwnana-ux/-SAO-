@@ -11,7 +11,7 @@ except ImportError:
 import patent_pipeline as pp
 
 # ページ基本設定
-st.set_page_config(page_title="🪼 日本語特許SAO構造分析", page_icon="🪼", layout="wide")
+st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
 
 # セッション状態の初期化
 if "single_result" not in st.session_state:
@@ -130,7 +130,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🪼 日本語特許SAO構造分析")
+st.title("🌊 特許SAOラボ")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
@@ -148,7 +148,7 @@ with tab1:
         key="single_text",
     )
 
-    if st.button("🦈 解析する", type="primary", key="single_run"):
+    if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
@@ -179,6 +179,24 @@ with tab1:
                 st.markdown("#### 🪸 構成要素間の関係図")
                 graph = pp.build_graphviz(relations, title="構成要素間関係", theme="deepsea")
                 st.graphviz_chart(graph, use_container_width=True)
+
+                st.markdown("#### 🐙 クレームの広さ・狭さ")
+                narrowness, breadth, scope_detail = pp.compute_claim_scope_score(relations)
+                scope_cols = st.columns(2)
+                scope_cols[0].metric("広さスコア（大きいほど抽象的）", f"{breadth:.3f}")
+                scope_cols[1].metric("狭さスコア（大きいほど限定的）", f"{narrowness:.3f}")
+                with st.expander("広さ・狭さの内訳を見る"):
+                    st.write(
+                        f"- 構成要素数: {scope_detail['構成要素数']}\n"
+                        f"- 関係の総数: {scope_detail['関係の総数']}\n"
+                        f"- 数値スペックの数: {scope_detail['数値スペックの数']}\n"
+                        f"- 「有する」階層の深さ: {scope_detail['階層の深さ']}\n"
+                        f"- 関係密度(関係数/構成要素数): {scope_detail['関係密度']}"
+                    )
+                    st.caption(
+                        "※ このスコアは絶対的な尺度ではなく、他の請求項と相対的に比べるための指標です"
+                        "（例：独立項と従属項の比較、改良前後のクレーム案の比較など）。"
+                    )
 
             with col2:
                 st.markdown("#### 📋 抽出された関係（SAOトリプル）")
@@ -226,6 +244,8 @@ with tab2:
 
                     jaccard_score, common, only_a, only_b = pp.jaccard_similarity(relations_a, relations_b)
                     structural_score, structural_detail = pp.structural_similarity(relations_a, relations_b)
+                    narrowness_a, breadth_a, scope_detail_a = pp.compute_claim_scope_score(relations_a)
+                    narrowness_b, breadth_b, scope_detail_b = pp.compute_claim_scope_score(relations_b)
 
                     semantic_score, semantic_matches = None, None
                     if use_semantic:
@@ -244,6 +264,8 @@ with tab2:
                         "structural_detail": structural_detail,
                         "semantic_score": semantic_score,
                         "semantic_matches": semantic_matches,
+                        "scope_a": (narrowness_a, breadth_a, scope_detail_a),
+                        "scope_b": (narrowness_b, breadth_b, scope_detail_b),
                     }
                 except Exception as e:
                     st.error(f"解析中にエラーが発生しました: {e}")
@@ -272,6 +294,30 @@ with tab2:
                 f"- 枝分かれパターンの類似度: {detail['枝分かれパターンの類似度']:.3f}\n"
                 f"- 関係の種類の内訳の類似度: {detail['関係の種類の内訳の類似度']:.3f}"
             )
+
+        st.markdown("### 🐙 クレームの広さ・狭さの比較")
+        narrowness_a, breadth_a, scope_detail_a = res["scope_a"]
+        narrowness_b, breadth_b, scope_detail_b = res["scope_b"]
+        scope_col_a, scope_col_b = st.columns(2)
+        with scope_col_a:
+            st.markdown("**請求項A**")
+            st.metric("広さスコア", f"{breadth_a:.3f}")
+            st.caption(
+                f"構成要素数: {scope_detail_a['構成要素数']} / "
+                f"数値スペック: {scope_detail_a['数値スペックの数']} / "
+                f"階層の深さ: {scope_detail_a['階層の深さ']}"
+            )
+        with scope_col_b:
+            st.markdown("**請求項B**")
+            st.metric("広さスコア", f"{breadth_b:.3f}")
+            st.caption(
+                f"構成要素数: {scope_detail_b['構成要素数']} / "
+                f"数値スペック: {scope_detail_b['数値スペックの数']} / "
+                f"階層の深さ: {scope_detail_b['階層の深さ']}"
+            )
+        st.caption(
+            "※ このスコアは絶対的な尺度ではなく、AとBを相対的に比べるための指標です。"
+        )
 
         st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
         col1, col2, col3 = st.columns(3)
