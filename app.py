@@ -2,6 +2,7 @@ import base64
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# Matplotlibの日本語文字化け対策
 try:
     import japanize_matplotlib
 except ImportError:
@@ -10,7 +11,7 @@ except ImportError:
 import patent_pipeline as pp
 
 # ページ基本設定
-st.set_page_config(page_title="🪼　日本語特許請求項分析", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
 
 # セッション状態の初期化
 if "single_result" not in st.session_state:
@@ -24,6 +25,7 @@ def get_base64_of_bin_file(bin_file):
     with open(bin_file, "rb") as f:
         data = f.read()
     return base64.b64encode(data).decode()
+
 
 # 背景CSSの組み立て
 try:
@@ -40,6 +42,7 @@ try:
     }}
     """
 except Exception:
+    # 画像読み込みエラー時のフォールバックグラデーション
     bg_style = """
     [data-testid="stAppViewContainer"] {
         background: linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
@@ -117,7 +120,7 @@ st.markdown(
         backdrop-filter: blur(8px);
     }}
 
-    /* Matplotlib 画像表示コンテナ（透明化） */
+    /* Matplotlib 画像表示コンテナ（透明化して白枠を排除） */
     div[data-testid="stImage"] {{
         background: transparent !important;
         border-radius: 18px;
@@ -132,12 +135,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# メインコンテンツ
-st.title("🪼　日本語特許請求項分析")
+st.title("🌊 特許SAOラボ")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
 
+
+# ============================================================
+# タブ①：1つの請求項を解析して図を見る
+# ============================================================
 with tab1:
     st.subheader("📝 請求項を入力してください")
     text = st.text_area(
@@ -163,6 +169,7 @@ with tab1:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
 
+    # 結果を表示
     if st.session_state.single_result is not None:
         relations = st.session_state.single_result["relations"]
 
@@ -177,8 +184,15 @@ with tab1:
                 st.markdown("#### 🪸 構成要素間の関係図")
                 fig = plt.figure(figsize=(8, 6))
                 pp.visualize_relations(relations, title="構成要素間関係")
-                st.pyplot(fig)
-                plt.close(fig)
+
+                # 背景色を透明に強制上書き
+                current_fig = plt.gcf()
+                current_fig.patch.set_alpha(0.0)
+                for ax in current_fig.axes:
+                    ax.patch.set_alpha(0.0)
+
+                st.pyplot(current_fig, transparent=True)
+                plt.close(current_fig)
 
             with col2:
                 st.markdown("#### 📋 抽出された関係（SAOトリプル）")
@@ -196,6 +210,10 @@ with tab1:
                     hide_index=True,
                 )
 
+
+# ============================================================
+# タブ②：2つの請求項を比較して類似度診断する
+# ============================================================
 with tab2:
     st.subheader("📝 2つの請求項を入力してください")
 
@@ -245,6 +263,7 @@ with tab2:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.compare_result = None
 
+    # 結果を表示
     if st.session_state.compare_result is not None:
         res = st.session_state.compare_result
 
