@@ -3,200 +3,262 @@ import matplotlib.pyplot as plt
 
 import patent_pipeline as pp
 
-st.set_page_config(page_title="🪼 特許SAOラボ", page_icon="🪼", layout="wide")
+st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
 
 st.markdown(
     """
     <style>
     /* ============================================================
-       深海テーマ：背景（光芒＋グラデーション）
+       深海テーマ（リアル志向）：基調カラー
+       派手な虹色をやめ、単色系（黒〜濃紺〜ティール）の
+       ドキュメンタリー的な深海の色調に統一する。
     ============================================================ */
     .stApp {
         background:
-            radial-gradient(ellipse 900px 500px at 50% -8%, rgba(150, 230, 255, 0.30), transparent 60%),
-            radial-gradient(ellipse 500px 300px at 15% 15%, rgba(150, 230, 255, 0.12), transparent 55%),
-            radial-gradient(circle at 85% 30%, rgba(199, 141, 255, 0.10), transparent 45%),
-            radial-gradient(circle at 25% 85%, rgba(100, 255, 218, 0.08), transparent 45%),
-            linear-gradient(180deg, #06304d 0%, #073a5c 18%, #052b47 40%, #03203a 62%, #01152a 82%, #000c1c 100%);
+            radial-gradient(ellipse 1100px 500px at 50% -12%, rgba(90, 170, 200, 0.16), transparent 62%),
+            linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
         background-attachment: fixed;
         position: relative;
         overflow-x: hidden;
     }
 
-    /* 漂う泡 */
-    .stApp::before {
-        content: "";
-        position: fixed;
-        inset: 0;
-        pointer-events: none;
-        z-index: 0;
-        background-image:
-            radial-gradient(circle, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.05) 60%, transparent 70%),
-            radial-gradient(circle, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.04) 60%, transparent 70%),
-            radial-gradient(circle, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.05) 60%, transparent 70%),
-            radial-gradient(circle, rgba(255,255,255,0.4) 0%, rgba(255,255,255,0.04) 60%, transparent 70%),
-            radial-gradient(circle, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.04) 60%, transparent 70%),
-            radial-gradient(circle, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.05) 60%, transparent 70%);
-        background-size: 18px 18px, 26px 26px, 14px 14px, 22px 22px, 16px 16px, 30px 30px;
-        background-position: 8% 100%, 22% 100%, 40% 100%, 63% 100%, 78% 100%, 92% 100%;
-        background-repeat: no-repeat;
-        animation: bubble-rise 9s linear infinite;
-        opacity: 0.8;
+    /* ------------------------------------------------------------
+       ゴッドレイ（水面から差し込む光芒）
+    ------------------------------------------------------------ */
+    .godrays { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+    .godrays span {
+        position: absolute;
+        top: -20%;
+        width: 140px;
+        height: 140%;
+        background: linear-gradient(180deg, rgba(180, 225, 240, 0.16) 0%, rgba(150, 210, 230, 0.05) 45%, transparent 80%);
+        filter: blur(18px);
+        transform-origin: top center;
+        animation: ray-sway 14s ease-in-out infinite;
     }
-    @keyframes bubble-rise {
-        0%   { background-position: 8% 105%, 22% 110%, 40% 100%, 63% 115%, 78% 108%, 92% 100%; opacity: 0; }
-        10%  { opacity: 0.9; }
-        90%  { opacity: 0.5; }
-        100% { background-position: 6% -20%, 26% -25%, 44% -15%, 60% -30%, 82% -18%, 88% -22%; opacity: 0; }
+    .godrays span:nth-child(1) { left: 8%;  transform: rotate(8deg);  animation-delay: 0s; }
+    .godrays span:nth-child(2) { left: 30%; transform: rotate(-4deg); width: 90px; animation-delay: 3s; }
+    .godrays span:nth-child(3) { left: 55%; transform: rotate(6deg);  width: 180px; opacity: 0.7; animation-delay: 6s; }
+    .godrays span:nth-child(4) { left: 78%; transform: rotate(-9deg); width: 110px; animation-delay: 1.5s; }
+    @keyframes ray-sway {
+        0%, 100% { transform: rotate(var(--r, 6deg)) translateX(0); opacity: 0.55; }
+        50%      { transform: rotate(calc(var(--r, 6deg) * -1)) translateX(18px); opacity: 0.85; }
     }
 
-    /* 漂うクラゲ・お魚デコレーション */
-    .sea-critters { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
-    .sea-critters span {
-        position: absolute;
-        font-size: 1.8rem;
-        opacity: 0.55;
-        filter: drop-shadow(0 0 6px rgba(120, 220, 255, 0.5));
-        animation: drift 22s ease-in-out infinite;
+    /* ------------------------------------------------------------
+       コースティクス（水面の揺らめく光の網目模様）
+       SVGフィルタ（feTurbulence）で有機的な揺らぎを再現
+    ------------------------------------------------------------ */
+    .caustics-layer {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background: radial-gradient(ellipse 1200px 600px at 50% 0%, rgba(140, 210, 230, 0.5), transparent 65%);
+        filter: url(#causticsFilter);
+        mix-blend-mode: screen;
+        opacity: 0.35;
     }
-    .sea-critters span:nth-child(1) { left: 6%;  top: 70%; font-size: 2.1rem; animation-duration: 26s; animation-delay: 0s; }
-    .sea-critters span:nth-child(2) { left: 88%; top: 20%; font-size: 1.6rem; animation-duration: 20s; animation-delay: 2s; }
-    .sea-critters span:nth-child(3) { left: 15%; top: 30%; font-size: 1.4rem; animation-duration: 24s; animation-delay: 4s; }
-    .sea-critters span:nth-child(4) { left: 75%; top: 78%; font-size: 1.9rem; animation-duration: 28s; animation-delay: 1s; }
-    .sea-critters span:nth-child(5) { left: 45%; top: 12%; font-size: 1.3rem; animation-duration: 18s; animation-delay: 6s; }
-    @keyframes drift {
-        0%   { transform: translate(0, 0) rotate(0deg); }
-        50%  { transform: translate(24px, -30px) rotate(6deg); }
-        100% { transform: translate(0, 0) rotate(0deg); }
+
+    /* ------------------------------------------------------------
+       マリンスノー（ゆっくり降り積もる微粒子）
+    ------------------------------------------------------------ */
+    .marine-snow { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; filter: blur(0.3px); }
+    .marine-snow::before, .marine-snow::after {
+        content: "";
+        position: absolute;
+        inset: -10% 0 0 0;
+        background-image:
+            radial-gradient(circle, rgba(210,235,245,0.55) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.4) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.5) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.35) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.45) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.3) 0%, transparent 70%),
+            radial-gradient(circle, rgba(210,235,245,0.5) 0%, transparent 70%);
+        background-size: 3px 3px, 2px 2px, 4px 4px, 2px 2px, 3px 3px, 2px 2px, 3px 3px;
+        background-position: 5% 0%, 18% 0%, 33% 0%, 47% 0%, 61% 0%, 76% 0%, 90% 0%;
+        background-repeat: no-repeat;
+        animation: snow-fall 26s linear infinite;
+    }
+    .marine-snow::after {
+        animation-duration: 38s;
+        animation-delay: -12s;
+        background-size: 2px 2px, 3px 3px, 2px 2px, 3px 3px, 2px 2px, 4px 4px, 2px 2px;
+        background-position: 12% 0%, 27% 0%, 42% 0%, 58% 0%, 70% 0%, 83% 0%, 95% 0%;
+        opacity: 0.7;
+    }
+    @keyframes snow-fall {
+        0%   { background-position: 5% -5%, 18% -8%, 33% -3%, 47% -10%, 61% -6%, 76% -4%, 90% -7%; opacity: 0; }
+        8%   { opacity: 0.8; }
+        92%  { opacity: 0.5; }
+        100% { background-position: 9% 105%, 24% 108%, 37% 102%, 53% 110%, 66% 104%, 80% 106%, 94% 103%; opacity: 0; }
+    }
+
+    /* ------------------------------------------------------------
+       ビネット（画面端を暗く落として奥行きを出す）
+    ------------------------------------------------------------ */
+    .vignette {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background: radial-gradient(ellipse at 50% 40%, transparent 35%, rgba(0, 4, 8, 0.55) 100%);
+    }
+
+    /* ------------------------------------------------------------
+       フィルムグレイン（微細なノイズで写真的な質感を足す）
+    ------------------------------------------------------------ */
+    .film-grain {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        opacity: 0.05;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+        background-size: 220px 220px;
     }
 
     /* 全体の文字色（深海の中で読みやすいライトカラーに） */
     .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, .stCaption {
-        color: #dff3ff;
+        color: #d3e8f0;
     }
     h1, h2, h3, h4 {
-        color: #baf3ff !important;
-        text-shadow: 0 0 14px rgba(120, 230, 255, 0.45);
+        color: #aee0ee !important;
+        text-shadow: 0 0 16px rgba(120, 200, 220, 0.35);
         font-weight: 800 !important;
     }
     .stCaption, [data-testid="stCaptionContainer"] {
-        color: #9fd4e8 !important;
+        color: #86b3c4 !important;
     }
 
-    /* タブ（貝殻っぽいガラスピル） */
+    /* タブ（潜水艇のHUD風ガラスピル） */
     button[data-baseweb="tab"] {
         border-radius: 999px !important;
         padding: 0.4rem 1.2rem !important;
         margin-right: 0.4rem !important;
-        background-color: rgba(255, 255, 255, 0.06) !important;
-        border: 1px solid rgba(150, 230, 255, 0.25) !important;
-        color: #cdeeff !important;
+        background-color: rgba(10, 30, 40, 0.5) !important;
+        border: 1px solid rgba(140, 200, 220, 0.2) !important;
+        color: #bcdce8 !important;
         backdrop-filter: blur(6px);
     }
     button[data-baseweb="tab"][aria-selected="true"] {
-        background: linear-gradient(135deg, rgba(100,255,218,0.22), rgba(199,141,255,0.22)) !important;
+        background: linear-gradient(135deg, rgba(80, 190, 210, 0.22), rgba(40, 120, 150, 0.22)) !important;
         color: #ffffff !important;
-        border: 1px solid rgba(120, 230, 255, 0.6) !important;
+        border: 1px solid rgba(120, 210, 230, 0.55) !important;
         font-weight: 700 !important;
-        box-shadow: 0 0 14px rgba(100, 255, 218, 0.35);
+        box-shadow: 0 0 14px rgba(80, 190, 210, 0.3);
     }
 
-    /* ボタン（発光クラゲ風） */
+    /* ボタン（発光生物のバイオルミネセンス） */
     .stButton > button {
         border-radius: 999px !important;
-        background: linear-gradient(135deg, #64ffda 0%, #4fb3ff 45%, #c77dff 100%) !important;
-        color: #02233a !important;
+        background: linear-gradient(135deg, #2fd7c4 0%, #1a8fb0 100%) !important;
+        color: #021a24 !important;
         font-weight: 800 !important;
         border: none !important;
         padding: 0.5rem 1.6rem !important;
-        box-shadow: 0 0 18px rgba(100, 255, 218, 0.45), 0 3px 10px rgba(0,0,0,0.35) !important;
+        box-shadow: 0 0 16px rgba(47, 215, 196, 0.4), 0 3px 10px rgba(0,0,0,0.4) !important;
     }
     .stButton > button:hover {
-        filter: brightness(1.08);
-        box-shadow: 0 0 26px rgba(100, 255, 218, 0.65), 0 3px 10px rgba(0,0,0,0.35) !important;
+        filter: brightness(1.1);
+        box-shadow: 0 0 24px rgba(47, 215, 196, 0.6), 0 3px 10px rgba(0,0,0,0.4) !important;
     }
 
-    /* テキストエリア（水面のガラスカード） */
+    /* テキストエリア（潜水艇の計器パネル風） */
     .stTextArea textarea {
-        border-radius: 18px !important;
-        border: 1.5px solid rgba(150, 230, 255, 0.35) !important;
-        background: rgba(6, 30, 48, 0.55) !important;
-        color: #eaf9ff !important;
+        border-radius: 14px !important;
+        border: 1.5px solid rgba(140, 200, 220, 0.25) !important;
+        background: rgba(4, 18, 26, 0.65) !important;
+        color: #e4f3f8 !important;
         backdrop-filter: blur(8px);
     }
     .stTextArea textarea::placeholder {
-        color: #7fb8d4 !important;
+        color: #6b95a6 !important;
     }
     .stTextInput input, .stTextArea label, .stTextInput label {
-        color: #dff3ff !important;
+        color: #d3e8f0 !important;
     }
 
-    /* metricカード（真珠貝カード） */
+    /* metricカード */
     div[data-testid="stMetric"] {
-        background: rgba(255, 255, 255, 0.06);
-        border-radius: 18px;
+        background: rgba(10, 30, 40, 0.45);
+        border-radius: 16px;
         padding: 0.9rem;
-        border: 1px solid rgba(150, 230, 255, 0.25);
-        box-shadow: 0 0 16px rgba(80, 200, 255, 0.15);
+        border: 1px solid rgba(140, 200, 220, 0.2);
+        box-shadow: 0 0 14px rgba(60, 160, 190, 0.12);
         backdrop-filter: blur(8px);
     }
     div[data-testid="stMetric"] label, div[data-testid="stMetricValue"] {
-        color: #eaf9ff !important;
+        color: #e4f3f8 !important;
     }
 
     /* expander */
     .streamlit-expanderHeader {
-        border-radius: 14px !important;
-        background: rgba(255, 255, 255, 0.05) !important;
-        color: #dff3ff !important;
-        border: 1px solid rgba(150, 230, 255, 0.2) !important;
+        border-radius: 12px !important;
+        background: rgba(10, 30, 40, 0.4) !important;
+        color: #d3e8f0 !important;
+        border: 1px solid rgba(140, 200, 220, 0.18) !important;
     }
     .streamlit-expanderContent {
-        background: rgba(255, 255, 255, 0.03) !important;
-        border-radius: 0 0 14px 14px !important;
+        background: rgba(10, 30, 40, 0.25) !important;
+        border-radius: 0 0 12px 12px !important;
     }
 
     /* checkbox・警告・成功・情報ボックス */
-    .stCheckbox label { color: #dff3ff !important; }
+    .stCheckbox label { color: #d3e8f0 !important; }
     div[data-testid="stAlert"] {
-        border-radius: 16px !important;
+        border-radius: 14px !important;
         backdrop-filter: blur(6px);
     }
 
-    /* dataframe をガラスカードで囲む */
+    /* dataframe */
     div[data-testid="stDataFrame"] {
-        border-radius: 16px;
+        border-radius: 14px;
         overflow: hidden;
-        border: 1px solid rgba(150, 230, 255, 0.25);
-        box-shadow: 0 0 16px rgba(80, 200, 255, 0.12);
+        border: 1px solid rgba(140, 200, 220, 0.2);
+        box-shadow: 0 0 14px rgba(60, 160, 190, 0.1);
     }
 
-    /* 関係図（matplotlib）は白背景のまま、深海に浮かぶ宝物カード風に額装 */
+    /* 関係図（matplotlib）は白背景のまま、深海に沈む観測パネル風に額装 */
     div[data-testid="stImage"] {
-        background: rgba(255, 250, 245, 0.97);
-        border-radius: 22px;
+        background: rgba(248, 250, 250, 0.97);
+        border-radius: 18px;
         padding: 1rem;
-        border: 1px solid rgba(150, 230, 255, 0.35);
-        box-shadow: 0 0 24px rgba(80, 200, 255, 0.25), 0 6px 18px rgba(0,0,0,0.35);
+        border: 1px solid rgba(140, 200, 220, 0.3);
+        box-shadow: 0 0 20px rgba(60, 160, 190, 0.2), 0 6px 18px rgba(0,0,0,0.45);
     }
     div[data-testid="stImage"] img {
-        border-radius: 12px;
+        border-radius: 10px;
     }
     </style>
 
-    <div class="sea-critters">
-        <span>🪼</span>
-        <span>🐠</span>
-        <span>🐙</span>
-        <span>🫧</span>
-        <span>🐡</span>
-    </div>
+    <svg width="0" height="0" style="position:absolute">
+        <filter id="causticsFilter">
+            <feTurbulence type="fractalNoise" baseFrequency="0.012 0.05" numOctaves="2" seed="7" result="turb">
+                <animate attributeName="baseFrequency" dur="22s" values="0.012 0.05;0.02 0.07;0.012 0.05" repeatCount="indefinite" />
+            </feTurbulence>
+            <feColorMatrix in="turb" type="matrix"
+                values="0 0 0 0 0.55  0 0 0 0 0.85  0 0 0 0 0.95  0 0 0 1 0" result="tealTurb" />
+            <feComponentTransfer in="tealTurb">
+                <feFuncA type="gamma" exponent="7" amplitude="1.4" offset="0" />
+            </feComponentTransfer>
+            <feGaussianBlur stdDeviation="1.2" />
+        </filter>
+    </svg>
+
+    <div class="godrays"><span></span><span></span><span></span><span></span></div>
+    <div class="caustics-layer"></div>
+    <div class="marine-snow"></div>
+    <div class="vignette"></div>
+    <div class="film-grain"></div>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🪼 特許SAOラボ")
-st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します🌊")
+st.title("🌊 特許SAOラボ")
+st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
 
