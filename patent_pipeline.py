@@ -1946,6 +1946,97 @@ def _assign_branch_colors(G):
     return styles, root
 
 
+# ============================================================
+# ⑨.5 Graphviz（dotエンジン）による階層DAGレイアウトでの可視化
+# ============================================================
+# 「有する」の階層構造に、それをまたぐ直接関係・位置関係の矢印が
+# 乗っている今回のデータは、木ではなく「階層型の有向非巡回グラフ
+# （DAG）」である。これはSugiyamaフレームワークと呼ばれる、
+# 階層型グラフ描画のための確立された理論があり、Graphvizのdot
+# エンジンがこれを実装している。自前でレイアウトを計算する
+# matplotlib版（visualize_relations）よりも、階層の割り当て・
+# 交差の最小化・矢印の迂回を自動でうまくやってくれる。
+
+# 深海テーマの発光パレット（枝ごとに色分け）
+_DEEPSEA_PALETTE = [
+    {"fill": "#0E3A52", "border": "#5FD4E0", "font": "#E8FBFF"},   # シアン系の発光
+    {"fill": "#123A2E", "border": "#4FE0A8", "font": "#E9FFF6"},   # 緑系の発光
+    {"fill": "#3A2A4A", "border": "#B98CF0", "font": "#F5EEFF"},   # 紫系の発光
+    {"fill": "#4A2438", "border": "#FF8AC0", "font": "#FFEBF4"},   # ピンク系の発光
+    {"fill": "#3E3418", "border": "#F0D25C", "font": "#FFF9E0"},   # 黄系の発光
+    {"fill": "#123C48", "border": "#6FE8E0", "font": "#EAFFFD"},   # ターコイズ
+    {"fill": "#2E1F4A", "border": "#9C7CF0", "font": "#F0EBFF"},   # 藤色
+    {"fill": "#0F2A44", "border": "#7CAEFF", "font": "#EAF2FF"},   # 青
+]
+_DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
+
+
+def build_graphviz(final_relations, title=None, theme="deepsea"):
+    """
+    analyze_claim()等が返した関係リストを、Graphvizのdotエンジンで
+    階層型に自動レイアウトしたグラフとして組み立てる。
+
+    戻り値は graphviz.Digraph オブジェクト。
+    Jupyter/Colabではそのまま表示でき、Streamlitでは
+    st.graphviz_chart(戻り値) でそのまま描画できる。
+    """
+    import graphviz
+
+    G = nx.DiGraph()
+    for r in final_relations:
+        G.add_node(r["source"])
+        G.add_node(r["target"])
+        G.add_edge(r["source"], r["target"], relation=r["relation"], type=r["type"])
+
+    g = graphviz.Digraph(engine="dot")
+    g.attr(
+        rankdir="LR", splines="spline", nodesep="0.25", ranksep="0.85",
+        bgcolor="transparent",
+    )
+    if title:
+        g.attr(label=title, labelloc="t", fontsize="20",
+               fontname="IPAexGothic",
+               fontcolor="#E8FBFF" if theme == "deepsea" else "#233044")
+
+    if len(G.nodes()) == 0:
+        return g
+
+    node_styles, _root = _assign_branch_colors(G)
+
+    palette = _DEEPSEA_PALETTE if theme == "deepsea" else _BRANCH_PALETTE
+    root_style = _DEEPSEA_ROOT if theme == "deepsea" else _ROOT_STYLE
+
+    def _style_for(n):
+        s = node_styles.get(n)
+        if s is _ROOT_STYLE:
+            return root_style
+        if s in _BRANCH_PALETTE:
+            return palette[_BRANCH_PALETTE.index(s)]
+        return palette[0]
+
+    g.attr("node", shape="box", style="rounded,filled", fontname="IPAexGothic",
+           fontsize="12", margin="0.18,0.1", penwidth="1.8")
+    g.attr("edge", fontname="IPAexGothic", fontsize="10", penwidth="1.6")
+
+    added = set()
+    for n in G.nodes():
+        style = _style_for(n)
+        g.node(
+            n,
+            fillcolor=style["fill"],
+            color=style["border"],
+            fontcolor=style["font"],
+        )
+        added.add(n)
+
+    for u, v, d in G.edges(data=True):
+        line_style = _style_for(v)
+        g.edge(u, v, label="→ " + d["relation"], color=line_style["border"],
+               fontcolor=line_style["border"] if theme == "deepsea" else "#445566")
+
+    return g
+
+
 def visualize_relations(final_relations, title="特許請求項の構成要素間関係"):
     """analyze_claim()等が返した関係リストを渡すと、マインドマップ風の図を描画する"""
     G = nx.DiGraph()
@@ -2066,7 +2157,7 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
             off_x, off_y = -ddy / dd * 0.22, ddx / dd * 0.22
         else:
             off_x, off_y = 0, 0
-        ax.text(mx + off_x, my + off_y,  d["relation"], fontsize=9, fontproperties=FONT_PROP,
+        ax.text(mx + off_x, my + off_y, "→ " + d["relation"], fontsize=9, fontproperties=FONT_PROP,
                 ha="center", va="center", color=edge_color, fontweight="medium",
                 bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor=line_color,
                           linewidth=1.1, alpha=0.95), zorder=3)

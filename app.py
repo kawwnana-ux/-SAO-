@@ -11,7 +11,7 @@ except ImportError:
 import patent_pipeline as pp
 
 # ページ基本設定
-st.set_page_config(page_title="🪼　日本語特許SAO構造分析", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
 
 # セッション状態の初期化
 if "single_result" not in st.session_state:
@@ -130,7 +130,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🪼　日本語特許SAO構造分析")
+st.title("🌊 特許SAOラボ")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
@@ -177,14 +177,8 @@ with tab1:
 
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
-                # 前のプロット領域を一度クリア
-                plt.clf()
-                plt.close('all')
-
-                # visualize_relationsを実行し、その直後の現在のFigureを取得して描画
-                pp.visualize_relations(relations, title="構成要素間関係")
-                st.pyplot(plt.gcf())
-                plt.clf()
+                graph = pp.build_graphviz(relations, title="構成要素間関係", theme="deepsea")
+                st.graphviz_chart(graph, use_container_width=True)
 
             with col2:
                 st.markdown("#### 📋 抽出された関係（SAOトリプル）")
