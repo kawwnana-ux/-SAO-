@@ -25,7 +25,7 @@ st.markdown(
     /* ------------------------------------------------------------
        ゴッドレイ（水面から差し込む光芒）
     ------------------------------------------------------------ */
-    .godrays { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+    .godrays { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }
     .godrays span {
         position: absolute;
         top: -20%;
@@ -52,18 +52,18 @@ st.markdown(
     .caustics-layer {
         position: fixed;
         inset: 0;
-        z-index: 0;
+        z-index: -1;
         pointer-events: none;
-        background: radial-gradient(ellipse 1200px 600px at 50% 0%, rgba(140, 210, 230, 0.5), transparent 65%);
+        background: radial-gradient(ellipse 1200px 600px at 50% 0%, rgba(120, 190, 210, 0.32), transparent 65%);
         filter: url(#causticsFilter);
         mix-blend-mode: screen;
-        opacity: 0.35;
+        opacity: 0.22;
     }
 
     /* ------------------------------------------------------------
        マリンスノー（ゆっくり降り積もる微粒子）
     ------------------------------------------------------------ */
-    .marine-snow { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; filter: blur(0.3px); }
+    .marine-snow { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; filter: blur(0.3px); }
     .marine-snow::before, .marine-snow::after {
         content: "";
         position: absolute;
@@ -101,7 +101,7 @@ st.markdown(
     .vignette {
         position: fixed;
         inset: 0;
-        z-index: 0;
+        z-index: -1;
         pointer-events: none;
         background: radial-gradient(ellipse at 50% 40%, transparent 35%, rgba(0, 4, 8, 0.55) 100%);
     }
@@ -112,7 +112,7 @@ st.markdown(
     .film-grain {
         position: fixed;
         inset: 0;
-        z-index: 0;
+        z-index: -1;
         pointer-events: none;
         opacity: 0.05;
         mix-blend-mode: overlay;
