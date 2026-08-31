@@ -2595,7 +2595,17 @@ def _get_embed_model():
         _embed_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
     return _embed_model
 
-
+def relations_to_triple_set_for_semantic(relations, normalize_numbers=True):
+    """
+    意味マッチング（②）専用のトリプル集合。
+    「有する」は階層構造の情報であり、すでに③（構造の類似度）が
+    見ているので、ここでは含めない。「検査装置 有する 通信部」の
+    ような、部品名が違うだけで骨組みが同じ表現に、意味マッチングが
+    釣られてしまうのを防ぐため。
+    """
+    filtered = [r for r in relations if r["type"] != "has"]
+    return relations_to_triple_set(filtered, normalize_numbers)
+    
 def _triple_to_text(triple):
     source, relation, target = triple
     return f"{source}が{target}を{relation}"
@@ -2612,11 +2622,8 @@ def semantic_similarity(relations_a, relations_b, normalize_numbers=True):
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
-    triples_a = sorted(relations_to_triple_set(relations_a, normalize_numbers))
-    triples_b = sorted(relations_to_triple_set(relations_b, normalize_numbers))
-
-    if not triples_a or not triples_b:
-        return 0.0, []
+　　triples_a = sorted(relations_to_triple_set_for_semantic(relations_a, normalize_numbers))
+    triples_b = sorted(relations_to_triple_set_for_semantic(relations_b, normalize_numbers))
 
     model = _get_embed_model()
     texts_a = [_triple_to_text(t) for t in triples_a]
@@ -2979,6 +2986,7 @@ def build_patent_database(records, show_progress=True):
             continue
         if not relations:
             continue
+        
         triples = sorted(relations_to_triple_set(relations, normalize_numbers=True))
         texts = [_triple_to_text(t) for t in triples]
         embeddings = model.encode(texts, normalize_embeddings=True)
