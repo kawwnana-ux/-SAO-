@@ -1,7 +1,7 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# Matplotlibの日本語文字化け対策（インストールされていない場合は無視されるようtry-except）
+# Matplotlibの日本語文字化け対策
 try:
     import japanize_matplotlib
 except ImportError:
@@ -18,107 +18,14 @@ if "single_result" not in st.session_state:
 if "compare_result" not in st.session_state:
     st.session_state.compare_result = None
 
-# カスタムCSS & SVGフィルタ
+# カスタムCSS（フリーズの原因となったSVG/重いCSSアニメーションを除去し、軽量化）
 st.markdown(
     """
     <style>
-    /* ============================================================
-       深海テーマ（リアル志向）：基調カラー
-    ============================================================ */
+    /* 深海テーマ：グラデーションのみで軽量化 */
     .stApp {
-        background:
-            radial-gradient(ellipse 1100px 500px at 50% -12%, rgba(90, 170, 200, 0.16), transparent 62%),
-            linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
+        background: linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
         background-attachment: fixed;
-        position: relative;
-        overflow-x: hidden;
-    }
-
-    /* ゴッドレイ（水面から差し込む光芒） */
-    .godrays { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }
-    .godrays span {
-        position: absolute;
-        top: -20%;
-        width: 140px;
-        height: 140%;
-        background: linear-gradient(180deg, rgba(180, 225, 240, 0.16) 0%, rgba(150, 210, 230, 0.05) 45%, transparent 80%);
-        filter: blur(18px);
-        transform-origin: top center;
-        animation: ray-sway 14s ease-in-out infinite;
-    }
-    .godrays span:nth-child(1) { left: 8%;  transform: rotate(8deg);  animation-delay: 0s; }
-    .godrays span:nth-child(2) { left: 30%; transform: rotate(-4deg); width: 90px; animation-delay: 3s; }
-    .godrays span:nth-child(3) { left: 55%; transform: rotate(6deg);  width: 180px; opacity: 0.7; animation-delay: 6s; }
-    .godrays span:nth-child(4) { left: 78%; transform: rotate(-9deg); width: 110px; animation-delay: 1.5s; }
-    @keyframes ray-sway {
-        0%, 100% { transform: rotate(var(--r, 6deg)) translateX(0); opacity: 0.55; }
-        50%      { transform: rotate(calc(var(--r, 6deg) * -1)) translateX(18px); opacity: 0.85; }
-    }
-
-    /* コースティクス（水面の揺らめく光の網目模様） */
-    .caustics-layer {
-        position: fixed;
-        inset: 0;
-        z-index: -1;
-        pointer-events: none;
-        background: radial-gradient(ellipse 1200px 600px at 50% 0%, rgba(120, 190, 210, 0.32), transparent 65%);
-        filter: url(#causticsFilter);
-        mix-blend-mode: screen;
-        opacity: 0.22;
-    }
-
-    /* マリンスノー（ゆっくり降り積もる微粒子） */
-    .marine-snow { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; filter: blur(0.3px); }
-    .marine-snow::before, .marine-snow::after {
-        content: "";
-        position: absolute;
-        inset: -10% 0 0 0;
-        background-image:
-            radial-gradient(circle, rgba(210,235,245,0.55) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.4) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.5) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.35) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.45) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.3) 0%, transparent 70%),
-            radial-gradient(circle, rgba(210,235,245,0.5) 0%, transparent 70%);
-        background-size: 3px 3px, 2px 2px, 4px 4px, 2px 2px, 3px 3px, 2px 2px, 3px 3px;
-        background-position: 5% 0%, 18% 0%, 33% 0%, 47% 0%, 61% 0%, 76% 0%, 90% 0%;
-        background-repeat: no-repeat;
-        animation: snow-fall 26s linear infinite;
-    }
-    .marine-snow::after {
-        animation-duration: 38s;
-        animation-delay: -12s;
-        background-size: 2px 2px, 3px 3px, 2px 2px, 3px 3px, 2px 2px, 4px 4px, 2px 2px;
-        background-position: 12% 0%, 27% 0%, 42% 0%, 58% 0%, 70% 0%, 83% 0%, 95% 0%;
-        opacity: 0.7;
-    }
-    @keyframes snow-fall {
-        0%   { background-position: 5% -5%, 18% -8%, 33% -3%, 47% -10%, 61% -6%, 76% -4%, 90% -7%; opacity: 0; }
-        8%   { opacity: 0.8; }
-        92%  { opacity: 0.5; }
-        100% { background-position: 9% 105%, 24% 108%, 37% 102%, 53% 110%, 66% 104%, 80% 106%, 94% 103%; opacity: 0; }
-    }
-
-    /* ビネット */
-    .vignette {
-        position: fixed;
-        inset: 0;
-        z-index: -1;
-        pointer-events: none;
-        background: radial-gradient(ellipse at 50% 40%, transparent 35%, rgba(0, 4, 8, 0.55) 100%);
-    }
-
-    /* フィルムグレイン */
-    .film-grain {
-        position: fixed;
-        inset: 0;
-        z-index: -1;
-        pointer-events: none;
-        opacity: 0.05;
-        mix-blend-mode: overlay;
-        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
-        background-size: 220px 220px;
     }
 
     /* 文字色設定 */
@@ -142,14 +49,12 @@ st.markdown(
         background-color: rgba(10, 30, 40, 0.5) !important;
         border: 1px solid rgba(140, 200, 220, 0.2) !important;
         color: #bcdce8 !important;
-        backdrop-filter: blur(6px);
     }
     button[data-baseweb="tab"][aria-selected="true"] {
         background: linear-gradient(135deg, rgba(80, 190, 210, 0.22), rgba(40, 120, 150, 0.22)) !important;
         color: #ffffff !important;
         border: 1px solid rgba(120, 210, 230, 0.55) !important;
         font-weight: 700 !important;
-        box-shadow: 0 0 14px rgba(80, 190, 210, 0.3);
     }
 
     /* ボタンデザイン */
@@ -160,11 +65,9 @@ st.markdown(
         font-weight: 800 !important;
         border: none !important;
         padding: 0.5rem 1.6rem !important;
-        box-shadow: 0 0 16px rgba(47, 215, 196, 0.4), 0 3px 10px rgba(0,0,0,0.4) !important;
     }
     .stButton > button:hover {
         filter: brightness(1.1);
-        box-shadow: 0 0 24px rgba(47, 215, 196, 0.6), 0 3px 10px rgba(0,0,0,0.4) !important;
     }
 
     /* テキストエリア */
@@ -173,13 +76,9 @@ st.markdown(
         border: 1.5px solid rgba(140, 200, 220, 0.25) !important;
         background: rgba(4, 18, 26, 0.65) !important;
         color: #e4f3f8 !important;
-        backdrop-filter: blur(8px);
     }
     .stTextArea textarea::placeholder {
         color: #6b95a6 !important;
-    }
-    .stTextInput input, .stTextArea label, .stTextInput label {
-        color: #d3e8f0 !important;
     }
 
     /* Metricカード */
@@ -188,38 +87,6 @@ st.markdown(
         border-radius: 16px;
         padding: 0.9rem;
         border: 1px solid rgba(140, 200, 220, 0.2);
-        box-shadow: 0 0 14px rgba(60, 160, 190, 0.12);
-        backdrop-filter: blur(8px);
-    }
-    div[data-testid="stMetric"] label, div[data-testid="stMetricValue"] {
-        color: #e4f3f8 !important;
-    }
-
-    /* Expander */
-    .streamlit-expanderHeader {
-        border-radius: 12px !important;
-        background: rgba(10, 30, 40, 0.4) !important;
-        color: #d3e8f0 !important;
-        border: 1px solid rgba(140, 200, 220, 0.18) !important;
-    }
-    .streamlit-expanderContent {
-        background: rgba(10, 30, 40, 0.25) !important;
-        border-radius: 0 0 12px 12px !important;
-    }
-
-    /* UIパーツ */
-    .stCheckbox label { color: #d3e8f0 !important; }
-    div[data-testid="stAlert"] {
-        border-radius: 14px !important;
-        backdrop-filter: blur(6px);
-    }
-
-    /* Dataframe */
-    div[data-testid="stDataFrame"] {
-        border-radius: 14px;
-        overflow: hidden;
-        border: 1px solid rgba(140, 200, 220, 0.2);
-        box-shadow: 0 0 14px rgba(60, 160, 190, 0.1);
     }
 
     /* Matplotlib 画像表示コンテナ */
@@ -228,32 +95,11 @@ st.markdown(
         border-radius: 18px;
         padding: 1rem;
         border: 1px solid rgba(140, 200, 220, 0.3);
-        box-shadow: 0 0 20px rgba(60, 160, 190, 0.2), 0 6px 18px rgba(0,0,0,0.45);
     }
     div[data-testid="stImage"] img {
         border-radius: 10px;
     }
     </style>
-
-    <svg width="0" height="0" style="position:absolute">
-        <filter id="causticsFilter">
-            <feTurbulence type="fractalNoise" baseFrequency="0.012 0.05" numOctaves="2" seed="7" result="turb">
-                <animate attributeName="baseFrequency" dur="22s" values="0.012 0.05;0.02 0.07;0.012 0.05" repeatCount="indefinite" />
-            </feTurbulence>
-            <feColorMatrix in="turb" type="matrix"
-                values="0 0 0 0 0.55  0 0 0 0 0.85  0 0 0 0 0.95  0 0 0 1 0" result="tealTurb" />
-            <feComponentTransfer in="tealTurb">
-                <feFuncA type="gamma" exponent="7" amplitude="1.4" offset="0" />
-            </feComponentTransfer>
-            <feGaussianBlur stdDeviation="1.2" />
-        </filter>
-    </svg>
-
-    <div class="godrays"><span></span><span></span><span></span><span></span></div>
-    <div class="caustics-layer"></div>
-    <div class="marine-snow"></div>
-    <div class="vignette"></div>
-    <div class="film-grain"></div>
     """,
     unsafe_allow_html=True,
 )
@@ -292,7 +138,7 @@ with tab1:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
 
-    # 結果を表示（セッションから取得）
+    # 結果を表示
     if st.session_state.single_result is not None:
         relations = st.session_state.single_result["relations"]
 
@@ -379,7 +225,7 @@ with tab2:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.compare_result = None
 
-    # 結果を表示（セッションから取得）
+    # 結果を表示
     if st.session_state.compare_result is not None:
         res = st.session_state.compare_result
 
