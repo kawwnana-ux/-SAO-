@@ -3180,3 +3180,34 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
     """
     full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
     return analyze_claim(full_text), full_text
+
+
+def parse_claims_block(text):
+    """
+    「【請求項１】（本文）【請求項２】（本文）…」という、
+    実際の特許公報でそのまま使われている標準的な書式のテキストを、
+    区切りの手作業なしで直接パースする。
+
+    全角・半角どちらの数字にも対応する。
+    【請求項N】の目印が1つも見つからない場合は、テキスト全体を
+    請求項１本文とみなす（1件だけコピペした場合への対応）。
+
+    戻り値: {請求項番号(int): 本文(str)} の辞書
+    """
+    pattern = _re_dep.compile(r"【\s*請求項\s*([0-9０-９]+)\s*】")
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        stripped = text.strip()
+        return {1: stripped} if stripped else {}
+
+    result = {}
+    for i, m in enumerate(matches):
+        num_str = m.group(1).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        num = int(num_str)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            result[num] = body
+    return result
