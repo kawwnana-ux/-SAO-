@@ -7,3 +7,4 @@ matplotlib
 sentence-transformers
 scipy
 numpy
+graphviz
