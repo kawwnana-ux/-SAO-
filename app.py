@@ -161,6 +161,37 @@ def _find_column(df, aliases):
 
 
 def _split_multi_value(value):
+    def _extract_fi_subclass(value):
+    """
+    FIからサブクラスまでを抽出する。
+
+    例：
+      H01L 21/00     → H01L
+      H01L21/02      → H01L
+      G06F 3/01      → G06F
+      H10B 12/00     → H10B
+
+    複数のFIが指定されている場合は、それぞれから
+    サブクラスを抽出して重複を除去する。
+    """
+    fis = _split_multi_value(value)
+    subclasses = []
+
+    for fi in fis:
+        fi = str(fi).strip().upper()
+
+        # FIの先頭にある「英字1文字＋数字2桁＋英字1文字」
+        # をサブクラスとして取得
+        m = re.match(r"^([A-HY][0-9]{2}[A-Z])", fi)
+
+        if m:
+            subclasses.append(m.group(1))
+        else:
+            # 想定外の形式は元の値を残す
+            subclasses.append(fi)
+
+    # 順序を維持して重複除去
+    return list(dict.fromkeys(subclasses))
     """出願人/権利者・FIなどの複数値を汎用的に分割する。"""
     if pd.isna(value):
         return []
@@ -216,10 +247,15 @@ def _prepare_stats_df(df):
         "FI原文": df[fi_col],
         "出願人/権利者原文": df[applicant_col],
     })
-
+    
+    work["FIサブクラス"] = work["FI原文"].apply(
+        lambda x: _extract_fi_subclass(x)[0]if _extract_fi_subclass(x) else None
+    )
+    
     work["筆頭FI"] = work["FI原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
+
     work["筆頭出願人/権利者"] = work["出願人/権利者原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
