@@ -2066,7 +2066,7 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
             off_x, off_y = -ddy / dd * 0.22, ddx / dd * 0.22
         else:
             off_x, off_y = 0, 0
-        ax.text(mx + off_x, my + off_y, "→ " + d["relation"], fontsize=9, fontproperties=FONT_PROP,
+        ax.text(mx + off_x, my + off_y,  d["relation"], fontsize=9, fontproperties=FONT_PROP,
                 ha="center", va="center", color=edge_color, fontweight="medium",
                 bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor=line_color,
                           linewidth=1.1, alpha=0.95), zorder=3)
