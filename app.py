@@ -317,13 +317,35 @@ def _show_patent_statistics(df):
         hide_index=True
     )
 
-    # ② 筆頭FIランキング
-    st.markdown("### 🏆 ② 筆頭FIランキング")
+    
+    # ② 筆頭FIサブクラスランキング
+    st.markdown("### 🏆 ② 筆頭FIサブクラスランキング")
     first_fi = (
-        work.dropna(subset=["筆頭FI"])
-        .groupby("筆頭FI")
+        work.dropna(subset=["FIサブクラス"])
+        .groupby("FIサブクラス")
         .size()
         .reset_index(name="出願件数")
+        .sort_values(
+            ["出願件数", "FIサブクラス"],
+            ascending=[False, True]
+        )
+        .reset_index(drop=True)
+    )
+    
+    first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
+    
+    st.bar_chart(
+        first_fi.head(top_n).set_index("FIサブクラス")["出願件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label="FIサブクラス"
+    )
+    
+    st.dataframe(
+        first_fi.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
         .sort_values(["出願件数", "筆頭FI"], ascending=[False, True])
         .reset_index(drop=True)
     )
