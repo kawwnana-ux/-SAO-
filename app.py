@@ -117,16 +117,16 @@ st.markdown(
         backdrop-filter: blur(8px);
     }}
 
-    /* Matplotlib 画像表示コンテナ */
-    div[data-testid="stImage"] {{
-        background: rgba(255, 255, 255, 0.95);
+/* Matplotlib 画像表示コンテナ（透明化して真っ白になるのを防ぐ） */
+    div[data-testid="stImage"] {
+        background: transparent !important;
         border-radius: 18px;
-        padding: 1rem;
-        border: 1px solid rgba(100, 210, 255, 0.4);
-    }}
-    div[data-testid="stImage"] img {{
+        padding: 0.5rem;
+        border: none !important;
+    }
+    div[data-testid="stImage"] img {
         border-radius: 10px;
-    }}
+    }
     </style>
     """,
     unsafe_allow_html=True,
