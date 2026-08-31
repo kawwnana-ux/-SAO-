@@ -127,10 +127,7 @@ st.markdown(
     div[data-testid="stImage"] img {
         border-radius: 10px;
     }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
 
 # メインコンテンツ
 st.title("🪼　日本語特許請求項分析")
