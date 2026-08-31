@@ -22,6 +22,8 @@ if "patent_db" not in st.session_state:
     st.session_state.patent_db = None
 if "search_results" not in st.session_state:
     st.session_state.search_results = None
+if "dependent_result" not in st.session_state:
+    st.session_state.dependent_result = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -137,7 +139,7 @@ st.markdown(
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
-tab1, tab2, tab3 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索"])
+tab1, tab2, tab3, tab4 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索", "🪼 従属請求項を展開"])
 
 
 # ============================================================
@@ -152,7 +154,7 @@ with tab1:
         key="single_text",
     )
 
-    if st.button("🦈 解析する", type="primary", key="single_run"):
+    if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
@@ -467,3 +469,87 @@ with tab3:
                         use_container_width=True,
                         hide_index=True,
                     )
+
+
+# ============================================================
+# タブ④：従属請求項を、親請求項の内容も含めて完全な形に展開する
+# ============================================================
+with tab4:
+    st.subheader("📜 ステップ１：請求項群を貼り付ける")
+    st.caption(
+        "実際の公報の書き方（【請求項１】【請求項２】…）のまま、"
+        "コピペで貼り付けてください。区切りの手作業は不要です。"
+        "【請求項】の目印がなければ、全体を請求項１として扱います。"
+    )
+    claims_text = st.text_area(
+        "請求項群",
+        height=280,
+        placeholder="【請求項１】\n（請求項1の全文）\n【請求項２】\n（請求項2の全文。「請求項１に記載の」を含む）",
+        key="claims_text",
+    )
+
+    parsed_claims = pp.parse_claims_block(claims_text) if claims_text.strip() else {}
+
+    if claims_text.strip() and not parsed_claims:
+        st.warning("請求項を認識できませんでした。テキストを確認してください。")
+    elif parsed_claims:
+        st.success(f"✅ 請求項 {sorted(parsed_claims.keys())} を認識しました。")
+        with st.expander("認識結果を確認する"):
+            st.dataframe(
+                [{"番号": n, "本文（先頭60文字）": b[:60] + "..."} for n, b in sorted(parsed_claims.items())],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+
+    st.subheader("🪼 ステップ２：展開したい請求項を選ぶ")
+    if parsed_claims:
+        target_num = st.selectbox("展開する請求項番号", sorted(parsed_claims.keys()), key="target_claim_num")
+    else:
+        target_num = None
+        st.info("先にステップ１で請求項を入力してください。")
+
+    if st.button("🔍 展開して解析する", key="dependent_run", disabled=not parsed_claims):
+        try:
+            (components, relations), full_text = pp.analyze_dependent_claim(target_num, parsed_claims)
+            st.session_state.dependent_result = {
+                "full_text": full_text,
+                "relations": relations,
+            }
+        except Exception as e:
+            st.error(f"展開・解析中にエラーが発生しました: {e}")
+            st.session_state.dependent_result = None
+
+    if st.session_state.dependent_result is not None:
+        res = st.session_state.dependent_result
+        st.markdown("#### 📖 展開後の完全な請求項テキスト")
+        st.info(res["full_text"])
+
+        relations = res["relations"]
+        if not relations:
+            st.info("関係が抽出できませんでした。")
+        else:
+            st.success(f"🎉 {len(relations)} 件の関係を抽出しました！")
+            col1, col2 = st.columns([3, 2])
+            with col1:
+                st.markdown("#### 🪸 構成要素間の関係図")
+                graph = pp.build_graphviz(relations, title="構成要素間関係（展開後）", theme="deepsea")
+                st.graphviz_chart(graph, use_container_width=True)
+
+                st.markdown("#### 🐙 クレームの広さ・狭さ")
+                narrowness, breadth, scope_detail = pp.compute_claim_scope_score(relations)
+                scope_cols = st.columns(2)
+                scope_cols[0].metric("広さスコア", f"{breadth:.3f}")
+                scope_cols[1].metric("狭さスコア", f"{narrowness:.3f}")
+
+            with col2:
+                st.markdown("#### 📋 抽出された関係（SAOトリプル）")
+                st.dataframe(
+                    [
+                        {"主語": r["source"], "関係": r["relation"], "目的語": r["target"], "種類": r["type"]}
+                        for r in relations
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )

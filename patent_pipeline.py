@@ -1060,9 +1060,20 @@ def extract_composition_relations(doc, components):
         if not source_comps:
             continue
 
-        head_noun = verb.head
         target_comp = None
-        if head_noun.i != verb.i:
+        nsubj_child = None
+        for child in verb.children:
+            if child.dep_ == "nsubj":
+                nsubj_child = child
+                break
+        if nsubj_child is not None:
+            target_comp = (
+                find_component_by_token(components, nsubj_child.i)
+                or find_referenced_component(components, nsubj_child)
+            )
+
+        head_noun = verb.head
+        if target_comp is None and head_noun.i != verb.i:
             target_comp = find_component_by_token(components, head_noun.i)
             if target_comp is None:
                 fallback = find_target_component_from_verb(components, verb)
@@ -2595,17 +2606,7 @@ def _get_embed_model():
         _embed_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
     return _embed_model
 
-def relations_to_triple_set_for_semantic(relations, normalize_numbers=True):
-    """
-    意味マッチング（②）専用のトリプル集合。
-    「有する」は階層構造の情報であり、すでに③（構造の類似度）が
-    見ているので、ここでは含めない。「検査装置 有する 通信部」の
-    ような、部品名が違うだけで骨組みが同じ表現に、意味マッチングが
-    釣られてしまうのを防ぐため。
-    """
-    filtered = [r for r in relations if r["type"] != "has"]
-    return relations_to_triple_set(filtered, normalize_numbers)
-    
+
 def _triple_to_text(triple):
     source, relation, target = triple
     return f"{source}が{target}を{relation}"
@@ -2622,8 +2623,11 @@ def semantic_similarity(relations_a, relations_b, normalize_numbers=True):
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
-    triples_a = sorted(relations_to_triple_set_for_semantic(relations_a, normalize_numbers))
-    triples_b = sorted(relations_to_triple_set_for_semantic(relations_b, normalize_numbers))
+    triples_a = sorted(relations_to_triple_set(relations_a, normalize_numbers))
+    triples_b = sorted(relations_to_triple_set(relations_b, normalize_numbers))
+
+    if not triples_a or not triples_b:
+        return 0.0, []
 
     model = _get_embed_model()
     texts_a = [_triple_to_text(t) for t in triples_a]
@@ -2986,7 +2990,6 @@ def build_patent_database(records, show_progress=True):
             continue
         if not relations:
             continue
-        
         triples = sorted(relations_to_triple_set(relations, normalize_numbers=True))
         texts = [_triple_to_text(t) for t in triples]
         embeddings = model.encode(texts, normalize_embeddings=True)
@@ -3057,3 +3060,123 @@ def print_search_results(results, query_name="検索クエリ"):
         precise = f", 精密スコア={r['precise_score']:.3f}" if "precise_score" in r else ""
         print(f"{i+1}. [{r['id']}] 粗いスコア={r['fast_score']:.3f}{precise}")
     return results
+
+
+# ============================================================
+# ⑳ 従属請求項の展開
+# ============================================================
+# 「請求項１に記載の◯◯」という従属請求項は、親請求項の内容を
+# 文章として繰り返さないため、そのままanalyze_claim()に渡しても
+# 追加された限定文言しか抽出できず、親請求項が本来持っている
+# 構成要素が全部抜け落ちてしまう。
+# ここでは、親請求項の本文と、従属請求項の追加限定を自動でつなぎ
+# 合わせ、単独で解析できる完全な文章に組み立て直す。
+
+import re as _re_dep
+
+
+def _split_claim_title(text):
+    """
+    請求項テキストの末尾にある「発明の名称」を、コンマの位置に
+    頼らず、既存の構成要素抽出ロジックを再利用して正確に切り出す。
+    戻り値: (発明の名称を除いた本文, 発明の名称)
+    """
+    text = text.strip()
+    doc = nlp(text)
+    components = extract_patent_components_general(doc)
+
+    last_i = len(doc) - 1
+    while last_i > 0 and doc[last_i].pos_ == "PUNCT":
+        last_i -= 1
+
+    title_comp = find_component_by_token(components, last_i)
+    if title_comp is None:
+        return "", text
+
+    start_char = doc[title_comp["start"]].idx
+    end_char = doc[last_i].idx + len(doc[last_i].text)
+    body = text[:start_char]
+    title = text[start_char:end_char]
+    return body, title
+
+
+_CLAIM_REF_PATTERN = _re_dep.compile(
+    r"請求項(?P<nums>[0-9０-９、,及びおよび又はまたはからー～\-]+)(?:のいずれか)?(?:一項)?に記載の"
+)
+
+
+def _parse_claim_ref(text):
+    """
+    「請求項１に記載の」「請求項１又は２に記載の」
+    「請求項１から３のいずれか一項に記載の」等から、
+    参照している請求項番号と、その表現の位置を取り出す。
+    参照が見つからなければ None を返す（＝独立請求項）。
+    """
+    m = _CLAIM_REF_PATTERN.search(text)
+    if not m:
+        return None
+    span = m.group("nums")
+    span_half = span.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    nums = [int(n) for n in _re_dep.findall(r"\d+", span_half)]
+    if not nums:
+        return None
+    if any(c in span for c in ("から", "-", "ー", "～")) and len(nums) >= 2:
+        nums = list(range(nums[0], nums[-1] + 1))
+    return {"numbers": sorted(set(nums)), "match_start": m.start(), "match_end": m.end()}
+
+
+def resolve_dependent_claim(claim_number, claim_texts, prefer_parent=None, _seen=None):
+    """
+    claim_texts: {請求項番号(int): 本文(str)} の辞書
+    claim_number: 展開したい請求項の番号
+
+    「請求項１又は２に記載の」のように複数の請求項を参照している
+    場合、prefer_parentでどちらを親とみなすか指定できる
+    （省略時は一番小さい番号を使う）。
+
+    戻り値: 親請求項の内容をすべて展開した、単独でanalyze_claim()に
+            渡せる完全な請求項テキスト。
+    """
+    if _seen is None:
+        _seen = set()
+    if claim_number in _seen:
+        raise ValueError(f"請求項の参照が循環しています: {claim_number}")
+    _seen = _seen | {claim_number}
+
+    text = claim_texts.get(claim_number)
+    if text is None:
+        raise KeyError(f"請求項{claim_number}の本文が見つかりません")
+
+    ref = _parse_claim_ref(text)
+    if ref is None:
+        # 他の請求項を参照していない、独立請求項
+        return text.strip()
+
+    parent_num = prefer_parent if prefer_parent in ref["numbers"] else ref["numbers"][0]
+    parent_text = resolve_dependent_claim(parent_num, claim_texts, _seen=_seen)
+
+    # 「請求項◯に記載の」より前の部分が、追加の限定文言
+    additional = text[:ref["match_start"]].strip()
+    if additional.endswith(("、", "，")):
+        additional = additional[:-1]
+
+    # 親請求項の文はそのまま残し（コンマでつなげて1つの長い文に
+    # してしまうとGiNZAが誤読しやすくなるため）、追加の限定文言は
+    # 独立したもう1つの文として付け加える。同じ表現（例：「前記電極」）
+    # は、後段の解析で自動的に同じノードとして扱われるので、
+    # 文を分けても情報は失われない。
+    merged = parent_text.strip()
+    if not merged.endswith("。"):
+        merged += "。"
+    if additional:
+        merged += additional + "。"
+    return merged
+
+
+def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
+    """
+    resolve_dependent_claim() で展開したテキストを、そのまま
+    analyze_claim() にかけるところまでを1回で行う便利関数。
+    """
+    full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
+    return analyze_claim(full_text), full_text
