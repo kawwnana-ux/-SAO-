@@ -1,5 +1,5 @@
 import base64
-import matplotlib.plt as plt
+import matplotlib.pyplot as plt
 import streamlit as st
 
 # (中略: set_page_config や import など)
