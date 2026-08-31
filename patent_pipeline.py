@@ -1880,6 +1880,72 @@ def _bezier_point_at(verts, t):
     return x, y
 
 
+_BRANCH_PALETTE = [
+    {"fill": "#EAF2FF", "edge": "#5B8DEF", "line": "#8FB2F5"},   # 青
+    {"fill": "#EAFBF1", "edge": "#34A870", "line": "#8FD6B2"},   # 緑
+    {"fill": "#FFF3E6", "edge": "#E08A2E", "line": "#F0BE8C"},   # オレンジ
+    {"fill": "#FCEAF5", "edge": "#D4529C", "line": "#EBA6CE"},   # ピンク
+    {"fill": "#F0EBFF", "edge": "#8A63D2", "line": "#C2ACEE"},   # 紫
+    {"fill": "#E9FBFF", "edge": "#2FA3B8", "line": "#8FD6E4"},   # 水色
+    {"fill": "#FFF9E0", "edge": "#C9A400", "line": "#E8D480"},   # 黄
+    {"fill": "#FDECEA", "edge": "#D9534F", "line": "#EDA6A3"},   # 赤
+]
+_ROOT_STYLE = {"fill": "#3B4252", "edge": "#3B4252", "line": "#B0B7C6", "text": "#FFFFFF"}
+
+
+def _assign_branch_colors(G):
+    """
+    ルートから見て、どの大枝（rootの直接の子）に属するかを求め、
+    枝ごとに違う色を割り当てる。NotebookLMのマインドマップのように、
+    同じ枝の中は同じ色系統になる。
+    「有する」だけでなく、直接関係・位置関係の辺もたどって、
+    枝の色を子孫まできちんと引き継ぐ。
+    """
+    has_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("type") == "has"]
+    owners = set(u for u, v in has_edges)
+    all_targets = set(v for u, v, d in G.edges(data=True))
+    roots = [n for n in owners if n not in all_targets]
+    root = roots[0] if roots else (next(iter(G.nodes())) if G.nodes() else None)
+
+    # 種類を問わず、隣接ノードを辿れるようにしておく
+    neighbors = {}
+    for u, v in G.edges():
+        neighbors.setdefault(u, []).append(v)
+        neighbors.setdefault(v, []).append(u)
+
+    has_children = {}
+    for u, v in has_edges:
+        has_children.setdefault(u, []).append(v)
+
+    branch_of = {}
+    if root is not None:
+        branch_of[root] = None
+        top_children = has_children.get(root, [])
+        for i, c in enumerate(top_children):
+            branch_of[c] = i % len(_BRANCH_PALETTE)
+
+        # rootの直接の子（各大枝の起点）から、辺の種類を問わず
+        # 全方向にBFSで色を広げていく
+        from collections import deque
+        queue = deque(top_children)
+        while queue:
+            node = queue.popleft()
+            b = branch_of.get(node)
+            for nb in neighbors.get(node, []):
+                if nb not in branch_of and nb != root:
+                    branch_of[nb] = b
+                    queue.append(nb)
+
+    styles = {}
+    for n in G.nodes():
+        if n == root:
+            styles[n] = _ROOT_STYLE
+        else:
+            b = branch_of.get(n)
+            styles[n] = _BRANCH_PALETTE[b] if b is not None else _BRANCH_PALETTE[0]
+    return styles, root
+
+
 def visualize_relations(final_relations, title="特許請求項の構成要素間関係"):
     """analyze_claim()等が返した関係リストを渡すと、マインドマップ風の図を描画する"""
     G = nx.DiGraph()
@@ -1892,6 +1958,7 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
         print("関係が抽出できませんでした。構成要素や依存構造を確認してください。")
         return
 
+    node_styles, _root_node = _assign_branch_colors(G)
     labels = {n: _wrap_label(n) for n in G.nodes()}
     pos = compute_layout(G)
 
@@ -1942,7 +2009,9 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
     # 辺（ベジェ曲線）を先に描く
     # ------------------------------------------------------
     for u, v, d in edge_list:
-        style = TYPE_STYLE.get(d["type"], {"color": "gray"})
+        branch_style = node_styles.get(v, node_styles.get(u, _BRANCH_PALETTE[0]))
+        line_color = branch_style["line"] if branch_style is not _ROOT_STYLE else "#B0B7C6"
+        edge_color = branch_style["edge"] if branch_style is not _ROOT_STYLE else "#8A93A6"
         x0, y0 = pos[u]
         x1, y1 = pos[v]
         w0, h0 = _box_size(labels[u])
@@ -1971,12 +2040,13 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
             verts = [(sx, sy), (sx + dx, sy), (tx - dx, ty), (tx, ty)]
             path = Path(verts, [Path.MOVETO, Path.CURVE4, Path.CURVE4, Path.CURVE4])
 
-        patch = mpatches.PathPatch(path, facecolor="none", edgecolor=style["color"], lw=1.8, zorder=1)
+        patch = mpatches.PathPatch(path, facecolor="none", edgecolor=line_color, lw=2.4, zorder=1,
+                                    capstyle="round")
         ax.add_patch(patch)
 
         arrow_dx = 0.15 if tx > sx else -0.15
         ax.annotate("", xy=(tx, ty), xytext=(tx - arrow_dx, ty),
-                    arrowprops=dict(arrowstyle="-|>", color=style["color"], lw=1.8))
+                    arrowprops=dict(arrowstyle="-|>", color=edge_color, lw=2.0))
 
         # ラベル位置：同じsourceから複数の辺が出ている場合、
         # tを0.3〜0.7の範囲でずらして重なりを減らす
@@ -1996,32 +2066,27 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
             off_x, off_y = -ddy / dd * 0.22, ddx / dd * 0.22
         else:
             off_x, off_y = 0, 0
-        ax.text(mx + off_x, my + off_y, d["relation"], fontsize=9, fontproperties=FONT_PROP,
-                ha="center", va="center",
-                bbox=dict(facecolor="white", edgecolor="none", alpha=0.9, pad=1.2), zorder=3)
+        ax.text(mx + off_x, my + off_y, "→ " + d["relation"], fontsize=9, fontproperties=FONT_PROP,
+                ha="center", va="center", color=edge_color, fontweight="medium",
+                bbox=dict(boxstyle="round,pad=0.28", facecolor="white", edgecolor=line_color,
+                          linewidth=1.1, alpha=0.95), zorder=3)
 
     # ------------------------------------------------------
-    # ノード（角丸四角）
+    # ノード（角丸四角、枝ごとに色分け）
     # ------------------------------------------------------
     for n in G.nodes():
         x, y = pos[n]
         w, h = _box_size(labels[n])
+        style = node_styles.get(n, _BRANCH_PALETTE[0])
+        text_color = style.get("text", "#233044")
         box = mpatches.FancyBboxPatch(
             (x - w / 2, y - h / 2), w, h,
-            boxstyle="round,pad=0.05,rounding_size=0.12",
-            linewidth=1.5, edgecolor="#2f5f96", facecolor="#eaf1fb", zorder=4
+            boxstyle="round,pad=0.06,rounding_size=0.22",
+            linewidth=1.8, edgecolor=style["edge"], facecolor=style["fill"], zorder=4,
         )
         ax.add_patch(box)
         ax.text(x, y, labels[n], fontsize=10.5, fontproperties=FONT_PROP,
-                ha="center", va="center", zorder=5, color="#1b3350")
-
-    legend_handles = [
-        mpatches.Patch(color=TYPE_STYLE[t]["color"], label=TYPE_STYLE[t]["label"])
-        for t in used_types if t in TYPE_STYLE
-    ]
-    if legend_handles:
-        ax.legend(handles=legend_handles, prop=FONT_PROP, fontsize=10, loc="lower left",
-                  bbox_to_anchor=(0, 1.02), frameon=False)
+                ha="center", va="center", zorder=5, color=text_color, fontweight="bold")
 
     ax.set_title(title, fontproperties=FONT_PROP, fontsize=18, pad=25)
     ax.set_xlim(min(xs) - 3, max(xs) + 3)

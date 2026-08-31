@@ -3,25 +3,79 @@ import matplotlib.pyplot as plt
 
 import patent_pipeline as pp
 
-import inspect
-if "all_list_targets" in inspect.getsource(pp.extract_has_relations):
-    st.success("✅ 最新版のコードが読み込まれています")
-else:
-    st.error("❌ まだ古いコードのままです")
+st.set_page_config(page_title="🍡 特許SAOラボ", page_icon="🍡", layout="wide")
 
-st.set_page_config(page_title="特許請求項SAO解析", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* 全体の背景と余白 */
+    .stApp {
+        background: linear-gradient(180deg, #FFF9F5 0%, #FDF3FB 100%);
+    }
+    /* タイトル周り */
+    h1 {
+        color: #5B4B8A !important;
+        font-weight: 800 !important;
+    }
+    /* タブ */
+    button[data-baseweb="tab"] {
+        border-radius: 999px !important;
+        padding: 0.4rem 1.2rem !important;
+        margin-right: 0.4rem !important;
+        background-color: #FFFFFF !important;
+        border: 1px solid #EADCF8 !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background-color: #F3E8FF !important;
+        color: #7C4DBD !important;
+        font-weight: 700 !important;
+    }
+    /* ボタン */
+    .stButton > button {
+        border-radius: 999px !important;
+        background: linear-gradient(135deg, #FFB6C1 0%, #C9A7F5 100%) !important;
+        color: white !important;
+        font-weight: 700 !important;
+        border: none !important;
+        padding: 0.5rem 1.6rem !important;
+        box-shadow: 0 3px 8px rgba(180, 140, 220, 0.35) !important;
+    }
+    .stButton > button:hover {
+        opacity: 0.9 !important;
+    }
+    /* テキストエリア */
+    .stTextArea textarea {
+        border-radius: 16px !important;
+        border: 1.5px solid #EADCF8 !important;
+    }
+    /* metricカード */
+    div[data-testid="stMetric"] {
+        background-color: #FFFFFF;
+        border-radius: 16px;
+        padding: 0.8rem;
+        border: 1px solid #F1E4FB;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    /* expander */
+    .streamlit-expanderHeader {
+        border-radius: 12px !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.title("特許請求項 SAO構造解析・類似度診断")
-st.caption("GiNZAによる依存構造解析で、特許請求項を構成要素間の関係グラフに変換します。")
+st.title("🍡 特許SAOラボ")
+st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します🌸")
 
-tab1, tab2 = st.tabs(["① 1つの請求項を解析", "② 2つの請求項を比較"])
+tab1, tab2 = st.tabs(["🌱 1つの請求項を解析", "🔍 2つの請求項を比較"])
 
 
 # ============================================================
 # タブ①：1つの請求項を解析して図を見る
 # ============================================================
 with tab1:
-    st.subheader("請求項を入力してください")
+    st.subheader("📝 請求項を入力してください")
     text = st.text_area(
         "請求項テキスト",
         height=220,
@@ -29,7 +83,7 @@ with tab1:
         key="single_text",
     )
 
-    if st.button("解析する", type="primary", key="single_run"):
+    if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
         else:
@@ -44,19 +98,19 @@ with tab1:
                 if not relations:
                     st.info("関係が抽出できませんでした。文の書き方を見直してみてください。")
                 else:
-                    st.success(f"{len(relations)} 件の関係を抽出しました。")
+                    st.success(f"🎉 {len(relations)} 件の関係を抽出しました！")
 
                     col1, col2 = st.columns([3, 2])
 
                     with col1:
-                        st.markdown("#### 構成要素間の関係図")
+                        st.markdown("#### 🌳 構成要素間の関係図")
                         pp.visualize_relations(relations, title="構成要素間関係")
                         fig = plt.gcf()
                         st.pyplot(fig)
                         plt.close(fig)
 
                     with col2:
-                        st.markdown("#### 抽出された関係（SAOトリプル）")
+                        st.markdown("#### 📋 抽出された関係（SAOトリプル）")
                         st.dataframe(
                             [
                                 {"主語": r["source"], "関係": r["relation"],
@@ -72,7 +126,7 @@ with tab1:
 # タブ②：2つの請求項を比較して類似度診断する
 # ============================================================
 with tab2:
-    st.subheader("2つの請求項を入力してください")
+    st.subheader("📝 2つの請求項を入力してください")
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -85,7 +139,7 @@ with tab2:
         value=False,
     )
 
-    if st.button("比較する", type="primary", key="compare_run"):
+    if st.button("🔍 比較する", type="primary", key="compare_run"):
         if not text_a.strip() or not text_b.strip():
             st.warning("請求項A・Bの両方を入力してください。")
         else:
@@ -110,7 +164,7 @@ with tab2:
                         except Exception as e:
                             st.error(f"意味マッチングでエラーが発生しました: {e}")
 
-                st.markdown("### 診断結果")
+                st.markdown("### 💎 診断結果")
                 score_cols = st.columns(3)
                 score_cols[0].metric("①Jaccard類似度（表記の一致）", f"{jaccard_score:.3f}")
                 if semantic_score is not None:
@@ -127,7 +181,7 @@ with tab2:
                         f"- 関係の種類の内訳の類似度: {structural_detail['関係の種類の内訳の類似度']:.3f}"
                     )
 
-                st.markdown("### ①Jaccard：トリプルの一致・不一致")
+                st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.markdown(f"**共通トリプル（{len(common)}件）**")
@@ -143,7 +197,7 @@ with tab2:
                         st.write(t)
 
                 if semantic_matches is not None:
-                    st.markdown("### ②意味マッチング：対応付けの詳細")
+                    st.markdown("### 🌸 ②意味マッチング：対応付けの詳細")
                     matches_sorted = sorted(semantic_matches, key=lambda x: -x[2])
                     st.dataframe(
                         [
