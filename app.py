@@ -49,7 +49,6 @@ except Exception:
     }
     """
 
-# カスタムCSS（元コードのCSSに背景画像だけを反映）
 st.markdown(
     f"""
     <style>
@@ -178,10 +177,14 @@ with tab1:
 
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
-                fig = plt.figure(figsize=(8, 6))
+                # 前のプロット領域を一度クリア
+                plt.clf()
+                plt.close('all')
+
+                # visualize_relationsを実行し、その直後の現在のFigureを取得して描画
                 pp.visualize_relations(relations, title="構成要素間関係")
-                st.pyplot(fig)
-                plt.close(fig)
+                st.pyplot(plt.gcf())
+                plt.clf()
 
             with col2:
                 st.markdown("#### 📋 抽出された関係（SAOトリプル）")
