@@ -27,7 +27,7 @@ def get_base64_of_bin_file(bin_file):
     return base64.b64encode(data).decode()
 
 
-# 背景CSSの組み立て
+# 背景CSSの設定
 try:
     bin_str = get_base64_of_bin_file("deep_sea.jpg")
     bg_style = f"""
@@ -43,12 +43,13 @@ try:
     """
 except Exception:
     bg_style = """
-    [data-testid="stAppViewContainer"] {
+    .stApp {
         background: linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
+        background-attachment: fixed;
     }
     """
 
-# カスタムCSS適用
+# カスタムCSS（元コードのCSSに背景画像だけを反映）
 st.markdown(
     f"""
     <style>
@@ -56,15 +57,15 @@ st.markdown(
 
     /* 文字色設定 */
     .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, .stCaption {{
-        color: #e6f7ff !important;
+        color: #d3e8f0;
     }}
     h1, h2, h3, h4 {{
-        color: #ffffff !important;
-        text-shadow: 0 0 12px rgba(0, 200, 255, 0.6);
+        color: #aee0ee !important;
+        text-shadow: 0 0 16px rgba(120, 200, 220, 0.35);
         font-weight: 800 !important;
     }}
     .stCaption, [data-testid="stCaptionContainer"] {{
-        color: #b3e0ff !important;
+        color: #86b3c4 !important;
     }}
 
     /* タブデザイン */
@@ -72,60 +73,55 @@ st.markdown(
         border-radius: 999px !important;
         padding: 0.4rem 1.2rem !important;
         margin-right: 0.4rem !important;
-        background-color: rgba(5, 25, 45, 0.65) !important;
-        border: 1px solid rgba(100, 210, 255, 0.3) !important;
-        color: #cceeff !important;
-        backdrop-filter: blur(8px);
+        background-color: rgba(10, 30, 40, 0.5) !important;
+        border: 1px solid rgba(140, 200, 220, 0.2) !important;
+        color: #bcdce8 !important;
     }}
     button[data-baseweb="tab"][aria-selected="true"] {{
-        background: linear-gradient(135deg, rgba(0, 180, 220, 0.5), rgba(0, 90, 140, 0.5)) !important;
+        background: linear-gradient(135deg, rgba(80, 190, 210, 0.22), rgba(40, 120, 150, 0.22)) !important;
         color: #ffffff !important;
-        border: 1px solid rgba(120, 230, 255, 0.8) !important;
+        border: 1px solid rgba(120, 210, 230, 0.55) !important;
         font-weight: 700 !important;
     }}
 
     /* ボタンデザイン */
     .stButton > button {{
         border-radius: 999px !important;
-        background: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%) !important;
-        color: #001e38 !important;
+        background: linear-gradient(135deg, #2fd7c4 0%, #1a8fb0 100%) !important;
+        color: #021a24 !important;
         font-weight: 800 !important;
         border: none !important;
         padding: 0.5rem 1.6rem !important;
-        box-shadow: 0 4px 15px rgba(0, 180, 255, 0.4);
     }}
     .stButton > button:hover {{
-        filter: brightness(1.15);
+        filter: brightness(1.1);
     }}
 
     /* テキストエリア */
     .stTextArea textarea {{
         border-radius: 14px !important;
-        border: 1.5px solid rgba(100, 210, 255, 0.4) !important;
-        background: rgba(3, 20, 35, 0.6) !important;
-        color: #ffffff !important;
-        backdrop-filter: blur(8px);
+        border: 1.5px solid rgba(140, 200, 220, 0.25) !important;
+        background: rgba(4, 18, 26, 0.65) !important;
+        color: #e4f3f8 !important;
     }}
     .stTextArea textarea::placeholder {{
-        color: #80c8e8 !important;
+        color: #6b95a6 !important;
     }}
 
     /* Metricカード */
     div[data-testid="stMetric"] {{
-        background: rgba(5, 25, 45, 0.65);
+        background: rgba(10, 30, 40, 0.45);
         border-radius: 16px;
         padding: 0.9rem;
-        border: 1px solid rgba(100, 210, 255, 0.3);
-        backdrop-filter: blur(8px);
+        border: 1px solid rgba(140, 200, 220, 0.2);
     }}
 
     /* Matplotlib 画像表示コンテナ */
     div[data-testid="stImage"] {{
-        background: rgba(255, 255, 255, 0.92) !important;
+        background: rgba(248, 250, 250, 0.97);
         border-radius: 18px;
-        padding: 0.8rem;
-        border: 1px solid rgba(100, 210, 255, 0.4) !important;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        padding: 1rem;
+        border: 1px solid rgba(140, 200, 220, 0.3);
     }}
     div[data-testid="stImage"] img {{
         border-radius: 10px;
@@ -182,8 +178,6 @@ with tab1:
 
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
-
-                # 元のきれいな描画コードをそのまま呼び出します
                 fig = plt.figure(figsize=(8, 6))
                 pp.visualize_relations(relations, title="構成要素間関係")
                 st.pyplot(fig)
