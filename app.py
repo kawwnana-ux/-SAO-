@@ -147,14 +147,16 @@ tab1, tab2, tab3, tab4 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つ�
 # ============================================================
 with tab1:
     st.subheader("📝 請求項を入力してください")
-    text = st.text_area(
-        "請求項テキスト",
-        height=220,
-        placeholder="例：第１の基板と、前記第１の基板上に設けられた第２の半導体層と、前記第２の半導体層に接続された電極と、を有する半導体装置。",
-        key="single_text",
-    )
+    with st.form("single_form"):
+        text = st.text_area(
+            "請求項テキスト",
+            height=220,
+            placeholder="例：第１の基板と、前記第１の基板上に設けられた第２の半導体層と、前記第２の半導体層に接続された電極と、を有する半導体装置。",
+            key="single_text",
+        )
+        submitted = st.form_submit_button("✨ 解析する", type="primary")
 
-    if st.button("✨ 解析する", type="primary", key="single_run"):
+    if submitted:
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
