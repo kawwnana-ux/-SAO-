@@ -200,7 +200,7 @@ def _prepare_stats_df(df):
         "FI", "筆頭FI", "FI分類", "FIコード", "fi_code", "fi"
     ])
     applicant_col = _find_column(df, [
-        "出願人/権利者/権利者", "出願人/権利者名", "出願人/権利者名称", "applicant",
+        "出願人/権利者", "出願人/権利者名", "出願人/権利者名称", "applicant",
         "applicants", "applicant_name"
     ])
 
@@ -220,7 +220,7 @@ def _prepare_stats_df(df):
     work["筆頭FI"] = work["FI原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
-    work["筆頭出願人/権利者/権利者"] = work["出願人/権利者/権利者原文"].apply(
+    work["筆頭出願人/権利者"] = work["出願人/権利者原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
 
@@ -233,23 +233,23 @@ def _make_applicant_fi_table(work):
     """出願人/権利者ごとに、その出願に含まれるFIを集計する。"""
     rows = []
     for _, row in work.iterrows():
-        applicants = _split_multi_value(row["出願人/権利者/権利者原文"])
+        applicants = _split_multi_value(row["出願人/権利者原文"])
         fis = _split_multi_value(row["FI原文"])
         if not applicants or not fis:
             continue
         for applicant in applicants:
             for fi in fis:
-                rows.append({"出願人/権利者/権利者": applicant, "FI": fi})
+                rows.append({"出願人/権利者": applicant, "FI": fi})
 
     if not rows:
-        return pd.DataFrame(columns=["出願人/権利者/権利者", "FI", "件数"])
+        return pd.DataFrame(columns=["出願人/権利者", "FI", "件数"])
 
     tmp = pd.DataFrame(rows)
     result = (
-        tmp.groupby(["出願人/権利者/権利者", "FI"])
+        tmp.groupby(["出願人/権利者", "FI"])
         .size()
         .reset_index(name="件数")
-        .sort_values(["出願人/権利者/権利者", "件数", "FI"], ascending=[True, False, True])
+        .sort_values(["出願人/権利者", "件数", "FI"], ascending=[True, False, True])
     )
     return result
 
@@ -268,7 +268,7 @@ def _show_patent_statistics(df):
 
     st.success(
         f"✅ {len(work):,} 件を分析しました。"
-        f"（出願日: {date_col} / FI: {fi_col} / 出願人/権利者/権利者: {applicant_col}）"
+        f"（出願日: {date_col} / FI: {fi_col} / 出願人/権利者: {applicant_col}）"
     )
 
     # ① 年別出願件数
