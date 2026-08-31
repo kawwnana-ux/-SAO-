@@ -1,17 +1,29 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# Matplotlibの日本語文字化け対策（インストールされていない場合は無視されるようtry-except）
+try:
+    import japanize_matplotlib
+except ImportError:
+    pass
+
 import patent_pipeline as pp
 
+# ページ基本設定
 st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
 
+# セッション状態の初期化
+if "single_result" not in st.session_state:
+    st.session_state.single_result = None
+if "compare_result" not in st.session_state:
+    st.session_state.compare_result = None
+
+# カスタムCSS & SVGフィルタ
 st.markdown(
     """
     <style>
     /* ============================================================
        深海テーマ（リアル志向）：基調カラー
-       派手な虹色をやめ、単色系（黒〜濃紺〜ティール）の
-       ドキュメンタリー的な深海の色調に統一する。
     ============================================================ */
     .stApp {
         background:
@@ -22,9 +34,7 @@ st.markdown(
         overflow-x: hidden;
     }
 
-    /* ------------------------------------------------------------
-       ゴッドレイ（水面から差し込む光芒）
-    ------------------------------------------------------------ */
+    /* ゴッドレイ（水面から差し込む光芒） */
     .godrays { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }
     .godrays span {
         position: absolute;
@@ -45,10 +55,7 @@ st.markdown(
         50%      { transform: rotate(calc(var(--r, 6deg) * -1)) translateX(18px); opacity: 0.85; }
     }
 
-    /* ------------------------------------------------------------
-       コースティクス（水面の揺らめく光の網目模様）
-       SVGフィルタ（feTurbulence）で有機的な揺らぎを再現
-    ------------------------------------------------------------ */
+    /* コースティクス（水面の揺らめく光の網目模様） */
     .caustics-layer {
         position: fixed;
         inset: 0;
@@ -60,9 +67,7 @@ st.markdown(
         opacity: 0.22;
     }
 
-    /* ------------------------------------------------------------
-       マリンスノー（ゆっくり降り積もる微粒子）
-    ------------------------------------------------------------ */
+    /* マリンスノー（ゆっくり降り積もる微粒子） */
     .marine-snow { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; filter: blur(0.3px); }
     .marine-snow::before, .marine-snow::after {
         content: "";
@@ -95,9 +100,7 @@ st.markdown(
         100% { background-position: 9% 105%, 24% 108%, 37% 102%, 53% 110%, 66% 104%, 80% 106%, 94% 103%; opacity: 0; }
     }
 
-    /* ------------------------------------------------------------
-       ビネット（画面端を暗く落として奥行きを出す）
-    ------------------------------------------------------------ */
+    /* ビネット */
     .vignette {
         position: fixed;
         inset: 0;
@@ -106,9 +109,7 @@ st.markdown(
         background: radial-gradient(ellipse at 50% 40%, transparent 35%, rgba(0, 4, 8, 0.55) 100%);
     }
 
-    /* ------------------------------------------------------------
-       フィルムグレイン（微細なノイズで写真的な質感を足す）
-    ------------------------------------------------------------ */
+    /* フィルムグレイン */
     .film-grain {
         position: fixed;
         inset: 0;
@@ -120,7 +121,7 @@ st.markdown(
         background-size: 220px 220px;
     }
 
-    /* 全体の文字色（深海の中で読みやすいライトカラーに） */
+    /* 文字色設定 */
     .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, .stCaption {
         color: #d3e8f0;
     }
@@ -133,7 +134,7 @@ st.markdown(
         color: #86b3c4 !important;
     }
 
-    /* タブ（潜水艇のHUD風ガラスピル） */
+    /* タブデザイン */
     button[data-baseweb="tab"] {
         border-radius: 999px !important;
         padding: 0.4rem 1.2rem !important;
@@ -151,7 +152,7 @@ st.markdown(
         box-shadow: 0 0 14px rgba(80, 190, 210, 0.3);
     }
 
-    /* ボタン（発光生物のバイオルミネセンス） */
+    /* ボタンデザイン */
     .stButton > button {
         border-radius: 999px !important;
         background: linear-gradient(135deg, #2fd7c4 0%, #1a8fb0 100%) !important;
@@ -166,7 +167,7 @@ st.markdown(
         box-shadow: 0 0 24px rgba(47, 215, 196, 0.6), 0 3px 10px rgba(0,0,0,0.4) !important;
     }
 
-    /* テキストエリア（潜水艇の計器パネル風） */
+    /* テキストエリア */
     .stTextArea textarea {
         border-radius: 14px !important;
         border: 1.5px solid rgba(140, 200, 220, 0.25) !important;
@@ -181,7 +182,7 @@ st.markdown(
         color: #d3e8f0 !important;
     }
 
-    /* metricカード */
+    /* Metricカード */
     div[data-testid="stMetric"] {
         background: rgba(10, 30, 40, 0.45);
         border-radius: 16px;
@@ -194,7 +195,7 @@ st.markdown(
         color: #e4f3f8 !important;
     }
 
-    /* expander */
+    /* Expander */
     .streamlit-expanderHeader {
         border-radius: 12px !important;
         background: rgba(10, 30, 40, 0.4) !important;
@@ -206,14 +207,14 @@ st.markdown(
         border-radius: 0 0 12px 12px !important;
     }
 
-    /* checkbox・警告・成功・情報ボックス */
+    /* UIパーツ */
     .stCheckbox label { color: #d3e8f0 !important; }
     div[data-testid="stAlert"] {
         border-radius: 14px !important;
         backdrop-filter: blur(6px);
     }
 
-    /* dataframe */
+    /* Dataframe */
     div[data-testid="stDataFrame"] {
         border-radius: 14px;
         overflow: hidden;
@@ -221,7 +222,7 @@ st.markdown(
         box-shadow: 0 0 14px rgba(60, 160, 190, 0.1);
     }
 
-    /* 関係図（matplotlib）は白背景のまま、深海に沈む観測パネル風に額装 */
+    /* Matplotlib 画像表示コンテナ */
     div[data-testid="stImage"] {
         background: rgba(248, 250, 250, 0.97);
         border-radius: 18px;
@@ -278,40 +279,52 @@ with tab1:
     if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
+            st.session_state.single_result = None
         else:
             with st.spinner("解析中..."):
                 try:
                     components, relations = pp.analyze_claim(text)
+                    st.session_state.single_result = {
+                        "components": components,
+                        "relations": relations,
+                    }
                 except Exception as e:
                     st.error(f"解析中にエラーが発生しました: {e}")
-                    components, relations = None, None
+                    st.session_state.single_result = None
 
-            if relations is not None:
-                if not relations:
-                    st.info("関係が抽出できませんでした。文の書き方を見直してみてください。")
-                else:
-                    st.success(f"🎉 {len(relations)} 件の関係を抽出しました！")
+    # 結果を表示（セッションから取得）
+    if st.session_state.single_result is not None:
+        relations = st.session_state.single_result["relations"]
 
-                    col1, col2 = st.columns([3, 2])
+        if not relations:
+            st.info("関係が抽出できませんでした。文の書き方を見直してみてください。")
+        else:
+            st.success(f"🎉 {len(relations)} 件の関係を抽出しました！")
 
-                    with col1:
-                        st.markdown("#### 🪸 構成要素間の関係図")
-                        pp.visualize_relations(relations, title="構成要素間関係")
-                        fig = plt.gcf()
-                        st.pyplot(fig)
-                        plt.close(fig)
+            col1, col2 = st.columns([3, 2])
 
-                    with col2:
-                        st.markdown("#### 📋 抽出された関係（SAOトリプル）")
-                        st.dataframe(
-                            [
-                                {"主語": r["source"], "関係": r["relation"],
-                                 "目的語": r["target"], "種類": r["type"]}
-                                for r in relations
-                            ],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+            with col1:
+                st.markdown("#### 🪸 構成要素間の関係図")
+                fig = plt.figure(figsize=(8, 6))
+                pp.visualize_relations(relations, title="構成要素間関係")
+                st.pyplot(fig)
+                plt.close(fig)
+
+            with col2:
+                st.markdown("#### 📋 抽出された関係（SAOトリプル）")
+                st.dataframe(
+                    [
+                        {
+                            "主語": r["source"],
+                            "関係": r["relation"],
+                            "目的語": r["target"],
+                            "種類": r["type"],
+                        }
+                        for r in relations
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
 # ============================================================
@@ -334,73 +347,90 @@ with tab2:
     if st.button("🐚 比較する", type="primary", key="compare_run"):
         if not text_a.strip() or not text_b.strip():
             st.warning("請求項A・Bの両方を入力してください。")
+            st.session_state.compare_result = None
         else:
             with st.spinner("解析中..."):
                 try:
                     _, relations_a = pp.analyze_claim(text_a)
                     _, relations_b = pp.analyze_claim(text_b)
+
+                    jaccard_score, common, only_a, only_b = pp.jaccard_similarity(relations_a, relations_b)
+                    structural_score, structural_detail = pp.structural_similarity(relations_a, relations_b)
+
+                    semantic_score, semantic_matches = None, None
+                    if use_semantic:
+                        with st.spinner("意味マッチングのモデルを読み込み中..."):
+                            try:
+                                semantic_score, semantic_matches = pp.semantic_similarity(relations_a, relations_b)
+                            except Exception as e:
+                                st.error(f"意味マッチングでエラーが発生しました: {e}")
+
+                    st.session_state.compare_result = {
+                        "jaccard_score": jaccard_score,
+                        "common": common,
+                        "only_a": only_a,
+                        "only_b": only_b,
+                        "structural_score": structural_score,
+                        "structural_detail": structural_detail,
+                        "semantic_score": semantic_score,
+                        "semantic_matches": semantic_matches,
+                    }
                 except Exception as e:
                     st.error(f"解析中にエラーが発生しました: {e}")
-                    relations_a, relations_b = None, None
+                    st.session_state.compare_result = None
 
-            if relations_a is not None and relations_b is not None:
-                jaccard_score, common, only_a, only_b = pp.jaccard_similarity(relations_a, relations_b)
-                structural_score, structural_detail = pp.structural_similarity(relations_a, relations_b)
+    # 結果を表示（セッションから取得）
+    if st.session_state.compare_result is not None:
+        res = st.session_state.compare_result
 
-                semantic_score = None
-                semantic_matches = None
-                if use_semantic:
-                    with st.spinner("意味マッチングのモデルを読み込み中..."):
-                        try:
-                            semantic_score, semantic_matches = pp.semantic_similarity(relations_a, relations_b)
-                        except Exception as e:
-                            st.error(f"意味マッチングでエラーが発生しました: {e}")
+        st.markdown("### 🦪 診断結果")
+        score_cols = st.columns(3)
+        score_cols[0].metric("①Jaccard類似度（表記の一致）", f"{res['jaccard_score']:.3f}")
 
-                st.markdown("### 🦪 診断結果")
-                score_cols = st.columns(3)
-                score_cols[0].metric("①Jaccard類似度（表記の一致）", f"{jaccard_score:.3f}")
-                if semantic_score is not None:
-                    score_cols[1].metric("②意味マッチング類似度", f"{semantic_score:.3f}")
-                else:
-                    score_cols[1].metric("②意味マッチング類似度", "―（未使用）")
-                score_cols[2].metric("③構造の類似度", f"{structural_score:.3f}")
+        if res["semantic_score"] is not None:
+            score_cols[1].metric("②意味マッチング類似度", f"{res['semantic_score']:.3f}")
+        else:
+            score_cols[1].metric("②意味マッチング類似度", "―（未使用）")
 
-                with st.expander("③構造比較の内訳を見る"):
-                    st.write(
-                        f"- 深さの類似度: {structural_detail['深さの類似度']:.3f}\n"
-                        f"- 規模(ノード数)の類似度: {structural_detail['規模(ノード数)の類似度']:.3f}\n"
-                        f"- 枝分かれパターンの類似度: {structural_detail['枝分かれパターンの類似度']:.3f}\n"
-                        f"- 関係の種類の内訳の類似度: {structural_detail['関係の種類の内訳の類似度']:.3f}"
-                    )
+        score_cols[2].metric("③構造の類似度", f"{res['structural_score']:.3f}")
 
-                st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.markdown(f"**共通トリプル（{len(common)}件）**")
-                    for t in sorted(common):
-                        st.write(t)
-                with col2:
-                    st.markdown(f"**Aだけにあるトリプル（{len(only_a)}件）**")
-                    for t in sorted(only_a):
-                        st.write(t)
-                with col3:
-                    st.markdown(f"**Bだけにあるトリプル（{len(only_b)}件）**")
-                    for t in sorted(only_b):
-                        st.write(t)
+        with st.expander("③構造比較の内訳を見る"):
+            detail = res["structural_detail"]
+            st.write(
+                f"- 深さの類似度: {detail['深さの類似度']:.3f}\n"
+                f"- 規模(ノード数)の類似度: {detail['規模(ノード数)の類似度']:.3f}\n"
+                f"- 枝分かれパターンの類似度: {detail['枝分かれパターンの類似度']:.3f}\n"
+                f"- 関係の種類の内訳の類似度: {detail['関係の種類の内訳の類似度']:.3f}"
+            )
 
-                if semantic_matches is not None:
-                    st.markdown("### 🫧 ②意味マッチング：対応付けの詳細")
-                    matches_sorted = sorted(semantic_matches, key=lambda x: -x[2])
-                    st.dataframe(
-                        [
-                            {
-                                "類似度": round(sim, 2),
-                                "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
-                                "トリプルA": " / ".join(ta),
-                                "トリプルB": " / ".join(tb),
-                            }
-                            for ta, tb, sim in matches_sorted
-                        ],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+        st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"**共通トリプル（{len(res['common'])}件）**")
+            for t in sorted(res["common"]):
+                st.write(t)
+        with col2:
+            st.markdown(f"**Aだけにあるトリプル（{len(res['only_a'])}件）**")
+            for t in sorted(res["only_a"]):
+                st.write(t)
+        with col3:
+            st.markdown(f"**Bだけにあるトリプル（{len(res['only_b'])}件）**")
+            for t in sorted(res["only_b"]):
+                st.write(t)
+
+        if res["semantic_matches"] is not None:
+            st.markdown("### 🫧 ②意味マッチング：対応付けの詳細")
+            matches_sorted = sorted(res["semantic_matches"], key=lambda x: -x[2])
+            st.dataframe(
+                [
+                    {
+                        "類似度": round(sim, 2),
+                        "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
+                        "トリプルA": " / ".join(ta),
+                        "トリプルB": " / ".join(tb),
+                    }
+                    for ta, tb, sim in matches_sorted
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
