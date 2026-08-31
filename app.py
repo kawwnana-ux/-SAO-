@@ -11,7 +11,7 @@ except ImportError:
 import patent_pipeline as pp
 
 # ページ基本設定
-st.set_page_config(page_title="🌊 特許SAOラボ", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="🪼 日本語特許SAO構造分析", page_icon="🪼", layout="wide")
 
 # セッション状態の初期化
 if "single_result" not in st.session_state:
@@ -130,7 +130,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🌊 特許SAOラボ")
+st.title("🪼 日本語特許SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
@@ -148,7 +148,7 @@ with tab1:
         key="single_text",
     )
 
-    if st.button("✨ 解析する", type="primary", key="single_run"):
+    if st.button("🦈 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
