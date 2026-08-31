@@ -11,7 +11,7 @@ except ImportError:
 import patent_pipeline as pp
 
 # ページ基本設定
-st.set_page_config(page_title="🪼 日本語特許請求項分析", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="日本語特許請求項分析", page_icon="🪼", layout="wide")
 
 # セッション状態の初期化
 if "single_result" not in st.session_state:
