@@ -2590,15 +2590,15 @@ _embed_model = None
 def _get_embed_model():
     global _embed_model
     if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        # 多言語対応の定番モデル（日本語も含む。ライブラリとの互換性が良い）
-        _embed_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
+        # 多言語対応で、現在も活発にメンテナンスされている実績あるモデル
+        # （日本語の技術文書・フォーマルな文章にも比較的強い）
+        _embed_model = SentenceTransformer('intfloat/multilingual-e5-base')
     return _embed_model
 
 
 def _triple_to_text(triple):
     source, relation, target = triple
-    return f"{source}が{target}を{relation}"
+    return f"query: {source}が{target}を{relation}"
 
 
 def semantic_similarity(relations_a, relations_b, normalize_numbers=True):
