@@ -161,38 +161,7 @@ def _find_column(df, aliases):
 
 
 def _split_multi_value(value):
-    def _extract_fi_subclass(value):
-    """
-    FIからサブクラスまでを抽出する。
-
-    例：
-      H01L 21/00     → H01L
-      H01L21/02      → H01L
-      G06F 3/01      → G06F
-      H10B 12/00     → H10B
-
-    複数のFIが指定されている場合は、それぞれから
-    サブクラスを抽出して重複を除去する。
-    """
-    fis = _split_multi_value(value)
-    subclasses = []
-
-    for fi in fis:
-        fi = str(fi).strip().upper()
-
-        # FIの先頭にある「英字1文字＋数字2桁＋英字1文字」
-        # をサブクラスとして取得
-        m = re.match(r"^([A-HY][0-9]{2}[A-Z])", fi)
-
-        if m:
-            subclasses.append(m.group(1))
-        else:
-            # 想定外の形式は元の値を残す
-            subclasses.append(fi)
-
-    # 順序を維持して重複除去
-    return list(dict.fromkeys(subclasses))
-    """出願人/権利者・FIなどの複数値を汎用的に分割する。"""
+    """出願人・FIなどの複数値を汎用的に分割する。"""
     if pd.isna(value):
         return []
     s = str(value).strip()
@@ -213,11 +182,43 @@ def _extract_year(value):
     return int(m.group(0)) if m else None
 
 
+def _extract_fi_subclass(value):
+    """
+    FIからIPC/FIのサブクラスまでを抽出する。
+
+    例:
+      H01L 21/00 -> H01L
+      H01L21/02  -> H01L
+      G06F 3/01  -> G06F
+      H10B 12/00 -> H10B
+
+    複数のFIが指定されている場合も対応し、
+    抽出したサブクラスの重複を除去する。
+    """
+    fis = _split_multi_value(value)
+    subclasses = []
+
+    for fi in fis:
+        fi = str(fi).strip().upper()
+
+        # FI/IPCの「セクション＋クラス＋サブクラス」
+        # 例: H01L, G06F, H10B
+        m = re.match(r"^([A-HY][0-9]{2}[A-Z])", fi)
+
+        if m:
+            subclasses.append(m.group(1))
+        elif fi:
+            # 想定外の形式でもデータを失わないよう元値を保持
+            subclasses.append(fi)
+
+    return list(dict.fromkeys(subclasses))
+
+
 def _prepare_stats_df(df):
     """
     統計分析に使う列を自動認識する。
     推奨列:
-      出願日, FI, 出願人/権利者
+      出願日, FI, 出願人
     英語列にも対応:
       application_date/date, fi, applicant
     """
@@ -231,7 +232,7 @@ def _prepare_stats_df(df):
         "FI", "筆頭FI", "FI分類", "FIコード", "fi_code", "fi"
     ])
     applicant_col = _find_column(df, [
-        "出願人/権利者", "出願人/権利者名", "出願人/権利者名称", "applicant",
+        "出願人", "出願人名", "出願人名称", "applicant",
         "applicants", "applicant_name"
     ])
 
@@ -240,23 +241,18 @@ def _prepare_stats_df(df):
     if fi_col is None:
         raise ValueError("「FI」列が見つかりません。例：FI / fi")
     if applicant_col is None:
-        raise ValueError("「出願人/権利者」列が見つかりません。例：出願人/権利者 / applicant")
+        raise ValueError("「出願人」列が見つかりません。例：出願人 / applicant")
 
     work = pd.DataFrame({
         "出願年": df[date_col].apply(_extract_year),
         "FI原文": df[fi_col],
-        "出願人/権利者原文": df[applicant_col],
+        "出願人原文": df[applicant_col],
     })
-    
-    work["FIサブクラス"] = work["FI原文"].apply(
-        lambda x: _extract_fi_subclass(x)[0]if _extract_fi_subclass(x) else None
-    )
-    
+
     work["筆頭FI"] = work["FI原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
-
-    work["筆頭出願人/権利者"] = work["出願人/権利者原文"].apply(
+    work["筆頭出願人"] = work["出願人原文"].apply(
         lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
     )
 
@@ -266,26 +262,26 @@ def _prepare_stats_df(df):
 
 
 def _make_applicant_fi_table(work):
-    """出願人/権利者ごとに、その出願に含まれるFIを集計する。"""
+    """出願人ごとに、その出願に含まれるFIを集計する。"""
     rows = []
     for _, row in work.iterrows():
-        applicants = _split_multi_value(row["出願人/権利者原文"])
+        applicants = _split_multi_value(row["出願人原文"])
         fis = _split_multi_value(row["FI原文"])
         if not applicants or not fis:
             continue
         for applicant in applicants:
             for fi in fis:
-                rows.append({"出願人/権利者": applicant, "FI": fi})
+                rows.append({"出願人": applicant, "FI": fi})
 
     if not rows:
-        return pd.DataFrame(columns=["出願人/権利者", "FI", "件数"])
+        return pd.DataFrame(columns=["出願人", "FI", "件数"])
 
     tmp = pd.DataFrame(rows)
     result = (
-        tmp.groupby(["出願人/権利者", "FI"])
+        tmp.groupby(["出願人", "FI"])
         .size()
         .reset_index(name="件数")
-        .sort_values(["出願人/権利者", "件数", "FI"], ascending=[True, False, True])
+        .sort_values(["出願人", "件数", "FI"], ascending=[True, False, True])
     )
     return result
 
@@ -304,7 +300,7 @@ def _show_patent_statistics(df):
 
     st.success(
         f"✅ {len(work):,} 件を分析しました。"
-        f"（出願日: {date_col} / FI: {fi_col} / 出願人/権利者: {applicant_col}）"
+        f"（出願日: {date_col} / FI: {fi_col} / 出願人: {applicant_col}）"
     )
 
     # ① 年別出願件数
@@ -317,72 +313,54 @@ def _show_patent_statistics(df):
         hide_index=True
     )
 
-    
     # ② 筆頭FIサブクラスランキング
-    st.markdown("### 🏆 ② 筆頭FIサブクラスランキング")
-    first_fi = (
-        work.dropna(subset=["FIサブクラス"])
-        .groupby("FIサブクラス")
-        .size()
-        .reset_index(name="出願件数")
-        .sort_values(
-            ["出願件数", "FIサブクラス"],
-            ascending=[False, True]
-        )
-        .reset_index(drop=True)
+st.markdown("### 🏆 ② 筆頭FIサブクラスランキング")
+
+first_fi = (
+    work.dropna(subset=["FIサブクラス"])
+    .groupby("FIサブクラス")
+    .size()
+    .reset_index(name="出願件数")
+    .sort_values(
+        ["出願件数", "FIサブクラス"],
+        ascending=[False, True]
     )
-    
-    first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
-    
-    st.bar_chart(
-        first_fi.head(top_n).set_index("FIサブクラス")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="FIサブクラス"
-    )
-    
-    st.dataframe(
-        first_fi.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-        .sort_values(["出願件数", "筆頭FI"], ascending=[False, True])
-        .reset_index(drop=True)
+    .reset_index(drop=True)
 )
-    first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
 
-    top_n = st.slider(
-        "表示するランキング件数",
-        min_value=5,
-        max_value=30,
-        value=10,
-        key="stats_top_n"
-    )
-    st.bar_chart(
-        first_fi.head(top_n).set_index("筆頭FI")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="筆頭FI"
-    )
-    st.dataframe(first_fi.head(top_n), use_container_width=True, hide_index=True)
+first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
 
-    # ③ 筆頭出願人/権利者ランキング
+st.bar_chart(
+    first_fi.head(top_n).set_index("FIサブクラス")["出願件数"],
+    horizontal=True,
+    x_label="出願件数",
+    y_label="FIサブクラス"
+)
+
+st.dataframe(
+    first_fi.head(top_n),
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ③ 筆頭出願人/権利者ランキング
     st.markdown("### 🏢 ③ 筆頭出願人/権利者ランキング")
     first_applicant = (
-        work.dropna(subset=["筆頭出願人/権利者"])
-        .groupby("筆頭出願人/権利者")
+        work.dropna(subset=["筆頭出願人"])
+        .groupby("筆頭出願人")
         .size()
         .reset_index(name="出願件数")
-        .sort_values(["出願件数", "筆頭出願人/権利者"], ascending=[False, True])
+        .sort_values(["出願件数", "筆頭出願人"], ascending=[False, True])
         .reset_index(drop=True)
     )
     first_applicant.insert(0, "順位", range(1, len(first_applicant) + 1))
 
     st.bar_chart(
-        first_applicant.head(top_n).set_index("筆頭出願人/権利者")["出願件数"],
+        first_applicant.head(top_n).set_index("筆頭出願人")["出願件数"],
         horizontal=True,
         x_label="出願件数",
-        y_label="筆頭出願人/権利者"
+        y_label="筆頭出願人"
     )
     st.dataframe(
         first_applicant.head(top_n),
@@ -395,19 +373,19 @@ def _show_patent_statistics(df):
     applicant_fi = _make_applicant_fi_table(work)
 
     if applicant_fi.empty:
-        st.info("出願人/権利者別FIを集計できるデータがありません。")
+        st.info("出願人別FIを集計できるデータがありません。")
         return
 
-    # 出願人/権利者ごとに上位FIを表示
-    applicant_choices = sorted(applicant_fi["出願人/権利者"].unique())
+    # 出願人ごとに上位FIを表示
+    applicant_choices = sorted(applicant_fi["出願人"].unique())
     selected_applicant = st.selectbox(
-        "詳しく見る出願人/権利者",
+        "詳しく見る出願人",
         applicant_choices,
         key="stats_selected_applicant"
     )
 
     selected = applicant_fi[
-        applicant_fi["出願人/権利者"] == selected_applicant
+        applicant_fi["出願人"] == selected_applicant
     ].copy()
     selected.insert(0, "順位", range(1, len(selected) + 1))
 
@@ -424,9 +402,9 @@ def _show_patent_statistics(df):
     )
 
     st.caption(
-        "※「筆頭FI」「筆頭出願人/権利者」は、CSVの該当セルに複数値がある場合、"
+        "※「筆頭FI」「筆頭出願人」は、CSVの該当セルに複数値がある場合、"
         "先頭に記載されたものを筆頭として集計します。"
-        "「出願人/権利者別出願FI」は、同一出願に複数の出願人/権利者・FIがある場合、"
+        "「出願人別出願FI」は、同一出願に複数の出願人・FIがある場合、"
         "それぞれの組合せを1件として集計します。"
     )
 
@@ -863,7 +841,7 @@ with tab5:
     st.subheader("📊 CSVから特許出願統計を分析")
     st.caption(
         "CSVをアップロードするか、CSV本文を貼り付けるだけで、"
-        "年別出願件数・筆頭FI・筆頭出願人/権利者・出願人/権利者別FIを集計します。"
+        "年別出願件数・筆頭FI・筆頭出願人・出願人別FIを集計します。"
     )
 
     st.markdown(
@@ -871,7 +849,7 @@ with tab5:
         **推奨CSV列**
         - `出願日`：例 `2024-03-15`
         - `FI`：例 `H01L 21/00; H01L 29/00`
-        - `出願人/権利者`：例 `株式会社A;株式会社B`
+        - `出願人`：例 `株式会社A;株式会社B`
 
         英語列 `application_date / fi / applicant` も利用できます。
         既存のCSVに `id` や `text` など他の列があっても問題ありません。
@@ -888,7 +866,7 @@ with tab5:
         "またはCSV本文をここに貼り付け",
         height=180,
         placeholder=(
-            "出願日,FI,出願人/権利者\n"
+            "出願日,FI,出願人\n"
             "2022-04-01,H01L 21/00,株式会社A\n"
             "2023-06-12,H01L 29/00;H01L 21/00,株式会社B;株式会社C\n"
             "2024-01-20,H10B 12/00,株式会社A"
