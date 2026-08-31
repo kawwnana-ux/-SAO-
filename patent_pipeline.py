@@ -2941,3 +2941,111 @@ def compare_claim_scope(relations_list, names=None):
               f"{detail['階層の深さ']:>6d} {detail['関係密度']:>6.2f}")
 
     return rows
+
+
+# ============================================================
+# ⑱ バッチ処理：1件を大量の既存請求項と比較して上位を絞り込む
+# ============================================================
+# 実務で本当に必要なのは「1対1」ではなく「1対大量」の比較。
+# 埋め込み計算はコストが高いので、そのまま全件にハンガリアン法を
+# かけると遅すぎる。そこで、検索エンジンと同じ2段階方式を取る：
+#   ①まず全件を「文書全体の平均ベクトル」同士の単純なコサイン類似度
+#     で高速に絞り込む（速いが粗い）
+#   ②絞り込んだ上位だけ、精密な意味マッチング（②で作ったハンガリアン法）
+#     で改めてスコアをつけ直す（遅いが正確）
+
+def build_patent_database(records, show_progress=True):
+    """
+    records: [(id, 請求項テキスト), ...] のリスト
+    （idは特許番号や管理番号など、何でもよい）
+
+    各請求項をあらかじめSAO解析し、文書全体の平均埋め込みベクトルを
+    計算してデータベース（リスト）として返す。
+    このデータベースは一度作れば使い回せるので、検索のたびに
+    全件を解析し直す必要がなくなる。
+    """
+    import numpy as np
+
+    model = _get_embed_model()
+    database = []
+    total = len(records)
+    for i, (rid, text) in enumerate(records):
+        if show_progress:
+            print(f"[{i+1}/{total}] {rid} を解析中...")
+        try:
+            _, relations = analyze_claim(text)
+        except Exception as e:
+            print(f"  → 解析エラー、スキップします: {e}")
+            continue
+        if not relations:
+            continue
+        triples = sorted(relations_to_triple_set(relations, normalize_numbers=True))
+        texts = [_triple_to_text(t) for t in triples]
+        embeddings = model.encode(texts, normalize_embeddings=True)
+        doc_embedding = np.mean(embeddings, axis=0)
+        doc_embedding = doc_embedding / (np.linalg.norm(doc_embedding) + 1e-8)
+
+        database.append({
+            "id": rid,
+            "text": text,
+            "relations": relations,
+            "doc_embedding": doc_embedding,
+        })
+    return database
+
+
+def search_similar_claims(query_text, database, top_k=10, rerank_k=5):
+    """
+    query_text（新しく調べたい請求項）を、build_patent_database() で
+    作ったデータベースの中から検索し、似ているものを上位から返す。
+
+    ①文書全体の平均ベクトルによる高速な粗いスコアで、
+      データベース全件からtop_k件に絞り込む
+    ②その中の上位rerank_k件だけ、精密な意味マッチング
+      （ハンガリアン法）でスコアを付け直す
+
+    戻り値: [{"id":.., "fast_score":.., "precise_score":(あれば),
+              "text":.., "matches":(rerankした場合のみ)}, ...]
+             fast_scoreの高い順（rerank後はprecise_scoreの高い順）
+    """
+    import numpy as np
+
+    _, query_relations = analyze_claim(query_text)
+    if not query_relations:
+        return []
+
+    model = _get_embed_model()
+    triples = sorted(relations_to_triple_set(query_relations, normalize_numbers=True))
+    texts = [_triple_to_text(t) for t in triples]
+    embeddings = model.encode(texts, normalize_embeddings=True)
+    query_embedding = np.mean(embeddings, axis=0)
+    query_embedding = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
+
+    scored = []
+    for entry in database:
+        fast_score = float(np.dot(query_embedding, entry["doc_embedding"]))
+        scored.append({"id": entry["id"], "text": entry["text"],
+                        "relations": entry["relations"], "fast_score": fast_score})
+
+    scored.sort(key=lambda x: -x["fast_score"])
+    top_candidates = scored[:top_k]
+
+    for entry in top_candidates[:rerank_k]:
+        precise_score, matches = semantic_similarity(query_relations, entry["relations"])
+        entry["precise_score"] = precise_score
+        entry["matches"] = matches
+
+    reranked = [e for e in top_candidates if "precise_score" in e]
+    not_reranked = [e for e in top_candidates if "precise_score" not in e]
+    reranked.sort(key=lambda x: -x["precise_score"])
+
+    return reranked + not_reranked
+
+
+def print_search_results(results, query_name="検索クエリ"):
+    """search_similar_claims() の結果を、人が読みやすい形で表示する"""
+    print(f"=== 「{query_name}」に似ている請求項（上位{len(results)}件） ===")
+    for i, r in enumerate(results):
+        precise = f", 精密スコア={r['precise_score']:.3f}" if "precise_score" in r else ""
+        print(f"{i+1}. [{r['id']}] 粗いスコア={r['fast_score']:.3f}{precise}")
+    return results

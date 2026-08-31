@@ -18,6 +18,10 @@ if "single_result" not in st.session_state:
     st.session_state.single_result = None
 if "compare_result" not in st.session_state:
     st.session_state.compare_result = None
+if "patent_db" not in st.session_state:
+    st.session_state.patent_db = None
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -133,7 +137,7 @@ st.markdown(
 st.title("🌊 特許SAOラボ")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
-tab1, tab2 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較"])
+tab1, tab2, tab3 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索"])
 
 
 # ============================================================
@@ -350,3 +354,116 @@ with tab2:
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+# ============================================================
+# タブ③：複数の請求項をデータベース化して、1件をまとめて検索する
+# ============================================================
+with tab3:
+    st.subheader("🗄️ ステップ１：比較対象の請求項をまとめて登録する")
+    st.caption(
+        "CSVファイル（列名: id, text）をアップロードするか、"
+        "下のテキストエリアに「-----」で区切って複数の請求項を貼り付けてください。"
+    )
+
+    uploaded_csv = st.file_uploader("CSVファイル（id, text の2列）", type=["csv"])
+    bulk_text = st.text_area(
+        "またはここに、請求項を「-----」で区切って貼り付ける",
+        height=180,
+        placeholder="1件目の請求項テキスト...\n-----\n2件目の請求項テキスト...\n-----\n3件目の請求項テキスト...",
+        key="bulk_text",
+    )
+
+    if st.button("📚 データベースを構築する", key="build_db_run"):
+        records = []
+        if uploaded_csv is not None:
+            import csv
+            import io
+
+            content = uploaded_csv.getvalue().decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(content))
+            for row in reader:
+                rid = row.get("id") or row.get("番号") or f"行{len(records)+1}"
+                text = row.get("text") or row.get("本文") or ""
+                if text.strip():
+                    records.append((rid, text.strip()))
+        elif bulk_text.strip():
+            parts = [p.strip() for p in bulk_text.split("-----") if p.strip()]
+            records = [(f"請求項{i+1}", p) for i, p in enumerate(parts)]
+
+        if not records:
+            st.warning("CSVのアップロード、またはテキストの貼り付けのどちらかを行ってください。")
+        else:
+            with st.spinner(f"{len(records)} 件を解析してデータベースを構築中...（初回は埋め込みモデルの読み込みに1分程度かかります）"):
+                try:
+                    db = pp.build_patent_database(records, show_progress=False)
+                    st.session_state.patent_db = db
+                    st.session_state.search_results = None
+                except Exception as e:
+                    st.error(f"データベース構築中にエラーが発生しました: {e}")
+                    st.session_state.patent_db = None
+
+    if st.session_state.patent_db is not None:
+        st.success(f"✅ {len(st.session_state.patent_db)} 件を登録済みです。")
+        with st.expander("登録済みの一覧を見る"):
+            st.dataframe(
+                [{"id": e["id"], "本文（先頭50文字）": e["text"][:50] + "..."} for e in st.session_state.patent_db],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+
+    st.subheader("🔦 ステップ２：調べたい請求項を検索する")
+    query_text = st.text_area(
+        "検索したい請求項テキスト",
+        height=160,
+        key="query_text",
+    )
+    col_topk, col_rerank = st.columns(2)
+    with col_topk:
+        top_k = st.slider("粗い絞り込みで残す件数", min_value=3, max_value=30, value=10)
+    with col_rerank:
+        rerank_k = st.slider("精密な再評価をする件数（上位から）", min_value=1, max_value=10, value=5)
+
+    if st.button("🔍 検索する", key="search_run"):
+        if st.session_state.patent_db is None:
+            st.warning("先にステップ１でデータベースを構築してください。")
+        elif not query_text.strip():
+            st.warning("検索したい請求項テキストを入力してください。")
+        else:
+            with st.spinner("検索中..."):
+                try:
+                    results = pp.search_similar_claims(
+                        query_text, st.session_state.patent_db, top_k=top_k, rerank_k=rerank_k
+                    )
+                    st.session_state.search_results = results
+                except Exception as e:
+                    st.error(f"検索中にエラーが発生しました: {e}")
+                    st.session_state.search_results = None
+
+    if st.session_state.search_results is not None:
+        results = st.session_state.search_results
+        st.markdown(f"#### 🏆 検索結果（上位{len(results)}件）")
+
+        for i, r in enumerate(results):
+            has_precise = "precise_score" in r
+            score_label = f"精密スコア {r['precise_score']:.3f}" if has_precise else f"粗いスコア {r['fast_score']:.3f}"
+            with st.expander(f"{i+1}位　【{r['id']}】　{score_label}"):
+                st.write(r["text"])
+                st.caption(f"粗いスコア: {r['fast_score']:.3f}" + (f" ／ 精密スコア: {r['precise_score']:.3f}" if has_precise else ""))
+                if has_precise:
+                    matches_sorted = sorted(r["matches"], key=lambda x: -x[2])
+                    st.dataframe(
+                        [
+                            {
+                                "類似度": round(sim, 2),
+                                "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
+                                "クエリ側": " / ".join(ta),
+                                "この請求項側": " / ".join(tb),
+                            }
+                            for ta, tb, sim in matches_sorted
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
