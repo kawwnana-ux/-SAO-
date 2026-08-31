@@ -25,24 +25,24 @@ def get_base64_of_bin_file(bin_file):
         data = f.read()
     return base64.b64encode(data).decode()
 
-
 # 背景CSSの組み立て
 try:
     bin_str = get_base64_of_bin_file("deep_sea.jpg")
     bg_style = f"""
-    .stApp {{
-        background-image: linear-gradient(rgba(0, 10, 20, 0.65), rgba(0, 5, 10, 0.85)), url("data:image/jpg;base64,{bin_str}");
+    [data-testid="stAppViewContainer"] {{
+        background-image: linear-gradient(rgba(0, 20, 40, 0.25), rgba(0, 10, 20, 0.45)), url("data:image/jpg;base64,{bin_str}");
         background-size: cover;
         background-position: center;
         background-attachment: fixed;
     }}
+    [data-testid="stHeader"] {{
+        background-color: rgba(0, 0, 0, 0) !important;
+    }}
     """
 except Exception:
-    # 画像読み込みエラー時のフォールバック
     bg_style = """
-    .stApp {
+    [data-testid="stAppViewContainer"] {
         background: linear-gradient(180deg, #08222f 0%, #071b28 14%, #051520 32%, #040f18 52%, #02090f 74%, #00050a 100%);
-        background-attachment: fixed;
     }
     """
 
@@ -52,71 +52,77 @@ st.markdown(
     <style>
     {bg_style}
 
+    /* 文字色設定 */
     .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, .stCaption {{
-        color: #d3e8f0;
+        color: #e6f7ff !important;
     }}
     h1, h2, h3, h4 {{
-        color: #aee0ee !important;
-        text-shadow: 0 0 16px rgba(120, 200, 220, 0.35);
+        color: #ffffff !important;
+        text-shadow: 0 0 12px rgba(0, 200, 255, 0.6);
         font-weight: 800 !important;
     }}
     .stCaption, [data-testid="stCaptionContainer"] {{
-        color: #86b3c4 !important;
+        color: #b3e0ff !important;
     }}
 
+    /* タブデザイン */
     button[data-baseweb="tab"] {{
         border-radius: 999px !important;
         padding: 0.4rem 1.2rem !important;
         margin-right: 0.4rem !important;
-        background-color: rgba(10, 30, 40, 0.6) !important;
-        border: 1px solid rgba(140, 200, 220, 0.2) !important;
-        color: #bcdce8 !important;
-        backdrop-filter: blur(4px);
+        background-color: rgba(5, 25, 45, 0.65) !important;
+        border: 1px solid rgba(100, 210, 255, 0.3) !important;
+        color: #cceeff !important;
+        backdrop-filter: blur(8px);
     }}
     button[data-baseweb="tab"][aria-selected="true"] {{
-        background: linear-gradient(135deg, rgba(80, 190, 210, 0.3), rgba(40, 120, 150, 0.3)) !important;
+        background: linear-gradient(135deg, rgba(0, 180, 220, 0.5), rgba(0, 90, 140, 0.5)) !important;
         color: #ffffff !important;
-        border: 1px solid rgba(120, 210, 230, 0.55) !important;
+        border: 1px solid rgba(120, 230, 255, 0.8) !important;
         font-weight: 700 !important;
     }}
 
+    /* ボタンデザイン */
     .stButton > button {{
         border-radius: 999px !important;
-        background: linear-gradient(135deg, #2fd7c4 0%, #1a8fb0 100%) !important;
-        color: #021a24 !important;
+        background: linear-gradient(135deg, #00f2fe 0%, #4facfe 100%) !important;
+        color: #001e38 !important;
         font-weight: 800 !important;
         border: none !important;
         padding: 0.5rem 1.6rem !important;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        box-shadow: 0 4px 15px rgba(0, 180, 255, 0.4);
     }}
     .stButton > button:hover {{
-        filter: brightness(1.1);
+        filter: brightness(1.15);
     }}
 
+    /* テキストエリア */
     .stTextArea textarea {{
         border-radius: 14px !important;
-        border: 1.5px solid rgba(140, 200, 220, 0.3) !important;
-        background: rgba(4, 18, 26, 0.75) !important;
-        color: #e4f3f8 !important;
-        backdrop-filter: blur(4px);
+        border: 1.5px solid rgba(100, 210, 255, 0.4) !important;
+        background: rgba(3, 20, 35, 0.6) !important;
+        color: #ffffff !important;
+        backdrop-filter: blur(8px);
     }}
     .stTextArea textarea::placeholder {{
-        color: #6b95a6 !important;
+        color: #80c8e8 !important;
     }}
 
+    /* Metricカード */
     div[data-testid="stMetric"] {{
-        background: rgba(10, 30, 40, 0.6);
+        background: rgba(5, 25, 45, 0.65);
         border-radius: 16px;
         padding: 0.9rem;
-        border: 1px solid rgba(140, 200, 220, 0.25);
-        backdrop-filter: blur(4px);
+        border: 1px solid rgba(100, 210, 255, 0.3);
+        backdrop-filter: blur(8px);
     }}
 
+    /* Matplotlib 画像表示コンテナ */
     div[data-testid="stImage"] {{
-        background: rgba(248, 250, 250, 0.95);
+        background: rgba(255, 255, 255, 0.95);
         border-radius: 18px;
         padding: 1rem;
-        border: 1px solid rgba(140, 200, 220, 0.3);
+        border: 1px solid rgba(100, 210, 255, 0.4);
     }}
     div[data-testid="stImage"] img {{
         border-radius: 10px;
