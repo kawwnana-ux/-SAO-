@@ -348,7 +348,7 @@ def _show_patent_statistics(df):
     )
         .sort_values(["出願件数", "筆頭FI"], ascending=[False, True])
         .reset_index(drop=True)
-    )
+)
     first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
 
     top_n = st.slider(
