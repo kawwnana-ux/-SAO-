@@ -117,17 +117,20 @@ st.markdown(
         backdrop-filter: blur(8px);
     }}
 
-/* Matplotlib 画像表示コンテナ（透明化して真っ白になるのを防ぐ） */
-    div[data-testid="stImage"] {
+    /* Matplotlib 画像表示コンテナ（透明化） */
+    div[data-testid="stImage"] {{
         background: transparent !important;
         border-radius: 18px;
         padding: 0.5rem;
         border: none !important;
-    }
-    div[data-testid="stImage"] img {
+    }}
+    div[data-testid="stImage"] img {{
         border-radius: 10px;
-    }
-
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # メインコンテンツ
 st.title("🪼　日本語特許請求項分析")
