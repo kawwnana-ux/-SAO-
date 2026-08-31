@@ -3,12 +3,16 @@ import matplotlib.pyplot as plt
 
 import patent_pipeline as pp
 
+import patent_pipeline as pp
 import inspect
-if "all_list_targets" in inspect.getsource(pp.extract_has_relations):
-    st.success("✅ 最新版のコードが読み込まれています")
-else:
-    st.error("❌ まだ古いコードのままです")
 
+_src = inspect.getsource(pp)
+st.code(
+    f"ファイルの行数: {len(_src.splitlines())}\n"
+    f"extract_direct_relationsの定義回数: {_src.count('def extract_direct_relations')}\n"
+    f"extract_has_relationsの定義回数: {_src.count('def extract_has_relations')}\n"
+    f"「であって」を含むか(含むリスト機能): {'含む' if 'であって' in inspect.getsource(pp.extract_direct_relations) else '含まない'}\n"
+)
 st.set_page_config(page_title="特許請求項SAO解析", layout="wide")
 
 st.title("特許請求項 SAO構造解析・類似度診断")
