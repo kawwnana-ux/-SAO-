@@ -96,7 +96,7 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため"}
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記"}
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -159,7 +159,7 @@ def extract_patent_components_general(doc):
     while i < len(doc):
         token = doc[i]
 
-        if token.text in ("前記", "該", "うち") or not token.text.strip():
+        if token.text in ("前記", "該", "うち", "乃至") or not token.text.strip():
             i += 1
             continue
 
@@ -177,7 +177,7 @@ def extract_patent_components_general(doc):
                 words.append(doc[i].text)
                 i += 1
             while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
+                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち", "乃至") or not doc[i].text.strip():
                     break
                 words.append(doc[i].text)
                 i += 1
@@ -195,7 +195,7 @@ def extract_patent_components_general(doc):
             words = [token.text]
             i += 1
             while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
+                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち", "乃至") or not doc[i].text.strip():
                     break
                 words.append(doc[i].text)
                 i += 1
@@ -792,6 +792,29 @@ def _find_nearest_topic_before_text(doc, components, verb):
             )
             if has_boundary:
                 continue
+            # 候補（「は」の係り先の名詞）が、すでに明示的なnsubjとして
+            # 別の動詞に係っている場合、その係り先からverbまでの経路を
+            # 辿ってみて、途中で連体修飾（acl＝「〜する◯◯」のような、
+            # 別の名詞を説明する節）を挟んでいれば、その候補は
+            # 全く別の節（別の名詞句の説明）の主題とみなしてスキップする。
+            # 経路が連用修飾（advcl等）だけで動詞から動詞へ直接繋がって
+            # いる場合は、同じ節の一部とみなして使ってよい。
+            if t.head.dep_ == "nsubj" and t.head.head.i != verb.i:
+                cursor = t.head.head
+                crosses_acl = False
+                seen_path = set()
+                while cursor.i not in seen_path:
+                    seen_path.add(cursor.i)
+                    if cursor.i == verb.i:
+                        break
+                    if cursor.dep_ == "acl":
+                        crosses_acl = True
+                        break
+                    if cursor.head.i == cursor.i:
+                        break
+                    cursor = cursor.head
+                if crosses_acl:
+                    continue
             comp = find_component_by_token(components, t.head.i) or find_referenced_component(components, t.head)
             if comp is not None:
                 return comp
@@ -938,6 +961,61 @@ def extract_comparison_relations(doc, components):
                 "target": items[i + 1],
                 "type": "direct",
             })
+
+    # 「ＡはＢより小さい（大きい／高い／低い／長い／短い等）」のような
+    # 比較表現。「より」で係る語（Ｂ）と、比較の対象（Ａ、通常は
+    # nsubj）を抽出する。
+    COMPARISON_ADJ = {"小さい", "大きい", "高い", "低い", "長い", "短い", "多い", "少ない", "広い", "狭い"}
+    for adj in doc:
+        if adj.pos_ != "ADJ" or adj.lemma_ not in COMPARISON_ADJ:
+            continue
+
+        yori_child = None
+        for c in adj.children:
+            if c.dep_ == "obl" and any(cc.dep_ == "case" and cc.text == "より" for cc in c.children):
+                yori_child = c
+                break
+        if yori_child is None:
+            continue
+        target_comp = find_component_by_token(components, yori_child.i) or find_referenced_component(components, yori_child)
+        if target_comp is None:
+            continue
+
+        # 比較の対象（Ａ）は、このadj自身のnsubj、またはこのadjの
+        # 係り先（複合語の頭、さらにその先の動詞や文全体の主語など）を
+        # 辿った先にあるnsubjとして表れることが多い。
+        subj_token = None
+        for c in adj.children:
+            if c.dep_ == "nsubj":
+                subj_token = c
+                break
+        if subj_token is None:
+            cursor = adj
+            visited = set()
+            while cursor.i not in visited:
+                visited.add(cursor.i)
+                for c in cursor.children:
+                    if c.dep_ == "nsubj" and c.i < adj.i:
+                        subj_token = c
+                        break
+                if subj_token is not None:
+                    break
+                if cursor.head.i == cursor.i:
+                    break
+                cursor = cursor.head
+        if subj_token is None:
+            continue
+        source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
+        if source_comp is None or source_comp["text"] == target_comp["text"]:
+            continue
+
+        relations.append({
+            "source": source_comp["text"],
+            "relation": f"より{adj.text}",
+            "target": target_comp["text"],
+            "type": "direct",
+        })
+
     return relations
 
 
@@ -1234,9 +1312,18 @@ def extract_direct_relations(doc, components):
 
         if _is_passive(verb):
             # 受身：headが受け手（target）。「に」で係る語などが動作主（source）。
+            source_candidates = []
             for child in verb.children:
-                if child.dep_ not in ("obl", "nsubj"):
-                    continue
+                if child.dep_ in ("obl", "nsubj"):
+                    source_candidates.append(child)
+                elif child.dep_ == "advcl":
+                    # 「〜と電気的に接続され」のように、本当の動作主（配線等）が
+                    # 「電気的に」という副詞句のnmod修飾語として、動詞から見て
+                    # 1段階深いところに埋め込まれていることがある。
+                    for gc in child.children:
+                        if gc.dep_ == "nmod":
+                            source_candidates.append(gc)
+            for child in source_candidates:
                 if child.text == "場合":
                     # 「場合」は条件節の目印であって、動作主ではないので除外する
                     # （GiNZAが超長文でここに主語を誤って結びつけることがある）
@@ -1347,29 +1434,45 @@ def extract_direct_relations(doc, components):
             for child in verb.children:
                 if child.dep_ != "obj":
                     continue
-                target = (
-                    find_component_by_token(components, child.i)
-                    or find_referenced_component(components, child)
-                )
-                if target is None or target["text"] == effective_source["text"]:
-                    continue
 
-                real_owner = effective_source
-                real_relation = verb.text
-                if verb.lemma_ == "含む":
-                    # 「Ａを…受信可能な受信部」のように、目的語の直後に
-                    # 「〜可能な部」が続く場合は、そちらを本当の持ち主にする
-                    cap_owner = _find_following_capability_owner(doc, components, child, verb.i)
-                    if cap_owner is not None and cap_owner["text"] != target["text"]:
-                        real_owner = cap_owner
-                if real_owner["text"] == target["text"]:
-                    continue
-                relations.append({
-                    "source": real_owner["text"],
-                    "relation": real_relation,
-                    "target": target["text"],
-                    "type": "direct",
-                })
+                # 「Ａ及びＢを含み」のように、objの前に「及び」等で
+                # 繋がれた項目がある場合、それはGiNZAの解析上、objの
+                # nmod修飾語として表れる。見逃さないよう、objの前に
+                # 「及び」「又は」等のcc（等位接続）子がある場合は、
+                # そのnmod修飾語も対象に加える。
+                obj_candidates = [child]
+                for nm in child.children:
+                    if nm.dep_ == "nmod" and nm.i < child.i:
+                        has_cc_between = any(
+                            gc.dep_ == "cc" and nm.i < gc.i < child.i for gc in child.children
+                        )
+                        if has_cc_between:
+                            obj_candidates.append(nm)
+
+                for obj_cand in obj_candidates:
+                    target = (
+                        find_component_by_token(components, obj_cand.i)
+                        or find_referenced_component(components, obj_cand)
+                    )
+                    if target is None or target["text"] == effective_source["text"]:
+                        continue
+
+                    real_owner = effective_source
+                    real_relation = verb.text
+                    if verb.lemma_ == "含む":
+                        # 「Ａを…受信可能な受信部」のように、目的語の直後に
+                        # 「〜可能な部」が続く場合は、そちらを本当の持ち主にする
+                        cap_owner = _find_following_capability_owner(doc, components, obj_cand, verb.i)
+                        if cap_owner is not None and cap_owner["text"] != target["text"]:
+                            real_owner = cap_owner
+                    if real_owner["text"] == target["text"]:
+                        continue
+                    relations.append({
+                        "source": real_owner["text"],
+                        "relation": real_relation,
+                        "target": target["text"],
+                        "type": "direct",
+                    })
 
             # 「Ａを送信可能な送信部と、Ｂを受信可能な受信部とを含む通信部」
             # のように、「含む」の対象が複数のリスト項目になっている場合、
@@ -1439,6 +1542,10 @@ def _is_list_item_component(doc, comp):
     その構成要素の直後に「と、」（区切りの格助詞＋読点）が来ているかどうかを
     判定する。「Ａと通信する」のような、単に「と」で係る場合（直後が
     読点でない）は対象外にする。
+
+    「第１のトランジスタから第６のトランジスタと、…を有し」のような、
+    範囲の始点側（「から」が直後に来る場合）も対象に含める
+    （「乃至」は解析前に「から」へ正規化されるため、同じ扱いになる）。
     """
     end = comp["end"]
     nxt = end + 1
@@ -1447,6 +1554,13 @@ def _is_list_item_component(doc, comp):
         and doc[nxt].text == "と"
         and doc[nxt].dep_ == "case"
         and doc[nxt + 1].text in ("、", "を")
+    ):
+        return True
+    if (
+        nxt < len(doc)
+        and doc[nxt].text == "から"
+        and doc[nxt].dep_ == "case"
+        and comp["text"].startswith("第")
     ):
         return True
     return False
@@ -1526,7 +1640,33 @@ def extract_has_relations(doc, components):
                 if t is not None:
                     targets.append(t)
         elif len(early_list_targets) >= 2 and (head_component is not None or root_component is not None):
-            owner = head_component if head_component is not None else root_component
+            # head_component（動詞の係り先）がGiNZAの長文誤解析で
+            # 見当違いの場所（例：後続の別の節）を指してしまっている
+            # ことがあるため、その場合はテキスト上の直前の「Ｘは、」を
+            # 優先的に所有者として使う。ただし、head_componentが
+            # そもそも見つからず（＝「こと」等でroot_componentに
+            # フォールバックする場合）は、topicの方が誤検出のリスクが
+            # 高いため使わない。
+            if head_component is not None:
+                nearby_topic = _find_nearest_topic_before_text(doc, components, verb)
+                if nearby_topic is not None:
+                    owner = nearby_topic
+                elif (
+                    root_component is not None
+                    and len({c["text"] for c in early_list_targets}) < len(early_list_targets)
+                ):
+                    # 「〜する工程と、〜する工程と、…を備え」のように、
+                    # 列挙項目が同じ語（「工程」等）の繰り返しになっている
+                    # 場合、それは方法クレーム特有の並列列挙であり、
+                    # 所有者は請求項全体のタイトル（root_component）である
+                    # 可能性が高い。head_componentが列挙とは無関係な語を
+                    # 誤って指してしまっていることがあるため、
+                    # この場合はroot_componentを優先する。
+                    owner = root_component
+                else:
+                    owner = head_component
+            else:
+                owner = root_component
             targets = [c for c in early_list_targets if c["text"] != owner["text"]]
         elif _find_nearest_topic_before_text(doc, components, verb) is not None:
             # 明示的なnsubjが見つからなくても、テキスト上に「Ｘは、」という
@@ -1741,8 +1881,16 @@ def _clean_claim_text(text):
     同じ1つのトークンにくっついてしまう問題は、
     extract_patent_components_general 側で「前記」「該」「うち」を
     途中に出てきても区切るようにして対応済み。
+
+    「乃至」（〜から〜まで、と同じ意味）は、GiNZAの辞書には
+    あまり登録されていないらしく、名詞や動詞に誤ってタグ付け
+    されてしまうことがある（文全体の構造解析が丸ごと崩れる
+    原因になる）。意味が同じで、GiNZAが安定して解析できる
+    「から」に置き換えることで回避する。
     """
-    return text.strip()
+    text = text.strip()
+    text = text.replace("乃至", "から")
+    return text
 
 
 def _extract_raw_relations(text):
@@ -3155,14 +3303,17 @@ def _split_claim_title(text):
 
 
 _CLAIM_REF_PATTERN = _re_dep.compile(
-    r"請求項(?P<nums>[0-9０-９、,及びおよび又はまたはからー～\-]+)(?:のいずれか)?(?:一項)?に記載の"
+    r"請求項(?P<nums>(?:請求項|[0-9０-９]+|[、,及びおよび又はまたはからー～\-乃至])+)"
+    r"(?:のいずれか)?(?:[0-9０-９一二三四五六七八九十]+項?)?"
+    r"(?:に)?(?:記載の|おいて)"
 )
 
 
 def _parse_claim_ref(text):
     """
-    「請求項１に記載の」「請求項１又は２に記載の」
-    「請求項１から３のいずれか一項に記載の」等から、
+    「請求項１に記載の」「請求項１又は２に記載の」「請求項１記載の」
+    「請求項１から３のいずれか一項に記載の」
+    「請求項１乃至請求項４のいずれか一において」等から、
     参照している請求項番号と、その表現の位置を取り出す。
     参照が見つからなければ None を返す（＝独立請求項）。
     """
@@ -3174,9 +3325,15 @@ def _parse_claim_ref(text):
     nums = [int(n) for n in _re_dep.findall(r"\d+", span_half)]
     if not nums:
         return None
-    if any(c in span for c in ("から", "-", "ー", "～")) and len(nums) >= 2:
+    if any(c in span for c in ("から", "-", "ー", "～", "乃至")) and len(nums) >= 2:
         nums = list(range(nums[0], nums[-1] + 1))
-    return {"numbers": sorted(set(nums)), "match_start": m.start(), "match_end": m.end()}
+    is_preamble_style = m.group(0).endswith("おいて")
+    return {
+        "numbers": sorted(set(nums)),
+        "match_start": m.start(),
+        "match_end": m.end(),
+        "is_preamble_style": is_preamble_style,
+    }
 
 
 def _build_claim_chain(claim_number, claim_texts, prefer_parent=None, _seen=None):
@@ -3204,10 +3361,20 @@ def _build_claim_chain(claim_number, claim_texts, prefer_parent=None, _seen=None
     parent_num = prefer_parent if prefer_parent in ref["numbers"] else ref["numbers"][0]
     chain = _build_claim_chain(parent_num, claim_texts, _seen=_seen)
 
-    # 「請求項◯に記載の」より前の部分が、この請求項固有の追加限定文言
-    additional = text[:ref["match_start"]].strip()
-    if additional.endswith(("、", "，")):
-        additional = additional[:-1]
+    # 「請求項◯に記載の」のように参照が末尾寄りにある場合は、それより
+    # 前の部分が追加の限定文言。「請求項◯において、」のように参照が
+    # 冒頭にある場合は、それより後ろの部分（発明の名称を除く）が
+    # 追加の限定文言になる。
+    if ref["is_preamble_style"]:
+        after = text[ref["match_end"]:].strip().lstrip("、，,")
+        additional, _title = _split_claim_title(after) if after else ("", "")
+        additional = additional.strip()
+        if additional.endswith(("、", "，")):
+            additional = additional[:-1]
+    else:
+        additional = text[:ref["match_start"]].strip()
+        if additional.endswith(("、", "，")):
+            additional = additional[:-1]
     if additional and not additional.endswith("。"):
         additional += "。"
 
