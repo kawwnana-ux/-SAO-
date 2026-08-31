@@ -2622,7 +2622,7 @@ def semantic_similarity(relations_a, relations_b, normalize_numbers=True):
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
-　　triples_a = sorted(relations_to_triple_set_for_semantic(relations_a, normalize_numbers))
+    triples_a = sorted(relations_to_triple_set_for_semantic(relations_a, normalize_numbers))
     triples_b = sorted(relations_to_triple_set_for_semantic(relations_b, normalize_numbers))
 
     model = _get_embed_model()
