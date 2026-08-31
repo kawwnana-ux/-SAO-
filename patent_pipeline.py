@@ -159,7 +159,7 @@ def extract_patent_components_general(doc):
     while i < len(doc):
         token = doc[i]
 
-        if token.text in ("前記", "該", "うち"):
+        if token.text in ("前記", "該", "うち") or not token.text.strip():
             i += 1
             continue
 
@@ -177,7 +177,7 @@ def extract_patent_components_general(doc):
                 words.append(doc[i].text)
                 i += 1
             while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち"):
+                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
                     break
                 words.append(doc[i].text)
                 i += 1
@@ -195,7 +195,7 @@ def extract_patent_components_general(doc):
             words = [token.text]
             i += 1
             while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち"):
+                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
                     break
                 words.append(doc[i].text)
                 i += 1
@@ -1129,6 +1129,38 @@ def extract_capability_relations(doc, components):
 
         head_noun = adj.head
         if head_noun.pos_ not in ("NOUN", "PROPN"):
+            # 「前記所定値は、ユーザにより設定可能である」のように、
+            # 「可能」が名詞を修飾する連体形ではなく、文の述語
+            # そのものとして使われている場合（＝「可能」自身が
+            # 係り先を持たない、またはAUX等に係る場合）に対応する。
+            # 「により」で示される動作主から、nsubj（〜は）への
+            # 関係として捉える。
+            nsubj_token = None
+            agent_token = None
+            for child in adj.children:
+                if child.dep_ == "nsubj":
+                    nsubj_token = child
+                elif child.dep_ == "obl":
+                    has_niyori = any(
+                        c.dep_ == "case" and c.text == "に" for c in child.children
+                    ) and any(
+                        gc.dep_ == "fixed" and gc.text == "より"
+                        for c in child.children for gc in c.children
+                    )
+                    if has_niyori:
+                        agent_token = child
+            if nsubj_token is None or agent_token is None:
+                continue
+            nsubj_comp = find_component_by_token(components, nsubj_token.i) or find_referenced_component(components, nsubj_token)
+            agent_comp = find_component_by_token(components, agent_token.i) or find_referenced_component(components, agent_token)
+            if nsubj_comp is None or agent_comp is None or nsubj_comp["text"] == agent_comp["text"]:
+                continue
+            relations.append({
+                "source": agent_comp["text"],
+                "relation": verb_stem,
+                "target": nsubj_comp["text"],
+                "type": "direct",
+            })
             continue
 
         source = find_component_by_token(components, head_noun.i) or find_referenced_component(components, head_noun)
@@ -1519,7 +1551,18 @@ def extract_has_relations(doc, components):
             # 「Ａと、Ｂと、Ｃと、…を有する」のような並列列挙のパターン用。
             # 直後に「と」が付くリスト項目だけを対象にする
             # （そうしないと、文中の無関係な名詞まで全部拾ってしまうため）。
-            targets = all_list_targets if all_list_targets else [c for c in components if c["end"] < verb.i]
+            # 列挙が見つからない場合（＝単に「Ｘを備える」という単数の
+            # 目的語だけの場合）は、動詞自身の目的語（obj）だけを使う
+            # （以前は「それより前の構成要素を全部」という広すぎる
+            #  フォールバックになっており、無関係な語まで拾っていた）。
+            if all_list_targets:
+                targets = all_list_targets
+            else:
+                t = (
+                    find_component_by_token(components, obj_token.i)
+                    or find_referenced_component(components, obj_token)
+                ) if obj_token is not None else None
+                targets = [t] if t is not None else []
         else:
             owner = root_component
             if owner is not None:
@@ -1702,8 +1745,13 @@ def _clean_claim_text(text):
     return text.strip()
 
 
-def analyze_claim(text):
-    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
+def _extract_raw_relations(text):
+    """
+    「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
+    生の抽出結果を返す。1つの完全な請求項ではなく、従属請求項の
+    追加限定文のような「断片」を解析するときに使う
+    （断片だけを見て孤立ノードを無理に根に繋げてしまうのを防ぐため）。
+    """
     text = _clean_claim_text(text)
     doc = nlp(text)
     components = extract_patent_components_general(doc)
@@ -1727,6 +1775,12 @@ def analyze_claim(text):
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
+    return components, final_relations, doc
+
+
+def analyze_claim(text):
+    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
+    components, final_relations, doc = _extract_raw_relations(text)
     final_relations = _simplify_hierarchy(final_relations, doc, components)
     return components, final_relations
 
@@ -3125,17 +3179,12 @@ def _parse_claim_ref(text):
     return {"numbers": sorted(set(nums)), "match_start": m.start(), "match_end": m.end()}
 
 
-def resolve_dependent_claim(claim_number, claim_texts, prefer_parent=None, _seen=None):
+def _build_claim_chain(claim_number, claim_texts, prefer_parent=None, _seen=None):
     """
-    claim_texts: {請求項番号(int): 本文(str)} の辞書
-    claim_number: 展開したい請求項の番号
+    claim_number を頂点として、祖先の請求項を根から順に並べた鎖にする。
 
-    「請求項１又は２に記載の」のように複数の請求項を参照している
-    場合、prefer_parentでどちらを親とみなすか指定できる
-    （省略時は一番小さい番号を使う）。
-
-    戻り値: 親請求項の内容をすべて展開した、単独でanalyze_claim()に
-            渡せる完全な請求項テキスト。
+    戻り値: [(請求項番号, その請求項固有の追加限定文（親の内容は含まない）), ...]
+            リストの先頭が一番根本の独立請求項。
     """
     if _seen is None:
         _seen = set()
@@ -3149,37 +3198,84 @@ def resolve_dependent_claim(claim_number, claim_texts, prefer_parent=None, _seen
 
     ref = _parse_claim_ref(text)
     if ref is None:
-        # 他の請求項を参照していない、独立請求項
-        return text.strip()
+        # 他の請求項を参照していない、独立請求項。全文がそのまま固有の内容になる。
+        return [(claim_number, text.strip())]
 
     parent_num = prefer_parent if prefer_parent in ref["numbers"] else ref["numbers"][0]
-    parent_text = resolve_dependent_claim(parent_num, claim_texts, _seen=_seen)
+    chain = _build_claim_chain(parent_num, claim_texts, _seen=_seen)
 
-    # 「請求項◯に記載の」より前の部分が、追加の限定文言
+    # 「請求項◯に記載の」より前の部分が、この請求項固有の追加限定文言
     additional = text[:ref["match_start"]].strip()
     if additional.endswith(("、", "，")):
         additional = additional[:-1]
+    if additional and not additional.endswith("。"):
+        additional += "。"
 
-    # 親請求項の文はそのまま残し（コンマでつなげて1つの長い文に
-    # してしまうとGiNZAが誤読しやすくなるため）、追加の限定文言は
-    # 独立したもう1つの文として付け加える。同じ表現（例：「前記電極」）
-    # は、後段の解析で自動的に同じノードとして扱われるので、
-    # 文を分けても情報は失われない。
-    merged = parent_text.strip()
-    if not merged.endswith("。"):
-        merged += "。"
-    if additional:
-        merged += additional + "。"
-    return merged
+    return chain + [(claim_number, additional)]
+
+
+def resolve_dependent_claim(claim_number, claim_texts, prefer_parent=None):
+    """
+    claim_texts: {請求項番号(int): 本文(str)} の辞書
+    claim_number: 展開したい請求項の番号
+
+    「請求項１又は２に記載の」のように複数の請求項を参照している
+    場合、prefer_parentでどちらを親とみなすか指定できる
+    （省略時は一番小さい番号を使う）。
+
+    戻り値: 親請求項の内容も含めて、人間が読める形につなげた
+            完全な請求項テキスト（表示用。解析には
+            analyze_dependent_claim() を使う）。
+    """
+    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
+    parts = [text for _, text in chain if text]
+    return "\n".join(parts)
 
 
 def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
     """
-    resolve_dependent_claim() で展開したテキストを、そのまま
-    analyze_claim() にかけるところまでを1回で行う便利関数。
+    従属請求項を、親請求項の内容も含めて解析する。
+
+    請求項の数が増えるほど、全部を1つの巨大な文としてGiNZAに
+    渡すと、誤読解や、行き場を失った構成要素が根っこに大量に
+    直接ぶら下がる「孤立ノードの急増」を招きやすい。
+    そこで、各請求項が持つ「固有の追加限定文」を1件ずつ別々に
+    解析し、その関係リストだけを最後にまとめて合体させる方式を取る。
+    「前記電極」のように共通する表現は、同じ文字列のノードとして
+    後段で自動的につながるので、文を分けても情報は失われない。
     """
+    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
+
+    all_relations = []
+    for i, (num, fragment_text) in enumerate(chain):
+        if not fragment_text:
+            continue
+        if i == 0:
+            # 一番根本の独立請求項は、通常通りフルに解析する
+            _, relations = analyze_claim(fragment_text)
+        else:
+            # 追加の限定文はそれ単体では不完全な断片なので、
+            # 孤立ノードを無理に根へ繋げる処理はまだかけない
+            # （全部合体させたあとで、最後に1回だけ行う）
+            _, relations, _ = _extract_raw_relations(fragment_text)
+        all_relations.extend(relations)
+
+    seen_keys = set()
+    unique_relations = []
+    for r in all_relations:
+        key = (r["source"], r["relation"], r["target"], r["type"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_relations.append(r)
+
+    # 全部合体させたあとで、最後にもう1回だけ階層整理をかける
+    # （独立請求項由来の「有する」エッジが十分にあるので、
+    #  正しい根はそこから見つかる）
+    final_relations = _simplify_hierarchy(unique_relations)
+
     full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
-    return analyze_claim(full_text), full_text
+    return (None, final_relations), full_text
 
 
 def parse_claims_block(text):
