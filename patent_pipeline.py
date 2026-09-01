@@ -4129,12 +4129,25 @@ def load_patent_metadata_csv(csv_text):
     def _split_fi(value, seps=("；", ";", "、", ",")):
         # FIコード自体に「/」（メイングループ/サブグループの区切り）が
         # 含まれるため、出願人の分割とは違い「/」では分割しない。
+        # また、「Ｈ１０Ｋ８５／６０，１５０」のように、FIコードの後ろに
+        # コンマ＋数字だけの「展開記号（細分）」が続くことがあり、これは
+        # 新しいFIコードではなく、直前のコードの一部である。
+        # 数字だけのトークンは、独立したコードとして分割せず、
+        # 直前のコードに「,数字」の形でくっつける。
         if not value:
             return []
         text = value
         for s in seps[1:]:
             text = text.replace(s, seps[0])
-        return [v.strip() for v in text.split(seps[0]) if v.strip()]
+        raw_tokens = [v.strip() for v in text.split(seps[0]) if v.strip()]
+
+        merged = []
+        for t in raw_tokens:
+            if t.isdigit() and merged:
+                merged[-1] = merged[-1] + "," + t
+            else:
+                merged.append(t)
+        return merged
 
     def _parse_date(value):
         if not value:
@@ -4151,6 +4164,15 @@ def load_patent_metadata_csv(csv_text):
     records = []
     for i, row in enumerate(reader):
         rid = row.get("文献番号") or row.get("出願番号") or row.get("公開番号") or f"行{i+1}"
+        stage = row.get("ステージ", "").strip()
+        registration_no = row.get("登録番号", "").strip()
+        publication_no = row.get("公開番号", "").strip()
+        if not stage:
+            # ステージ欄が空の場合、登録番号・公開番号の有無から推測する
+            if registration_no:
+                stage = "登録"
+            elif publication_no:
+                stage = "公開"
         records.append({
             "id": rid,
             "出願番号": row.get("出願番号", ""),
@@ -4160,8 +4182,11 @@ def load_patent_metadata_csv(csv_text):
             "出願人": _split_applicants(row.get("出願人/権利者", "")),
             "FI": _split_fi(row.get("FI", "")),
             "要約": row.get("要約", ""),
-            "公開番号": row.get("公開番号", ""),
-            "ステージ": row.get("ステージ", ""),
+            "公開番号": publication_no,
+            "公告番号": row.get("公告番号", "").strip(),
+            "登録番号": registration_no,
+            "審判番号": row.get("審判番号", "").strip(),
+            "ステージ": stage,
             "文献URL": row.get("文献URL", ""),
         })
     return records
