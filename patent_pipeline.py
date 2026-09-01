@@ -672,6 +672,18 @@ def _is_passive(verb):
     )
 
 
+def _is_negated(verb):
+    """
+    動詞が否定形（〜ない／〜ません等）かどうかを判定する。
+    「〜が行われない」のような否定文から、肯定の関係として
+    誤って抽出してしまうのを防ぐために使う。
+    """
+    return any(
+        child.lemma_ in ("ない", "ず", "ぬ") and child.pos_ in ("AUX", "SCONJ")
+        for child in verb.children
+    )
+
+
 def _is_instrumental_obl(token):
     """
     「回転カッター式破砕機により破砕する」のように、動詞の obl（斜格）が
@@ -1292,6 +1304,10 @@ def extract_direct_relations(doc, components):
             # 「有する」「備える」「具備する」は extract_has_relations /
             # extract_has_location_relations / extract_positional_relations の
             # 方で別途処理しているのでここでは扱わない
+            continue
+        if _is_negated(verb):
+            # 「〜が行われない」のように否定されている場合、肯定の関係として
+            # 抽出してしまうと意味が逆になるため、この動詞からは抽出しない。
             continue
         if verb.lemma_ == "接触" and any(
             child.dep_ == "advcl" and child.lemma_ == "接する" for child in verb.children
@@ -3474,3 +3490,209 @@ def parse_claims_block(text):
         if body:
             result[num] = body
     return result
+
+
+# ============================================================
+# ㉑ Explorer：SAOキーワード探査（自社 vs 競合の比較）
+# ============================================================
+# 単なる単語頻度ではなく、SAO解析で抽出した「構成要素」「動詞」を
+# キーワードとして使うことで、技術文書としての意味のある比較を行う。
+
+# 「有する」「含む」「である」等は、ほぼ全ての請求項に出てくる
+# 構造的な言い回しであり、技術内容とは無関係なので、キーワードとしては
+# 拾わない（自社・競合比較で「共通語」に紛れ込んでも意味がないため）。
+GENERIC_KEYWORD_VERBS = {
+    "有する", "備える", "具備する", "含む", "含み", "である",
+    "有し", "備え", "含める", "含める", "とは異なる",
+}
+
+
+def extract_keywords_from_relations(relations, kind="both"):
+    """
+    1件の請求項の関係リストから、キーワードの集合を取り出す。
+    kind: "component"（構成要素のみ）, "verb"（動詞のみ）, "both"（両方）
+
+    「有する」「備える」のような構造的な動詞（技術内容と無関係で、
+    ほぼ全ての請求項に出てくる語）は、動詞キーワードから除外する。
+    """
+    keywords = set()
+    for r in relations:
+        if kind in ("component", "both"):
+            keywords.add(r["source"])
+            keywords.add(r["target"])
+        if kind in ("verb", "both"):
+            if r["relation"] not in GENERIC_KEYWORD_VERBS and r["type"] != "has":
+                keywords.add(r["relation"])
+    return keywords
+
+
+def build_keyword_frequency(database, ids=None, kind="both"):
+    """
+    database（build_patent_database()の戻り値）から、
+    指定したid群（省略時は全件）のキーワード出現頻度を集計する。
+    「出現した請求項の件数」で数える（1件の中で同じ語が何度出ても1件とする）。
+    """
+    from collections import Counter
+
+    counter = Counter()
+    target_ids = set(ids) if ids is not None else None
+    for entry in database:
+        if target_ids is not None and entry["id"] not in target_ids:
+            continue
+        keywords = extract_keywords_from_relations(entry["relations"], kind=kind)
+        counter.update(keywords)
+    return counter
+
+
+def compare_keyword_groups(database, group_a_ids, group_b_ids, kind="both", top_n=30):
+    """
+    2つのグループ（例：自社群 vs 競合群）のキーワード頻度を比較する。
+
+    戻り値: {
+        "common": [(語, A頻度, B頻度), ...]（両方に出てくる語、頻度の合計順）,
+        "only_a": [(語, 頻度), ...]（Aだけに出てくる語）,
+        "only_b": [(語, 頻度), ...]（Bだけに出てくる語）,
+        "freq_a": Counter, "freq_b": Counter,
+    }
+    """
+    freq_a = build_keyword_frequency(database, group_a_ids, kind=kind)
+    freq_b = build_keyword_frequency(database, group_b_ids, kind=kind)
+
+    words_a = set(freq_a.keys())
+    words_b = set(freq_b.keys())
+
+    common = sorted(
+        ((w, freq_a[w], freq_b[w]) for w in (words_a & words_b)),
+        key=lambda x: -(x[1] + x[2])
+    )[:top_n]
+    only_a = sorted(((w, freq_a[w]) for w in (words_a - words_b)), key=lambda x: -x[1])[:top_n]
+    only_b = sorted(((w, freq_b[w]) for w in (words_b - words_a)), key=lambda x: -x[1])[:top_n]
+
+    return {"common": common, "only_a": only_a, "only_b": only_b, "freq_a": freq_a, "freq_b": freq_b}
+
+
+def print_keyword_comparison(result, name_a="自社", name_b="競合"):
+    """compare_keyword_groups() の結果を、人が読みやすい形で表示する"""
+    print(f"=== 共通する語（上位{len(result['common'])}件） ===")
+    for w, fa, fb in result["common"]:
+        print(f"  {w:15s} {name_a}:{fa:3d}件 / {name_b}:{fb:3d}件")
+    print()
+    print(f"=== {name_a}だけに出てくる語（上位{len(result['only_a'])}件） ===")
+    for w, f in result["only_a"]:
+        print(f"  {w:15s} {f:3d}件")
+    print()
+    print(f"=== {name_b}だけに出てくる語（上位{len(result['only_b'])}件） ===")
+    for w, f in result["only_b"]:
+        print(f"  {w:15s} {f:3d}件")
+
+
+def plot_wordcloud(freq_counter, title="キーワード頻度", font_path=None):
+    """
+    build_keyword_frequency() 等で作った頻度カウンタから、
+    ワードクラウドの画像（matplotlib Figure）を作る。
+    """
+    from wordcloud import WordCloud
+
+    if font_path is None:
+        font_candidates = glob.glob("/tmp/NotoSansJP-Regular.ttf") + glob.glob(
+            "/usr/share/fonts/**/NotoSansCJK*.ttc", recursive=True
+        )
+        font_path = font_candidates[0] if font_candidates else None
+
+    wc = WordCloud(
+        font_path=font_path,
+        width=900, height=500,
+        background_color="white",
+        colormap="viridis",
+    ).generate_from_frequencies(dict(freq_counter))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16)
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================
+# ㉒ Saturn V：意味的俯瞰マップ
+# ============================================================
+# build_patent_database() で計算済みの埋め込みベクトル（doc_embedding）を
+# PCAで2次元に落とし込み、意味的に近い特許同士が近くに配置される
+# 「地図」を作る。
+
+def build_semantic_map(database, n_components=2):
+    """
+    database（build_patent_database()の戻り値、doc_embeddingを含む）から、
+    2次元（または指定した次元数）の座標を計算する。
+
+    戻り値: [{"id":.., "text":.., "x":.., "y":..}, ...]
+    """
+    import numpy as np
+    from sklearn.decomposition import PCA
+
+    if len(database) < 2:
+        raise ValueError("2件以上のデータが必要です")
+
+    embeddings = np.array([e["doc_embedding"] for e in database])
+    n_comp = min(n_components, len(database) - 1, embeddings.shape[1])
+    pca = PCA(n_components=n_comp)
+    coords = pca.fit_transform(embeddings)
+
+    points = []
+    for entry, xy in zip(database, coords):
+        points.append({
+            "id": entry["id"],
+            "text": entry["text"],
+            "x": float(xy[0]),
+            "y": float(xy[1]) if n_comp > 1 else 0.0,
+        })
+    return points, pca.explained_variance_ratio_
+
+
+def plot_semantic_map(points, explained_variance=None, groups=None, title="意味的俯瞰マップ", theme="deepsea"):
+    """
+    build_semantic_map() の結果を、散布図として描画する。
+
+    groups: {id: グループ名, ...} を渡すと、グループごとに色分けする
+            （例：自社 vs 競合の比較地図にする場合）。
+    """
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    if groups:
+        group_names = sorted(set(groups.values()))
+        color_of = {g: palette[i % len(palette)] for i, g in enumerate(group_names)}
+        for g in group_names:
+            xs = [p["x"] for p in points if groups.get(p["id"]) == g]
+            ys = [p["y"] for p in points if groups.get(p["id"]) == g]
+            ax.scatter(xs, ys, s=90, alpha=0.85, color=color_of[g], edgecolors=fg,
+                       linewidths=0.6, label=g)
+        ax.legend(prop=FONT_PROP, facecolor=bg, labelcolor=fg, edgecolor=grid)
+    else:
+        xs = [p["x"] for p in points]
+        ys = [p["y"] for p in points]
+        ax.scatter(xs, ys, s=90, alpha=0.85, color=palette[0], edgecolors=fg, linewidths=0.6)
+
+    for p in points:
+        ax.annotate(str(p["id"]), (p["x"], p["y"]), fontsize=8, fontproperties=FONT_PROP,
+                    color=fg, xytext=(4, 4), textcoords="offset points")
+
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
+    if explained_variance is not None and len(explained_variance) >= 2:
+        ax.set_xlabel(f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
+        ax.set_ylabel(f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(grid)
+    ax.grid(True, color=grid, alpha=0.3)
+    plt.tight_layout()
+    return fig
