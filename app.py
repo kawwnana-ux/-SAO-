@@ -856,54 +856,329 @@ with tab5:
 
 
 # ============================================================
-# FIサブクラス（先頭4文字）抽出機能の追加
+# FIサブクラス（先頭4文字）抽出機能
 # ============================================================
 
 def extract_fi_subclass(fi_code):
     """
-    FIコードからサブクラス（例: H01L）を抽出する関数
+    FIコードからサブクラスを抽出する。
+
+    例：
+        H01L 21/00      -> H01L
+        H01L 29/00      -> H01L
+        H10B 12/00      -> H10B
     """
-    if not fi_code or pd.isna(fi_code):
+    if fi_code is None or pd.isna(fi_code):
         return None
+
     s = str(fi_code).strip()
-    m = re.search(r"([A-Z]\d{2}[A-Z])", s, re.IGNORECASE)
+
+    if not s:
+        return None
+
+    # FIのサブクラスは
+    # 「英字1文字 + 数字2桁 + 英字1文字」
+    # 例：H01L、H10B、G06F
+    m = re.search(r"([A-Za-z]\d{2}[A-Za-z])", s)
+
     if m:
         return m.group(1).upper()
-    return s[:4].upper() if len(s) >= 4 else s.upper()
+
+    return None
 
 
 def _prepare_stats_df_with_subclass(df, target_type="fi"):
-    """既存の_prepare_stats_dfを拡張し、サブクラス切り替えに対応"""
+    """
+    既存の_prepare_stats_dfを利用して統計用データを作成する。
+
+    target_type:
+        fi       : 完全なFIコード
+        subclass : FIサブクラス（H01Lなど）
+    """
+
+    # 元の関数を直接呼ぶ
+    # ※ globals()を書き換えないので再帰しない
     work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
 
     if target_type == "subclass":
-        work["FI原文"] = work["FI原文"].apply(
-            lambda val: ";".join([extract_fi_subclass(x) for x in _split_multi_value(val) if extract_fi_subclass(x)])
+
+        # FI原文をサブクラスへ変換
+        def convert_fi_values(value):
+            fis = _split_multi_value(value)
+
+            subclasses = []
+
+            for fi in fis:
+                subclass = extract_fi_subclass(fi)
+
+                if subclass and subclass not in subclasses:
+                    subclasses.append(subclass)
+
+            return ";".join(subclasses)
+
+        work["FI原文"] = work["FI原文"].apply(convert_fi_values)
+
+        # 筆頭FIもサブクラス化
+        work["筆頭FI"] = work["筆頭FI"].apply(
+            extract_fi_subclass
         )
-        work["筆頭FI"] = work["筆頭FI"].apply(extract_fi_subclass)
 
     return work, date_col, fi_col, applicant_col
 
 
 def _show_patent_statistics_with_subclass_option(df):
-    """サブクラス抽出切り替え機能付きの統計表示関数"""
+    """
+    FIコード単位 / FIサブクラス単位を切り替えて
+    既存の特許統計を表示する。
+    """
+
     mode = st.radio(
         "📊 FI集計単位の選択",
-        ["完全なFIコード (例: H01L 21/00)", "サブクラス単位 (先頭4文字 例: H01L)"],
+        [
+            "完全なFIコード (例: H01L 21/00)",
+            "サブクラス単位 (例: H01L)"
+        ],
         horizontal=True,
         key="fi_aggregate_mode"
     )
 
-    target_type = "subclass" if "サブクラス" in mode else "fi"
+    if "サブクラス" in mode:
+        target_type = "subclass"
+    else:
+        target_type = "fi"
 
-    orig_prepare = globals()["_prepare_stats_df"]
     try:
-        globals()["_prepare_stats_df"] = lambda d: _prepare_stats_df_with_subclass(d, target_type)
-        _show_patent_statistics(df)
-    finally:
-        globals()["_prepare_stats_df"] = orig_prepare
+        work, date_col, fi_col, applicant_col = (
+            _prepare_stats_df_with_subclass(
+                df,
+                target_type=target_type
+            )
+        )
+
+    except Exception as e:
+        st.error(f"統計データの準備中にエラーが発生しました: {e}")
+        return
+
+    if work.empty:
+        st.warning("出願年を読み取れるデータがありません。")
+        return
+
+    # ========================================================
+    # ここから既存の統計表示
+    # ========================================================
+
+    st.success(
+        f"✅ {len(work):,} 件を分析しました。"
+        f"（出願日: {date_col} / FI: {fi_col} / "
+        f"出願人/権利者: {applicant_col}）"
+    )
+
+    # --------------------------------------------------------
+    # ① 年別出願件数
+    # --------------------------------------------------------
+
+    st.markdown("### 📈 ① 年別出願件数推移")
+
+    yearly = (
+        work.groupby("出願年")
+        .size()
+        .rename("出願件数")
+        .sort_index()
+    )
+
+    st.line_chart(
+        yearly,
+        x_label="出願年",
+        y_label="出願件数"
+    )
+
+    st.dataframe(
+        yearly.reset_index(),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # ② FIランキング
+    # --------------------------------------------------------
+
+    if target_type == "subclass":
+        st.markdown("### 🏆 ② FIサブクラスランキング")
+        fi_label = "FIサブクラス"
+    else:
+        st.markdown("### 🏆 ② 筆頭FIランキング")
+        fi_label = "筆頭FI"
+
+    first_fi = (
+        work.dropna(subset=["筆頭FI"])
+        .groupby("筆頭FI")
+        .size()
+        .reset_index(name="出願件数")
+        .sort_values(
+            ["出願件数", "筆頭FI"],
+            ascending=[False, True]
+        )
+        .reset_index(drop=True)
+    )
+
+    first_fi.insert(
+        0,
+        "順位",
+        range(1, len(first_fi) + 1)
+    )
+
+    top_n = st.slider(
+        "表示するランキング件数",
+        min_value=5,
+        max_value=30,
+        value=10,
+        key="stats_top_n"
+    )
+
+    st.bar_chart(
+        first_fi.head(top_n).set_index("筆頭FI")["出願件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label=fi_label
+    )
+
+    st.dataframe(
+        first_fi.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # ③ 筆頭出願人/権利者ランキング
+    # --------------------------------------------------------
+
+    st.markdown("### 🏢 ③ 筆頭出願人/権利者ランキング")
+
+    first_applicant = (
+        work.dropna(
+            subset=["筆頭出願人/権利者"]
+        )
+        .groupby("筆頭出願人/権利者")
+        .size()
+        .reset_index(name="出願件数")
+        .sort_values(
+            ["出願件数", "筆頭出願人/権利者"],
+            ascending=[False, True]
+        )
+        .reset_index(drop=True)
+    )
+
+    first_applicant.insert(
+        0,
+        "順位",
+        range(1, len(first_applicant) + 1)
+    )
+
+    st.bar_chart(
+        first_applicant.head(top_n)
+        .set_index("筆頭出願人/権利者")["出願件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label="筆頭出願人/権利者"
+    )
+
+    st.dataframe(
+        first_applicant.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # ④ 出願人/権利者別FIランキング
+    # --------------------------------------------------------
+
+    if target_type == "subclass":
+        st.markdown(
+            "### 🧩 ④ 出願人/権利者別FIサブクラスランキング"
+        )
+    else:
+        st.markdown(
+            "### 🧩 ④ 出願人/権利者別出願FIランキング"
+        )
+
+    applicant_fi = _make_applicant_fi_table(work)
+
+    if applicant_fi.empty:
+        st.info(
+            "出願人/権利者別FIを集計できるデータがありません。"
+        )
+        return
+
+    applicant_choices = sorted(
+        applicant_fi["出願人/権利者"].unique()
+    )
+
+    selected_applicant = st.selectbox(
+        "詳しく見る出願人/権利者",
+        applicant_choices,
+        key="stats_selected_applicant"
+    )
+
+    selected = applicant_fi[
+        applicant_fi["出願人/権利者"]
+        == selected_applicant
+    ].copy()
+
+    selected.insert(
+        0,
+        "順位",
+        range(1, len(selected) + 1)
+    )
+
+    st.bar_chart(
+        selected.head(top_n)
+        .set_index("FI")["件数"],
+        horizontal=True,
+        x_label="出願件数",
+        y_label=fi_label
+    )
+
+    st.dataframe(
+        selected.head(top_n),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # 注記
+    # --------------------------------------------------------
+
+    if target_type == "subclass":
+
+        st.caption(
+            "※ FIサブクラスは、FIコードから "
+            "「英字1文字＋数字2桁＋英字1文字」"
+            "の部分を抽出して集計しています。"
+            "例えば「H01L 21/00」「H01L 29/00」は"
+            "いずれも「H01L」として集計されます。"
+        )
+
+    else:
+
+        st.caption(
+            "※「筆頭FI」「筆頭出願人/権利者」は、"
+            "CSVの該当セルに複数値がある場合、"
+            "先頭に記載されたものを筆頭として集計します。"
+            "「出願人/権利者別出願FI」は、"
+            "同一出願に複数の出願人/権利者・FIがある場合、"
+            "それぞれの組合せを1件として集計します。"
+        )
 
 
-# --- 実行部分 ---
+# ============================================================
+# タブ⑤で統計を表示
+# ============================================================
+
 if st.session_state.get("stats_df") is not None:
-    _show_patent_statistics_with_subclass_option(st.session_state.stats_df)
+
+    # タブ5の中に表示する
+    with tab5:
+
+        _show_patent_statistics_with_subclass_option(
+            st.session_state.stats_df
+        )
