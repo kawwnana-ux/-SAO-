@@ -193,7 +193,7 @@ with tab1:
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
                 graph = pp.build_graphviz(relations, title="構成要素間関係", theme="deepsea")
-                st.graphviz_chart(graph, use_container_width=True)
+                st.graphviz_chart(graph, width='stretch')
 
                 st.markdown("#### 🐙 クレームの広さ・狭さ")
                 narrowness, breadth, scope_detail = pp.compute_claim_scope_score(relations)
@@ -225,7 +225,7 @@ with tab1:
                         }
                         for r in relations
                     ],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -362,7 +362,7 @@ with tab2:
                     }
                     for ta, tb, sim in matches_sorted
                 ],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -419,7 +419,7 @@ with tab3:
         with st.expander("登録済みの一覧を見る"):
             st.dataframe(
                 [{"id": e["id"], "本文（先頭50文字）": e["text"][:50] + "..."} for e in st.session_state.patent_db],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -475,7 +475,7 @@ with tab3:
                             }
                             for ta, tb, sim in matches_sorted
                         ],
-                        use_container_width=True,
+                        width='stretch',
                         hide_index=True,
                     )
 
@@ -506,7 +506,7 @@ with tab4:
         with st.expander("認識結果を確認する"):
             st.dataframe(
                 [{"番号": n, "本文（先頭60文字）": b[:60] + "..."} for n, b in sorted(parsed_claims.items())],
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
             )
 
@@ -544,7 +544,7 @@ with tab4:
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
                 graph = pp.build_graphviz(relations, title="構成要素間関係（展開後）", theme="deepsea")
-                st.graphviz_chart(graph, use_container_width=True)
+                st.graphviz_chart(graph, width='stretch')
 
                 st.markdown("#### 🐙 クレームの広さ・狭さ")
                 narrowness, breadth, scope_detail = pp.compute_claim_scope_score(relations)
@@ -559,7 +559,7 @@ with tab4:
                         {"主語": r["source"], "関係": r["relation"], "目的語": r["target"], "種類": r["type"]}
                         for r in relations
                     ],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -654,7 +654,7 @@ with tab5:
             with st.expander("認識されたセクションを確認する"):
                 st.dataframe(
                     [{"id": e["id"], "見出し": "、".join(e["sections"].keys())} for e in st.session_state.abstract_db],
-                    use_container_width=True, hide_index=True,
+                    width='stretch', hide_index=True,
                 )
         db = st.session_state.abstract_db
     else:
@@ -684,18 +684,19 @@ with tab5:
         group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
-            "🛰️ ATLAS（基礎特許マップ）",
-            "🔍 Explorer（キーワード探査）", "🪐 Saturn V（意味的俯瞰マップ）",
-            "🧬 CORE（論理式分類）", "📊 構成部位・分布・比較",
+            "🗺️ 海図（ATLAS）",
+            "🐡 群れ探査（Explorer）", "🌊 深海海流マップ（Saturn V）",
+            "🪸 珊瑚礁分類（CORE）", "🐙 生態プロファイル",
         ])
 
         with sub_tab_atlas:
+            st.caption("🧭 出願の海を一望する海図。件数の潮流・出願人という船団・FIという漁場を俯瞰します。")
             has_metadata = any(e.get("出願日") for e in db)
             if not has_metadata:
                 st.info("このデータベースには出願日等のメタデータがありません。「フルメタデータCSV」を選んで構築してください。")
             else:
                 freq_choice = st.radio("時系列の単位", ["年", "月"], horizontal=True, key="atlas_freq")
-                if st.button("🛰️ 出願件数推移を見る", key="atlas_trend_run"):
+                if st.button("🌊 出願件数推移を見る", key="atlas_trend_run"):
                     fig = pp.plot_filing_trend(db, freq="Y" if freq_choice == "年" else "M")
                     st.pyplot(fig)
 
@@ -725,10 +726,11 @@ with tab5:
 
         # --- Explorer ---
         with sub_tab_explorer:
+            st.caption("🐡 2つの群れ（グループA・B）が、それぞれどんな言葉の縄張りを持っているかを泳ぎ回って探ります。")
             kind = st.radio("比較するキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
-            if st.button("🔍 比較する", key="explorer_run"):
+            if st.button("🐠 比較する", key="explorer_run"):
                 result = pp.compare_keyword_groups(db, group_a_ids, group_b_ids, kind=kind_map[kind])
                 st.session_state.explorer_result = result
 
@@ -747,17 +749,18 @@ with tab5:
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.markdown(f"**共通する語（{len(result['common'])}件）**")
-                    st.dataframe([{"語": w, "A": a, "B": b} for w, a, b in result["common"]], hide_index=True, use_container_width=True)
+                    st.dataframe([{"語": w, "A": a, "B": b} for w, a, b in result["common"]], hide_index=True, width='stretch')
                 with col2:
                     st.markdown(f"**Aだけの語（{len(result['only_a'])}件）**")
-                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, use_container_width=True)
+                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, width='stretch')
                 with col3:
                     st.markdown(f"**Bだけの語（{len(result['only_b'])}件）**")
-                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, use_container_width=True)
+                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, width='stretch')
 
         # --- Saturn V ---
         with sub_tab_saturn:
-            if st.button("🪐 マップを作成する", key="saturn_run"):
+            st.caption("🌊 意味の海流に乗せて、特許たちを漂わせます。似た内容の発明ほど、潮に流されて近くに寄り集まります。")
+            if st.button("🐋 マップを作成する", key="saturn_run"):
                 try:
                     points, var = pp.build_semantic_map(db)
                     groups = {i: "グループA" for i in group_a_ids}
@@ -774,6 +777,7 @@ with tab5:
 
         # --- CORE ---
         with sub_tab_core:
+            st.caption("🪸 縦軸・横軸で区切った珊瑚礁のマス目に特許を住まわせます。誰も住んでいない白いマスが、まだ誰も棲みついていない空白地帯です。")
             st.caption(
                 "各カテゴリを「カテゴリ名: キーワード1, キーワード2」の形で、1行に1カテゴリずつ入力してください。"
                 "そのカテゴリに割り当てるには、キーワードのうち1つでも含まれていればOKです。"
@@ -822,9 +826,10 @@ with tab5:
 
         # --- 構成部位ランキング・件数分布・レーダーチャート ---
         with sub_tab_rank:
-            st.markdown("#### 📊 構成部位ランキング（全体）")
+            st.caption("🐙 この海域によく生息する部位のランキング、群れの体格分布、そして群れ同士の生態比較です。")
+            st.markdown("#### 🦑 構成部位ランキング（全体）")
             rank_kind = st.radio("ランキングの対象", ["構成要素", "動詞"], horizontal=True, key="rank_kind")
-            if st.button("📊 ランキングを作る", key="rank_run"):
+            if st.button("🦑 ランキングを作る", key="rank_run"):
                 ranking = pp.rank_components(db, kind="component" if rank_kind == "構成要素" else "verb", top_n=20)
                 st.session_state.rank_result = ranking
             if st.session_state.get("rank_result") is not None:
