@@ -863,4 +863,171 @@ with tab5:
                 hide_index=True
             )
 
-        _show_patent_statistics(st.session_state.stats_df)
+        _show_patent_statistics_with_subclass_option(st.session_state.stats_df)
+
+import re
+import pandas as pd
+import streamlit as st
+
+# ============================================================
+# 既存コードで定義されたヘルパー関数のモック/参照定義
+# ※ 実際の運用環境では、既存コードのモジュールからインポートするか
+#    既存コードが実行された後の名前空間上で動作します。
+# ============================================================
+
+try:
+    # 既存コードがモジュール化されている場合、または同ファイル内にある想定
+    from main import (
+        _find_column,
+        _split_multi_value,
+        _extract_year,
+        _prepare_stats_df,
+        _make_applicant_fi_table,
+        _show_patent_statistics,
+    )
+except ImportError:
+    # 既存コードと同形式のフォールバック定義
+    def _find_column(df, aliases):
+        normalized = {
+            str(c).strip().lower().replace(" ", "").replace("　", ""): c
+            for c in df.columns
+        }
+        for alias in aliases:
+            key = str(alias).strip().lower().replace(" ", "").replace("　", "")
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    def _split_multi_value(value):
+        if pd.isna(value):
+            return []
+        s = str(value).strip()
+        if not s:
+            return []
+        s = re.sub(r"[；;、,\n\r]+", "|", s)
+        return [x.strip() for x in s.split("|") if x.strip()]
+
+    def _extract_year(value):
+        if pd.isna(value):
+            return None
+        s = str(value).strip()
+        m = re.search(r"(19|20)\d{2}", s)
+        return int(m.group(0)) if m else None
+
+
+# ============================================================
+# FIサブクラス (先頭4文字) 抽出ロジック
+# ============================================================
+
+def extract_fi_subclass(fi_code: str) -> str:
+    """
+    FIコードからサブクラス（先頭4文字：英字1字＋数字2字＋英字1字 例: 'H01L'）を抽出します。
+    """
+    if pd.isna(fi_code):
+        return None
+    s = str(fi_code).strip()
+    # メイングループ/サブグループ等を除去し、先頭の4文字（例: H01L）を抽出
+    m = re.match(r"^([A-Ha-h]\d{2}[A-Za-z])", s)
+    if m:
+        return m.group(1).upper()
+    # 正規表現にマッチしない場合でも、文字列長が4以上であれば先頭4文字を返す
+    return s[:4].upper() if len(s) >= 4 else s.upper()
+
+
+# ============================================================
+# 既存クラスを継承/カプセル化した処理クラス
+# ============================================================
+
+class FISubclassPatentAnalyzer:
+    """
+    既存の特許統計分析ロジックを改変せず、
+    FI分類をサブクラス階層（先頭4文字）単位に変換して集計するアナライザー。
+    """
+
+    @staticmethod
+    def prepare_stats_df(df: pd.DataFrame):
+        """
+        既存の _prepare_stats_df の出力を受けて、
+        FIの値をサブクラス（先頭4文字）に置き換えます。
+        """
+        # 1. 既存の関数を実行してDataFrameを取得
+        work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
+
+        # 2. 原文のFI文字列を分割して、それぞれサブクラス（先頭4文字）に変換
+        def _to_subclass_string(raw_fi_text):
+            fis = _split_multi_value(raw_fi_text)
+            subclasses = [extract_fi_subclass(fi) for fi in fis if extract_fi_subclass(fi)]
+            # 重複を除いて元の区切り形式（セミコロン区切り等）で結合
+            unique_subclasses = list(dict.fromkeys(subclasses))
+            return "; ".join(unique_subclasses)
+
+        work["FI原文"] = work["FI原文"].apply(_to_subclass_string)
+
+        # 3. 筆頭FIもサブクラス単位に更新
+        work["筆頭FI"] = work["FI原文"].apply(
+            lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
+        )
+
+        return work, date_col, fi_col, applicant_col
+
+    @classmethod
+    def show_patent_statistics(cls, df: pd.DataFrame):
+        """
+        サブクラス抽出を反映した特許統計分析を表示します。
+        既存の _show_patent_statistics のロジックを保持したまま呼び出します。
+        """
+        # 既存関数内で使われる _prepare_stats_df を一時的に本クラスのサブクラス対応版に差し替えて実行
+        original_prepare = globals().get("_prepare_stats_df")
+        try:
+            # モンキーパッチ適用（既存コード自体は改変せず、実行時に差し替え）
+            globals()["_prepare_stats_df"] = cls.prepare_stats_df
+            
+            st.markdown("---")
+            st.info("💡 **FIサブクラス（先頭4文字）モード**で集計を実行しています（例：H01L 21/00 ➔ H01L）")
+            
+            # 既存の表示用関数を実行
+            _show_patent_statistics(df)
+            
+        finally:
+            # 元の関数に戻す
+            if original_prepare:
+                globals()["_prepare_stats_df"] = original_prepare
+
+
+# ============================================================
+# Streamlit用 表示切り替え対応ラッパー関数
+# ============================================================
+
+def show_patent_statistics_with_subclass_option(df: pd.DataFrame):
+    """
+    UI上で「完全なFI」と「サブクラス（先頭4文字）」の切り替えを選択できるようにするラッパー。
+    """
+    mode = st.radio(
+        "FI集計レベルを選択",
+        options=["完全なFIコード (例: H01L 21/00)", "FIサブクラス (例: H01L)"],
+        horizontal=True,
+        key="fi_level_select"
+    )
+
+    if "サブクラス" in mode:
+        FISubclassPatentAnalyzer.show_patent_statistics(df)
+    else:
+        _show_patent_statistics(df)
+
+
+# --- スタンドアロンテスト用実行ブロック ---
+if __name__ == "__main__":
+    st.title("FIサブクラス抽出テスト")
+
+    # サンプルデータ作成
+    sample_data = pd.DataFrame({
+        "出願日": ["2021-01-01", "2022-05-15", "2023-09-10"],
+        "FI": [
+            "H01L 21/00; A61K 31/00",
+            "H01L 29/00",
+            "G06F 17/00; H01L 21/02"
+        ],
+        "出願人": ["株式会社A", "株式会社B; 株式会社A", "株式会社C"]
+    })
+
+    show_patent_statistics_with_subclass_option(sample_data)
