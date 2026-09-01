@@ -1,9 +1,9 @@
 import base64
-import matplotlib.pyplot as plt
-import pandas as pd
 import io
 import re
 from collections import Counter
+import matplotlib.pyplot as plt
+import pandas as pd
 import streamlit as st
 
 # Matplotlibの日本語文字化け対策
@@ -150,11 +150,11 @@ st.markdown(
 def _find_column(df, aliases):
     """CSVの列名が多少違っても自動認識する。"""
     normalized = {
-        str(c).strip().lower().replace(" ", "").replace("　", ""): c
+        str(c).strip().lower().replace(" ", "").replace(" ", ""): c
         for c in df.columns
     }
     for alias in aliases:
-        key = str(alias).strip().lower().replace(" ", "").replace("　", "")
+        key = str(alias).strip().lower().replace(" ", "").replace(" ", "")
         if key in normalized:
             return normalized[key]
     return None
@@ -167,7 +167,6 @@ def _split_multi_value(value):
     s = str(value).strip()
     if not s:
         return []
-    # 全角/半角の区切り文字、改行を統一
     s = re.sub(r"[；;、,\n\r]+", "|", s)
     parts = [x.strip() for x in s.split("|") if x.strip()]
     return parts
@@ -185,10 +184,6 @@ def _extract_year(value):
 def _prepare_stats_df(df):
     """
     統計分析に使う列を自動認識する。
-    推奨列:
-      出願日, FI, 出願人/権利者
-    英語列にも対応:
-      application_date/date, fi, applicant
     """
     df = df.copy()
 
@@ -340,7 +335,6 @@ def _show_patent_statistics(df):
         st.info("出願人/権利者別FIを集計できるデータがありません。")
         return
 
-    # 出願人/権利者ごとに上位FIを表示
     applicant_choices = sorted(applicant_fi["出願人/権利者"].unique())
     selected_applicant = st.selectbox(
         "詳しく見る出願人/権利者",
@@ -413,7 +407,6 @@ with tab1:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
 
-    # 結果を表示
     if st.session_state.single_result is not None:
         relations = st.session_state.single_result["relations"]
 
@@ -520,7 +513,6 @@ with tab2:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.compare_result = None
 
-    # 結果を表示
     if st.session_state.compare_result is not None:
         res = st.session_state.compare_result
 
@@ -623,7 +615,6 @@ with tab3:
         records = []
         if uploaded_csv is not None:
             import csv
-            import io
 
             content = uploaded_csv.getvalue().decode("utf-8-sig")
             reader = csv.DictReader(io.StringIO(content))
@@ -694,7 +685,7 @@ with tab3:
         for i, r in enumerate(results):
             has_precise = "precise_score" in r
             score_label = f"精密スコア {r['precise_score']:.3f}" if has_precise else f"粗いスコア {r['fast_score']:.3f}"
-            with st.expander(f"{i+1}位　【{r['id']}】　{score_label}"):
+            with st.expander(f"{i+1}位 【{r['id']}】 {score_label}"):
                 st.write(r["text"])
                 st.caption(f"粗いスコア: {r['fast_score']:.3f}" + (f" ／ 精密スコア: {r['precise_score']:.3f}" if has_precise else ""))
                 if has_precise:
@@ -875,7 +866,6 @@ def extract_fi_subclass(fi_code):
     if not fi_code or pd.isna(fi_code):
         return None
     s = str(fi_code).strip()
-    # アルファベット1文字 + 数字2桁 + アルファベット1文字（例: H01L, A61K）を検索
     m = re.search(r"([A-Z]\d{2}[A-Z])", s, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -885,13 +875,13 @@ def extract_fi_subclass(fi_code):
 def _prepare_stats_df_with_subclass(df, target_type="fi"):
     """既存の_prepare_stats_dfを拡張し、サブクラス切り替えに対応"""
     work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
-    
+
     if target_type == "subclass":
         work["FI原文"] = work["FI原文"].apply(
             lambda val: ";".join([extract_fi_subclass(x) for x in _split_multi_value(val) if extract_fi_subclass(x)])
         )
         work["筆頭FI"] = work["筆頭FI"].apply(extract_fi_subclass)
-        
+
     return work, date_col, fi_col, applicant_col
 
 
@@ -903,10 +893,9 @@ def _show_patent_statistics_with_subclass_option(df):
         horizontal=True,
         key="fi_aggregate_mode"
     )
-    
+
     target_type = "subclass" if "サブクラス" in mode else "fi"
-    
-    # 既存の関数を動的に差し替えて実行
+
     orig_prepare = globals()["_prepare_stats_df"]
     try:
         globals()["_prepare_stats_df"] = lambda d: _prepare_stats_df_with_subclass(d, target_type)
@@ -915,7 +904,6 @@ def _show_patent_statistics_with_subclass_option(df):
         globals()["_prepare_stats_df"] = orig_prepare
 
 
-# --- 実行部分（一番最後に記述） ---
+# --- 実行部分 ---
 if st.session_state.get("stats_df") is not None:
     _show_patent_statistics_with_subclass_option(st.session_state.stats_df)
- 
