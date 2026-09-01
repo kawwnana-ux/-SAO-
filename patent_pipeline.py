@@ -4281,6 +4281,47 @@ def rank_by_field(database, field="出願人", top_n=15):
     return counter.most_common(top_n)
 
 
+def fi_to_subclass(fi_code):
+    """
+    FIコードからサブクラスを取り出す（先頭4文字。例：「H10K85/60,150」→「H10K」）。
+    """
+    return fi_code[:4]
+
+
+def fi_to_maingroup(fi_code):
+    """
+    FIコードからメイングループを取り出す。
+    先頭6文字（例：「H10K85/60,150」→「H10K85」）。
+    6文字に満たない場合は先頭5文字だけを使う。
+    """
+    if len(fi_code) >= 6:
+        return fi_code[:6]
+    return fi_code[:5]
+
+
+def rank_fi(database, level="サブクラス", top_n=15):
+    """
+    FIコードを、指定した粒度（"サブクラス"＝先頭4文字、
+    "メイングループ"＝先頭6文字（無ければ5文字）、"そのまま"＝元のコード）
+    に丸めてから集計する。粒度を粗くすることで、細分番号の違いに
+    埋もれがちな技術分野ごとの傾向が見えやすくなる。
+    """
+    from collections import Counter
+
+    if level == "サブクラス":
+        convert = fi_to_subclass
+    elif level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    counter = Counter()
+    for entry in database:
+        values = entry.get("FI") or []
+        counter.update({convert(v) for v in values})
+    return counter.most_common(top_n)
+
+
 def plot_ranking_bar(ranking, title="ランキング", xlabel="件数", theme="deepsea"):
     """rank_by_field() の結果を横棒グラフにする"""
     s = _atlas_style(theme)
@@ -4302,18 +4343,32 @@ def plot_ranking_bar(ranking, title="ランキング", xlabel="件数", theme="d
     return fig
 
 
-def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, title="出願人×FI バブルチャート", theme="deepsea"):
+def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, fi_level="サブクラス",
+                              title="出願人×FI バブルチャート", theme="deepsea"):
     """
     出願人 × FI の組み合わせごとの件数を、対数スケールのバブルの
     大きさで表す散布図（バブルチャート）にする。
+
+    fi_level: "サブクラス"（先頭4文字）、"メイングループ"（先頭6文字。
+              無ければ5文字）、"そのまま"（元のコード）から選ぶ。
+              細分番号まで含めた元のコードのままだと、同じ技術分野の
+              コードが細かく分散してしまい傾向が見えにくいため、
+              既定値は"サブクラス"にしている。
     """
     from collections import Counter
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
 
     applicant_counter = Counter()
     fi_counter = Counter()
     for entry in database:
         applicant_counter.update(set(entry.get("出願人") or []))
-        fi_counter.update(set(entry.get("FI") or []))
+        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
 
     top_applicant_names = [a for a, _ in applicant_counter.most_common(top_applicants)]
     top_fi_names = [f for f, _ in fi_counter.most_common(top_fi)]
@@ -4323,7 +4378,7 @@ def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, title="出�
         for a in set(entry.get("出願人") or []):
             if a not in top_applicant_names:
                 continue
-            for f in set(entry.get("FI") or []):
+            for f in {convert(v) for v in (entry.get("FI") or [])}:
                 if f not in top_fi_names:
                     continue
                 pair_counter[(a, f)] += 1

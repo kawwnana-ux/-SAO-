@@ -708,16 +708,17 @@ with tab5:
                         fig = pp.plot_ranking_bar(st.session_state.atlas_applicant_ranking, title="出願人ランキング")
                         st.pyplot(fig)
                 with col2:
+                    fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="atlas_fi_level")
                     if st.button("🔬 FIランキング", key="atlas_fi_run"):
-                        ranking = pp.rank_by_field(db, "FI")
+                        ranking = pp.rank_fi(db, level=fi_level)
                         st.session_state.atlas_fi_ranking = ranking
                     if st.session_state.get("atlas_fi_ranking"):
-                        fig = pp.plot_ranking_bar(st.session_state.atlas_fi_ranking, title="FIランキング")
+                        fig = pp.plot_ranking_bar(st.session_state.atlas_fi_ranking, title=f"FIランキング（{fi_level}）")
                         st.pyplot(fig)
 
                 if st.button("🫧 出願人×FI バブルチャート", key="atlas_bubble_run"):
                     try:
-                        fig = pp.plot_applicant_fi_bubble(db)
+                        fig = pp.plot_applicant_fi_bubble(db, fi_level=fi_level)
                         st.pyplot(fig)
                     except Exception as e:
                         st.error(f"バブルチャート作成中にエラーが発生しました: {e}")
