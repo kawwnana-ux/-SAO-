@@ -1,9 +1,5 @@
 import base64
-import io
-import re
-from collections import Counter
 import matplotlib.pyplot as plt
-import pandas as pd
 import streamlit as st
 
 # Matplotlibの日本語文字化け対策
@@ -28,8 +24,10 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = None
 if "dependent_result" not in st.session_state:
     st.session_state.dependent_result = None
-if "stats_df" not in st.session_state:
-    st.session_state.stats_df = None
+if "group_a_ids" not in st.session_state:
+    st.session_state.group_a_ids = ""
+if "group_b_ids" not in st.session_state:
+    st.session_state.group_b_ids = ""
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -142,240 +140,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-# ============================================================
-# 特許統計分析用ヘルパー
-# ============================================================
-
-def _find_column(df, aliases):
-    """CSVの列名が多少違っても自動認識する。"""
-    normalized = {
-        str(c).strip().lower().replace(" ", "").replace(" ", ""): c
-        for c in df.columns
-    }
-    for alias in aliases:
-        key = str(alias).strip().lower().replace(" ", "").replace(" ", "")
-        if key in normalized:
-            return normalized[key]
-    return None
-
-
-def _split_multi_value(value):
-    """出願人/権利者・FIなどの複数値を汎用的に分割する。"""
-    if pd.isna(value):
-        return []
-    s = str(value).strip()
-    if not s:
-        return []
-    s = re.sub(r"[；;、,\n\r]+", "|", s)
-    parts = [x.strip() for x in s.split("|") if x.strip()]
-    return parts
-
-
-def _extract_year(value):
-    """日付、YYYY、YYYY-MM-DD、YYYY/MM/DD等から年を抽出。"""
-    if pd.isna(value):
-        return None
-    s = str(value).strip()
-    m = re.search(r"(19|20)\d{2}", s)
-    return int(m.group(0)) if m else None
-
-
-def _prepare_stats_df(df):
-    """
-    統計分析に使う列を自動認識する。
-    """
-    df = df.copy()
-
-    date_col = _find_column(df, [
-        "出願日", "出願年月日", "出願日付", "application_date",
-        "filing_date", "filingdate", "date"
-    ])
-    fi_col = _find_column(df, [
-        "FI", "筆頭FI", "FI分類", "FIコード", "fi_code", "fi"
-    ])
-    applicant_col = _find_column(df, [
-        "出願人/権利者", "出願人/権利者名", "出願人/権利者名称", "applicant",
-        "applicants", "applicant_name"
-    ])
-
-    if date_col is None:
-        raise ValueError("「出願日」列が見つかりません。例：出願日 / application_date")
-    if fi_col is None:
-        raise ValueError("「FI」列が見つかりません。例：FI / fi")
-    if applicant_col is None:
-        raise ValueError("「出願人/権利者」列が見つかりません。例：出願人/権利者 / applicant")
-
-    work = pd.DataFrame({
-        "出願年": df[date_col].apply(_extract_year),
-        "FI原文": df[fi_col],
-        "出願人/権利者原文": df[applicant_col],
-    })
-
-    work["筆頭FI"] = work["FI原文"].apply(
-        lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
-    )
-    work["筆頭出願人/権利者"] = work["出願人/権利者原文"].apply(
-        lambda x: _split_multi_value(x)[0] if _split_multi_value(x) else None
-    )
-
-    work = work.dropna(subset=["出願年"])
-    work["出願年"] = work["出願年"].astype(int)
-    return work, date_col, fi_col, applicant_col
-
-
-def _make_applicant_fi_table(work):
-    """出願人/権利者ごとに、その出願に含まれるFIを集計する。"""
-    rows = []
-    for _, row in work.iterrows():
-        applicants = _split_multi_value(row["出願人/権利者原文"])
-        fis = _split_multi_value(row["FI原文"])
-        if not applicants or not fis:
-            continue
-        for applicant in applicants:
-            for fi in fis:
-                rows.append({"出願人/権利者": applicant, "FI": fi})
-
-    if not rows:
-        return pd.DataFrame(columns=["出願人/権利者", "FI", "件数"])
-
-    tmp = pd.DataFrame(rows)
-    result = (
-        tmp.groupby(["出願人/権利者", "FI"])
-        .size()
-        .reset_index(name="件数")
-        .sort_values(["出願人/権利者", "件数", "FI"], ascending=[True, False, True])
-    )
-    return result
-
-
-def _show_patent_statistics(df):
-    """4種類の特許統計を表示する。"""
-    try:
-        work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
-    except Exception as e:
-        st.error(str(e))
-        return
-
-    if work.empty:
-        st.warning("出願年を読み取れるデータがありません。")
-        return
-
-    st.success(
-        f"✅ {len(work):,} 件を分析しました。"
-        f"（出願日: {date_col} / FI: {fi_col} / 出願人/権利者: {applicant_col}）"
-    )
-
-    # ① 年別出願件数
-    st.markdown("### 📈 ① 年別出願件数推移")
-    yearly = work.groupby("出願年").size().rename("出願件数").sort_index()
-    st.line_chart(yearly, x_label="出願年", y_label="出願件数")
-    st.dataframe(
-        yearly.reset_index(),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ② 筆頭FIランキング
-    st.markdown("### 🏆 ② 筆頭FIランキング")
-    first_fi = (
-        work.dropna(subset=["筆頭FI"])
-        .groupby("筆頭FI")
-        .size()
-        .reset_index(name="出願件数")
-        .sort_values(["出願件数", "筆頭FI"], ascending=[False, True])
-        .reset_index(drop=True)
-    )
-    first_fi.insert(0, "順位", range(1, len(first_fi) + 1))
-
-    top_n = st.slider(
-        "表示するランキング件数",
-        min_value=5,
-        max_value=30,
-        value=10,
-        key="stats_top_n"
-    )
-    st.bar_chart(
-        first_fi.head(top_n).set_index("筆頭FI")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="筆頭FI"
-    )
-    st.dataframe(first_fi.head(top_n), use_container_width=True, hide_index=True)
-
-    # ③ 筆頭出願人/権利者ランキング
-    st.markdown("### 🏢 ③ 筆頭出願人/権利者ランキング")
-    first_applicant = (
-        work.dropna(subset=["筆頭出願人/権利者"])
-        .groupby("筆頭出願人/権利者")
-        .size()
-        .reset_index(name="出願件数")
-        .sort_values(["出願件数", "筆頭出願人/権利者"], ascending=[False, True])
-        .reset_index(drop=True)
-    )
-    first_applicant.insert(0, "順位", range(1, len(first_applicant) + 1))
-
-    st.bar_chart(
-        first_applicant.head(top_n).set_index("筆頭出願人/権利者")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="筆頭出願人/権利者"
-    )
-    st.dataframe(
-        first_applicant.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ④ 出願人/権利者別出願FIランキング
-    st.markdown("### 🧩 ④ 出願人/権利者別出願FIランキング")
-    applicant_fi = _make_applicant_fi_table(work)
-
-    if applicant_fi.empty:
-        st.info("出願人/権利者別FIを集計できるデータがありません。")
-        return
-
-    applicant_choices = sorted(applicant_fi["出願人/権利者"].unique())
-    selected_applicant = st.selectbox(
-        "詳しく見る出願人/権利者",
-        applicant_choices,
-        key="stats_selected_applicant"
-    )
-
-    selected = applicant_fi[
-        applicant_fi["出願人/権利者"] == selected_applicant
-    ].copy()
-    selected.insert(0, "順位", range(1, len(selected) + 1))
-
-    st.bar_chart(
-        selected.head(top_n).set_index("FI")["件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="FI"
-    )
-    st.dataframe(
-        selected.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.caption(
-        "※「筆頭FI」「筆頭出願人/権利者」は、CSVの該当セルに複数値がある場合、"
-        "先頭に記載されたものを筆頭として集計します。"
-        "「出願人/権利者別出願FI」は、同一出願に複数の出願人/権利者・FIがある場合、"
-        "それぞれの組合せを1件として集計します。"
-    )
-
-
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🪸 1つの請求項を解析",
-    "🐚 2つの請求項を比較",
-    "🔦 まとめて検索",
-    "🪼 従属請求項を展開",
-    "📊 特許統計分析",
+    "🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索",
+    "🪼 従属請求項を展開", "🔭 ポートフォリオ分析",
 ])
 
 
@@ -407,6 +177,7 @@ with tab1:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
 
+    # 結果を表示
     if st.session_state.single_result is not None:
         relations = st.session_state.single_result["relations"]
 
@@ -513,6 +284,7 @@ with tab2:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.compare_result = None
 
+    # 結果を表示
     if st.session_state.compare_result is not None:
         res = st.session_state.compare_result
 
@@ -615,6 +387,7 @@ with tab3:
         records = []
         if uploaded_csv is not None:
             import csv
+            import io
 
             content = uploaded_csv.getvalue().decode("utf-8-sig")
             reader = csv.DictReader(io.StringIO(content))
@@ -685,7 +458,7 @@ with tab3:
         for i, r in enumerate(results):
             has_precise = "precise_score" in r
             score_label = f"精密スコア {r['precise_score']:.3f}" if has_precise else f"粗いスコア {r['fast_score']:.3f}"
-            with st.expander(f"{i+1}位 【{r['id']}】 {score_label}"):
+            with st.expander(f"{i+1}位　【{r['id']}】　{score_label}"):
                 st.write(r["text"])
                 st.caption(f"粗いスコア: {r['fast_score']:.3f}" + (f" ／ 精密スコア: {r['precise_score']:.3f}" if has_precise else ""))
                 if has_precise:
@@ -790,395 +563,131 @@ with tab4:
 
 
 # ============================================================
-# タブ⑤：CSVによる特許統計分析
+# タブ⑤：ポートフォリオ分析（Explorer / Saturn V / CORE）
 # ============================================================
 with tab5:
-    st.subheader("📊 CSVから特許出願統計を分析")
     st.caption(
-        "CSVをアップロードするか、CSV本文を貼り付けるだけで、"
-        "年別出願件数・筆頭FI・筆頭出願人/権利者・出願人/権利者別FIを集計します。"
+        "このタブは、タブ「🔦 まとめて検索」で構築したデータベースを再利用します。"
+        "先にそちらでデータベースを作ってから使ってください。"
     )
 
-    st.markdown(
-        """
-        **推奨CSV列**
-        - `出願日`：例 `2024-03-15`
-        - `FI`：例 `H01L 21/00; H01L 29/00`
-        - `出願人/権利者`：例 `株式会社A;株式会社B`
+    if st.session_state.patent_db is None:
+        st.info("先に「🔦 まとめて検索」タブでデータベースを構築してください。")
+    else:
+        db = st.session_state.patent_db
+        all_ids = [e["id"] for e in db]
+        st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
-        英語列 `application_date / fi / applicant` も利用できます。
-        既存のCSVに `id` や `text` など他の列があっても問題ありません。
-        """
-    )
+        st.markdown("#### 🏷️ グループ分け（自社 / 競合など）")
+        st.caption("id をカンマまたは改行区切りで入力してください。両方に入れなかったidは自動的にグループBに含まれません。")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            group_a_text = st.text_area("グループA（例：自社）のid", value=st.session_state.group_a_ids, height=80, key="group_a_input")
+        with col_b:
+            group_b_text = st.text_area("グループB（例：競合）のid", value=st.session_state.group_b_ids, height=80, key="group_b_input")
 
-    stats_uploaded_csv = st.file_uploader(
-        "📁 統計分析用CSVをアップロード",
-        type=["csv"],
-        key="stats_csv_upload"
-    )
+        def _parse_ids(text, fallback):
+            ids = [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]
+            return ids if ids else fallback
 
-    stats_csv_text = st.text_area(
-        "またはCSV本文をここに貼り付け",
-        height=180,
-        placeholder=(
-            "出願日,FI,出願人/権利者\n"
-            "2022-04-01,H01L 21/00,株式会社A\n"
-            "2023-06-12,H01L 29/00;H01L 21/00,株式会社B;株式会社C\n"
-            "2024-01-20,H10B 12/00,株式会社A"
-        ),
-        key="stats_csv_text"
-    )
+        group_a_ids = _parse_ids(group_a_text, all_ids[: len(all_ids) // 2] or all_ids)
+        group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
-    if st.button("📊 統計を分析する", type="primary", key="stats_run"):
-        try:
-            if stats_uploaded_csv is not None:
-                content = stats_uploaded_csv.getvalue().decode("utf-8-sig")
-            elif stats_csv_text.strip():
-                content = stats_csv_text
-            else:
-                st.warning("CSVをアップロードするか、CSV本文を貼り付けてください。")
-                content = None
+        sub_tab_explorer, sub_tab_saturn, sub_tab_core = st.tabs(["🔍 Explorer（キーワード探査）", "🪐 Saturn V（意味的俯瞰マップ）", "🧬 CORE（論理式分類）"])
 
-            if content:
-                stats_df = pd.read_csv(io.StringIO(content))
-                st.session_state.stats_df = stats_df
-        except Exception as e:
-            st.error(f"CSVの読み込みに失敗しました: {e}")
-            st.session_state.stats_df = None
+        # --- Explorer ---
+        with sub_tab_explorer:
+            kind = st.radio("比較するキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
+            kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
-    if st.session_state.stats_df is not None:
-        with st.expander("読み込んだCSVを確認する"):
-            st.dataframe(
-                st.session_state.stats_df,
-                use_container_width=True,
-                hide_index=True
+            if st.button("🔍 比較する", key="explorer_run"):
+                result = pp.compare_keyword_groups(db, group_a_ids, group_b_ids, kind=kind_map[kind])
+                st.session_state.explorer_result = result
+
+            if st.session_state.get("explorer_result") is not None:
+                result = st.session_state.explorer_result
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**グループAのワードクラウド**")
+                    fig = pp.plot_wordcloud(result["freq_a"], title="グループA")
+                    st.pyplot(fig)
+                with col2:
+                    st.markdown("**グループBのワードクラウド**")
+                    fig = pp.plot_wordcloud(result["freq_b"], title="グループB")
+                    st.pyplot(fig)
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown(f"**共通する語（{len(result['common'])}件）**")
+                    st.dataframe([{"語": w, "A": a, "B": b} for w, a, b in result["common"]], hide_index=True, use_container_width=True)
+                with col2:
+                    st.markdown(f"**Aだけの語（{len(result['only_a'])}件）**")
+                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, use_container_width=True)
+                with col3:
+                    st.markdown(f"**Bだけの語（{len(result['only_b'])}件）**")
+                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, use_container_width=True)
+
+        # --- Saturn V ---
+        with sub_tab_saturn:
+            if st.button("🪐 マップを作成する", key="saturn_run"):
+                try:
+                    points, var = pp.build_semantic_map(db)
+                    groups = {i: "グループA" for i in group_a_ids}
+                    groups.update({i: "グループB" for i in group_b_ids})
+                    st.session_state.saturn_result = (points, var, groups)
+                except Exception as e:
+                    st.error(f"マップ作成中にエラーが発生しました: {e}")
+
+            if st.session_state.get("saturn_result") is not None:
+                points, var, groups = st.session_state.saturn_result
+                fig = pp.plot_semantic_map(points, var, groups=groups, title="意味的俯瞰マップ")
+                st.pyplot(fig)
+                st.caption("意味的に近い特許同士が近くに配置されます。距離が近いほど、内容が似ていることを示します。")
+
+        # --- CORE ---
+        with sub_tab_core:
+            st.caption(
+                "各カテゴリを「カテゴリ名: キーワード1, キーワード2」の形で、1行に1カテゴリずつ入力してください。"
+                "そのカテゴリに割り当てるには、キーワードのうち1つでも含まれていればOKです。"
             )
-
-
-# ============================================================
-# FIサブクラス（先頭4文字）抽出機能
-# ============================================================
-
-def extract_fi_subclass(fi_code):
-    """
-    FIコードからサブクラスを抽出する。
-
-    例：
-        H01L 21/00      -> H01L
-        H01L 29/00      -> H01L
-        H10B 12/00      -> H10B
-    """
-    if fi_code is None or pd.isna(fi_code):
-        return None
-
-    s = str(fi_code).strip()
-
-    if not s:
-        return None
-
-    # FIのサブクラスは
-    # 「英字1文字 + 数字2桁 + 英字1文字」
-    # 例：H01L、H10B、G06F
-    m = re.search(r"([A-Za-z]\d{2}[A-Za-z])", s)
-
-    if m:
-        return m.group(1).upper()
-
-    return None
-
-
-def _prepare_stats_df_with_subclass(df, target_type="fi"):
-    """
-    既存の_prepare_stats_dfを利用して統計用データを作成する。
-
-    target_type:
-        fi       : 完全なFIコード
-        subclass : FIサブクラス（H01Lなど）
-    """
-
-    # 元の関数を直接呼ぶ
-    # ※ globals()を書き換えないので再帰しない
-    work, date_col, fi_col, applicant_col = _prepare_stats_df(df)
-
-    if target_type == "subclass":
-
-        # FI原文をサブクラスへ変換
-        def convert_fi_values(value):
-            fis = _split_multi_value(value)
-
-            subclasses = []
-
-            for fi in fis:
-                subclass = extract_fi_subclass(fi)
-
-                if subclass and subclass not in subclasses:
-                    subclasses.append(subclass)
-
-            return ";".join(subclasses)
-
-        work["FI原文"] = work["FI原文"].apply(convert_fi_values)
-
-        # 筆頭FIもサブクラス化
-        work["筆頭FI"] = work["筆頭FI"].apply(
-            extract_fi_subclass
-        )
-
-    return work, date_col, fi_col, applicant_col
-
-
-def _show_patent_statistics_with_subclass_option(df):
-    """
-    FIコード単位 / FIサブクラス単位を切り替えて
-    既存の特許統計を表示する。
-    """
-
-    mode = st.radio(
-        "📊 FI集計単位の選択",
-        [
-            "完全なFIコード (例: H01L 21/00)",
-            "サブクラス単位 (例: H01L)"
-        ],
-        horizontal=True,
-        key="fi_aggregate_mode"
-    )
-
-    if "サブクラス" in mode:
-        target_type = "subclass"
-    else:
-        target_type = "fi"
-
-    try:
-        work, date_col, fi_col, applicant_col = (
-            _prepare_stats_df_with_subclass(
-                df,
-                target_type=target_type
-            )
-        )
-
-    except Exception as e:
-        st.error(f"統計データの準備中にエラーが発生しました: {e}")
-        return
-
-    if work.empty:
-        st.warning("出願年を読み取れるデータがありません。")
-        return
-
-    # ========================================================
-    # ここから既存の統計表示
-    # ========================================================
-
-    st.success(
-        f"✅ {len(work):,} 件を分析しました。"
-        f"（出願日: {date_col} / FI: {fi_col} / "
-        f"出願人/権利者: {applicant_col}）"
-    )
-
-    # --------------------------------------------------------
-    # ① 年別出願件数
-    # --------------------------------------------------------
-
-    st.markdown("### 📈 ① 年別出願件数推移")
-
-    yearly = (
-        work.groupby("出願年")
-        .size()
-        .rename("出願件数")
-        .sort_index()
-    )
-
-    st.line_chart(
-        yearly,
-        x_label="出願年",
-        y_label="出願件数"
-    )
-
-    st.dataframe(
-        yearly.reset_index(),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # --------------------------------------------------------
-    # ② FIランキング
-    # --------------------------------------------------------
-
-    if target_type == "subclass":
-        st.markdown("### 🏆 ② FIサブクラスランキング")
-        fi_label = "FIサブクラス"
-    else:
-        st.markdown("### 🏆 ② 筆頭FIランキング")
-        fi_label = "筆頭FI"
-
-    first_fi = (
-        work.dropna(subset=["筆頭FI"])
-        .groupby("筆頭FI")
-        .size()
-        .reset_index(name="出願件数")
-        .sort_values(
-            ["出願件数", "筆頭FI"],
-            ascending=[False, True]
-        )
-        .reset_index(drop=True)
-    )
-
-    first_fi.insert(
-        0,
-        "順位",
-        range(1, len(first_fi) + 1)
-    )
-
-    top_n = st.slider(
-        "表示するランキング件数",
-        min_value=5,
-        max_value=30,
-        value=10,
-        key="stats_top_n"
-    )
-
-    st.bar_chart(
-        first_fi.head(top_n).set_index("筆頭FI")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label=fi_label
-    )
-
-    st.dataframe(
-        first_fi.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # --------------------------------------------------------
-    # ③ 筆頭出願人/権利者ランキング
-    # --------------------------------------------------------
-
-    st.markdown("### 🏢 ③ 筆頭出願人/権利者ランキング")
-
-    first_applicant = (
-        work.dropna(
-            subset=["筆頭出願人/権利者"]
-        )
-        .groupby("筆頭出願人/権利者")
-        .size()
-        .reset_index(name="出願件数")
-        .sort_values(
-            ["出願件数", "筆頭出願人/権利者"],
-            ascending=[False, True]
-        )
-        .reset_index(drop=True)
-    )
-
-    first_applicant.insert(
-        0,
-        "順位",
-        range(1, len(first_applicant) + 1)
-    )
-
-    st.bar_chart(
-        first_applicant.head(top_n)
-        .set_index("筆頭出願人/権利者")["出願件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label="筆頭出願人/権利者"
-    )
-
-    st.dataframe(
-        first_applicant.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # --------------------------------------------------------
-    # ④ 出願人/権利者別FIランキング
-    # --------------------------------------------------------
-
-    if target_type == "subclass":
-        st.markdown(
-            "### 🧩 ④ 出願人/権利者別FIサブクラスランキング"
-        )
-    else:
-        st.markdown(
-            "### 🧩 ④ 出願人/権利者別出願FIランキング"
-        )
-
-    applicant_fi = _make_applicant_fi_table(work)
-
-    if applicant_fi.empty:
-        st.info(
-            "出願人/権利者別FIを集計できるデータがありません。"
-        )
-        return
-
-    applicant_choices = sorted(
-        applicant_fi["出願人/権利者"].unique()
-    )
-
-    selected_applicant = st.selectbox(
-        "詳しく見る出願人/権利者",
-        applicant_choices,
-        key="stats_selected_applicant"
-    )
-
-    selected = applicant_fi[
-        applicant_fi["出願人/権利者"]
-        == selected_applicant
-    ].copy()
-
-    selected.insert(
-        0,
-        "順位",
-        range(1, len(selected) + 1)
-    )
-
-    st.bar_chart(
-        selected.head(top_n)
-        .set_index("FI")["件数"],
-        horizontal=True,
-        x_label="出願件数",
-        y_label=fi_label
-    )
-
-    st.dataframe(
-        selected.head(top_n),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # --------------------------------------------------------
-    # 注記
-    # --------------------------------------------------------
-
-    if target_type == "subclass":
-
-        st.caption(
-            "※ FIサブクラスは、FIコードから "
-            "「英字1文字＋数字2桁＋英字1文字」"
-            "の部分を抽出して集計しています。"
-            "例えば「H01L 21/00」「H01L 29/00」は"
-            "いずれも「H01L」として集計されます。"
-        )
-
-    else:
-
-        st.caption(
-            "※「筆頭FI」「筆頭出願人/権利者」は、"
-            "CSVの該当セルに複数値がある場合、"
-            "先頭に記載されたものを筆頭として集計します。"
-            "「出願人/権利者別出願FI」は、"
-            "同一出願に複数の出願人/権利者・FIがある場合、"
-            "それぞれの組合せを1件として集計します。"
-        )
-
-
-# ============================================================
-# タブ⑤で統計を表示
-# ============================================================
-
-if st.session_state.get("stats_df") is not None:
-
-    # タブ5の中に表示する
-    with tab5:
-
-        _show_patent_statistics_with_subclass_option(
-            st.session_state.stats_df
-        )
+            col1, col2 = st.columns(2)
+            with col1:
+                axis1_text = st.text_area(
+                    "縦軸のカテゴリ",
+                    height=150,
+                    placeholder="電気系: 電極, 温度センサ, 半導体層\n機構系: 車輪, アーム, ハンドル",
+                    key="axis1_text",
+                )
+            with col2:
+                axis2_text = st.text_area(
+                    "横軸のカテゴリ",
+                    height=150,
+                    placeholder="接続あり: 接続\n取り付けあり: 取り付け",
+                    key="axis2_text",
+                )
+
+            def _parse_axis(text):
+                axis = {}
+                for line in text.strip().split("\n"):
+                    if ":" not in line:
+                        continue
+                    name, kws = line.split(":", 1)
+                    keywords = [k.strip() for k in kws.split(",") if k.strip()]
+                    if name.strip() and keywords:
+                        axis[name.strip()] = {"any_of": keywords}
+                return axis
+
+            if st.button("🧬 分類する", key="core_run"):
+                axis1_formulas = _parse_axis(axis1_text)
+                axis2_formulas = _parse_axis(axis2_text)
+                if not axis1_formulas or not axis2_formulas:
+                    st.warning("縦軸・横軸の両方に、少なくとも1つのカテゴリを定義してください。")
+                else:
+                    matrix = pp.classify_patents(db, axis1_formulas, axis2_formulas)
+                    st.session_state.core_result = (matrix, list(axis1_formulas.keys()) + ["(未分類)"], list(axis2_formulas.keys()) + ["(未分類)"])
+
+            if st.session_state.get("core_result") is not None:
+                matrix, axis1_names, axis2_names = st.session_state.core_result
+                fig = pp.plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ")
+                st.pyplot(fig)
+                st.caption("枠で囲まれた0件のマスが、まだ組み合わせのない技術（ホワイトスペース）の候補です。")

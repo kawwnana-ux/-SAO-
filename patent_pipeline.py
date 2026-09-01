@@ -3696,3 +3696,103 @@ def plot_semantic_map(points, explained_variance=None, groups=None, title="意�
     ax.grid(True, color=grid, alpha=0.3)
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㉓ CORE：論理式分類・ヒートマップ
+# ============================================================
+# 独自の論理式（キーワードの組み合わせ）を定義して、特許群を
+# 「課題」軸と「解決手段」軸などで分類し、ヒートマップにする。
+# 値が0のマスは、まだ誰も出願していない技術の組み合わせ
+# （ホワイトスペース）の候補になる。
+
+def evaluate_formula(keywords, formula):
+    """
+    keywords: 1件の特許から抽出したキーワードの集合
+              （extract_keywords_from_relations()の戻り値）
+    formula: {"any_of": [...], "all_of": [...], "none_of": [...]}
+             のいずれかを指定した辞書（省略したキーの条件は無視する）
+             ・any_of: このうち1つでも含まれていればよい（OR）
+             ・all_of: これら全部が含まれている必要がある（AND）
+             ・none_of: これらが1つも含まれていてはいけない（NOT）
+    """
+    if "any_of" in formula and not any(k in keywords for k in formula["any_of"]):
+        return False
+    if "all_of" in formula and not all(k in keywords for k in formula["all_of"]):
+        return False
+    if "none_of" in formula and any(k in keywords for k in formula["none_of"]):
+        return False
+    return True
+
+
+def classify_patents(database, axis1_formulas, axis2_formulas, kind="both"):
+    """
+    axis1_formulas / axis2_formulas: {カテゴリ名: formula辞書, ...}
+
+    各特許のキーワード集合を、両方の軸それぞれについて、
+    マッチする全カテゴリに分類する（1件が複数のカテゴリに
+    同時に該当してもよい。例：複数の課題を同時に解決している特許）。
+    どちらの軸にもマッチするカテゴリがない場合は「(未分類)」に入れる。
+
+    戻り値: {(axis1のカテゴリ名, axis2のカテゴリ名): [id, id, ...], ...}
+    """
+    from collections import defaultdict
+
+    matrix = defaultdict(list)
+    for entry in database:
+        keywords = extract_keywords_from_relations(entry["relations"], kind=kind)
+        matched1 = [name for name, f in axis1_formulas.items() if evaluate_formula(keywords, f)]
+        matched2 = [name for name, f in axis2_formulas.items() if evaluate_formula(keywords, f)]
+        if not matched1:
+            matched1 = ["(未分類)"]
+        if not matched2:
+            matched2 = ["(未分類)"]
+        for a1 in matched1:
+            for a2 in matched2:
+                matrix[(a1, a2)].append(entry["id"])
+    return matrix
+
+
+def plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ"):
+    """
+    classify_patents() の結果をヒートマップとして描画する。
+    値が0のマス（青枠で強調）が、ホワイトスペースの候補になる。
+    """
+    import numpy as np
+
+    arr = np.zeros((len(axis1_names), len(axis2_names)), dtype=int)
+    for i, a1 in enumerate(axis1_names):
+        for j, a2 in enumerate(axis2_names):
+            arr[i, j] = len(matrix.get((a1, a2), []))
+
+    fig, ax = plt.subplots(figsize=(max(6, len(axis2_names) * 1.3), max(4, len(axis1_names) * 0.9)))
+    im = ax.imshow(arr, cmap="YlOrRd", aspect="auto", vmin=0)
+    ax.set_xticks(range(len(axis2_names)))
+    ax.set_xticklabels(axis2_names, rotation=30, ha="right", fontproperties=FONT_PROP, fontsize=10)
+    ax.set_yticks(range(len(axis1_names)))
+    ax.set_yticklabels(axis1_names, fontproperties=FONT_PROP, fontsize=10)
+
+    vmax = arr.max() if arr.max() > 0 else 1
+    for i in range(len(axis1_names)):
+        for j in range(len(axis2_names)):
+            val = int(arr[i, j])
+            ax.text(j, i, str(val), ha="center", va="center",
+                    color="black" if val < vmax / 2 else "white", fontsize=10)
+            if val == 0:
+                ax.add_patch(mpatches.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
+                                                 edgecolor="#3b7dd8", linewidth=1.8))
+
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("件数", fontproperties=FONT_PROP)
+    plt.tight_layout()
+    return fig
+
+
+def print_white_space_cells(matrix, axis1_names, axis2_names):
+    """0件のマス（ホワイトスペース候補）だけを一覧表示する"""
+    print("=== ホワイトスペース候補（0件のマス） ===")
+    for a1 in axis1_names:
+        for a2 in axis2_names:
+            if len(matrix.get((a1, a2), [])) == 0:
+                print(f"  「{a1}」×「{a2}」")
