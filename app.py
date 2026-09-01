@@ -28,6 +28,8 @@ if "group_a_ids" not in st.session_state:
     st.session_state.group_a_ids = ""
 if "group_b_ids" not in st.session_state:
     st.session_state.group_b_ids = ""
+if "abstract_db" not in st.session_state:
+    st.session_state.abstract_db = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -567,14 +569,74 @@ with tab4:
 # ============================================================
 with tab5:
     st.caption(
-        "このタブは、タブ「🔦 まとめて検索」で構築したデータベースを再利用します。"
-        "先にそちらでデータベースを作ってから使ってください。"
+        "このタブでは、タブ「🔦 まとめて検索」で構築した請求項データベース、"
+        "またはここで新しく作る「要約」データベースのどちらかを使えます。"
+        "要約はJ-PlatPat等で一括ダウンロードしやすいため、大量の分析に向いています。"
     )
 
-    if st.session_state.patent_db is None:
-        st.info("先に「🔦 まとめて検索」タブでデータベースを構築してください。")
+    db_source = st.radio(
+        "使うデータベース",
+        ["請求項データベース（🔦タブで構築済みのもの）", "要約データベース（ここで新しく作る）"],
+        key="db_source_choice",
+    )
+
+    if db_source.startswith("要約"):
+        st.markdown("#### 📄 要約をまとめて登録する")
+        st.caption(
+            "CSVファイル（列名: id, text）をアップロードするか、"
+            "下のテキストエリアに「-----」で区切って複数の要約を貼り付けてください。"
+            "【課題】【解決手段】等の見出しが入っていると、CORE分類の精度が上がります。"
+        )
+        uploaded_abs_csv = st.file_uploader("CSVファイル（id, text の2列）", type=["csv"], key="abs_csv")
+        abs_bulk_text = st.text_area(
+            "またはここに、要約を「-----」で区切って貼り付ける",
+            height=180,
+            placeholder="【課題】〜。【解決手段】〜。\n-----\n【課題】〜。【解決手段】〜。",
+            key="abs_bulk_text",
+        )
+        if st.button("📚 要約データベースを構築する", key="build_abs_db_run"):
+            abs_records = []
+            if uploaded_abs_csv is not None:
+                import csv
+                import io
+
+                content = uploaded_abs_csv.getvalue().decode("utf-8-sig")
+                reader = csv.DictReader(io.StringIO(content))
+                for row in reader:
+                    rid = row.get("id") or row.get("番号") or f"行{len(abs_records)+1}"
+                    text = row.get("text") or row.get("本文") or ""
+                    if text.strip():
+                        abs_records.append((rid, text.strip()))
+            elif abs_bulk_text.strip():
+                parts = [p.strip() for p in abs_bulk_text.split("-----") if p.strip()]
+                abs_records = [(f"要約{i+1}", p) for i, p in enumerate(parts)]
+
+            if not abs_records:
+                st.warning("CSVのアップロード、またはテキストの貼り付けのどちらかを行ってください。")
+            else:
+                with st.spinner(f"{len(abs_records)} 件を解析中...（初回は埋め込みモデルの読み込みに1分程度かかります）"):
+                    try:
+                        st.session_state.abstract_db = pp.build_abstract_database(abs_records, show_progress=False)
+                    except Exception as e:
+                        st.error(f"データベース構築中にエラーが発生しました: {e}")
+                        st.session_state.abstract_db = None
+
+        if st.session_state.abstract_db is not None:
+            st.success(f"✅ {len(st.session_state.abstract_db)} 件を登録済みです。")
+            with st.expander("認識されたセクションを確認する"):
+                st.dataframe(
+                    [{"id": e["id"], "見出し": "、".join(e["sections"].keys())} for e in st.session_state.abstract_db],
+                    use_container_width=True, hide_index=True,
+                )
+        db = st.session_state.abstract_db
     else:
         db = st.session_state.patent_db
+        if db is None:
+            st.info("先に「🔦 まとめて検索」タブでデータベースを構築してください。")
+
+    if db is None:
+        pass
+    else:
         all_ids = [e["id"] for e in db]
         st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
@@ -593,7 +655,10 @@ with tab5:
         group_a_ids = _parse_ids(group_a_text, all_ids[: len(all_ids) // 2] or all_ids)
         group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
-        sub_tab_explorer, sub_tab_saturn, sub_tab_core = st.tabs(["🔍 Explorer（キーワード探査）", "🪐 Saturn V（意味的俯瞰マップ）", "🧬 CORE（論理式分類）"])
+        sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
+            "🔍 Explorer（キーワード探査）", "🪐 Saturn V（意味的俯瞰マップ）",
+            "🧬 CORE（論理式分類）", "📊 構成部位・分布・比較",
+        ])
 
         # --- Explorer ---
         with sub_tab_explorer:
@@ -691,3 +756,44 @@ with tab5:
                 fig = pp.plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ")
                 st.pyplot(fig)
                 st.caption("枠で囲まれた0件のマスが、まだ組み合わせのない技術（ホワイトスペース）の候補です。")
+
+        # --- 構成部位ランキング・件数分布・レーダーチャート ---
+        with sub_tab_rank:
+            st.markdown("#### 📊 構成部位ランキング（全体）")
+            rank_kind = st.radio("ランキングの対象", ["構成要素", "動詞"], horizontal=True, key="rank_kind")
+            if st.button("📊 ランキングを作る", key="rank_run"):
+                ranking = pp.rank_components(db, kind="component" if rank_kind == "構成要素" else "verb", top_n=20)
+                st.session_state.rank_result = ranking
+            if st.session_state.get("rank_result") is not None:
+                fig = pp.plot_component_ranking(st.session_state.rank_result, title=f"{rank_kind}ランキング")
+                st.pyplot(fig)
+
+            st.divider()
+
+            st.markdown("#### 📈 クレームの広さ・狭さの分布")
+            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。")
+            if st.button("📈 分布を作る", key="dist_run"):
+                scores = pp.compute_scope_distribution(db)
+                if not scores:
+                    st.warning("請求項データベースを使ってください。")
+                else:
+                    st.session_state.dist_result = scores
+            if st.session_state.get("dist_result") is not None:
+                fig = pp.plot_scope_distribution(st.session_state.dist_result)
+                st.pyplot(fig)
+
+            st.divider()
+
+            st.markdown("#### 🕸️ グループ特徴のレーダーチャート比較")
+            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。")
+            if st.button("🕸️ レーダーチャートを作る", key="radar_run"):
+                profile_a = pp.compute_group_profile(db, group_a_ids)
+                profile_b = pp.compute_group_profile(db, group_b_ids)
+                if not profile_a or not profile_b:
+                    st.warning("請求項データベースを使ってください。")
+                else:
+                    st.session_state.radar_result = (profile_a, profile_b)
+            if st.session_state.get("radar_result") is not None:
+                profile_a, profile_b = st.session_state.radar_result
+                fig = pp.plot_radar_chart({"グループA": profile_a, "グループB": profile_b})
+                st.pyplot(fig)

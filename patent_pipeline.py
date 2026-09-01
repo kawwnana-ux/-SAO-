@@ -3528,9 +3528,9 @@ def extract_keywords_from_relations(relations, kind="both"):
 
 def build_keyword_frequency(database, ids=None, kind="both"):
     """
-    database（build_patent_database()の戻り値）から、
-    指定したid群（省略時は全件）のキーワード出現頻度を集計する。
-    「出現した請求項の件数」で数える（1件の中で同じ語が何度出ても1件とする）。
+    database（build_patent_database() または build_abstract_database() の
+    戻り値）から、指定したid群（省略時は全件）のキーワード出現頻度を
+    集計する。「出現した件数」で数える（1件の中で同じ語が何度出ても1件とする）。
     """
     from collections import Counter
 
@@ -3539,7 +3539,7 @@ def build_keyword_frequency(database, ids=None, kind="both"):
     for entry in database:
         if target_ids is not None and entry["id"] not in target_ids:
             continue
-        keywords = extract_keywords_from_relations(entry["relations"], kind=kind)
+        keywords = _entry_keywords(entry, kind=kind)
         counter.update(keywords)
     return counter
 
@@ -3740,9 +3740,46 @@ def classify_patents(database, axis1_formulas, axis2_formulas, kind="both"):
 
     matrix = defaultdict(list)
     for entry in database:
-        keywords = extract_keywords_from_relations(entry["relations"], kind=kind)
+        keywords = _entry_keywords(entry, kind=kind)
         matched1 = [name for name, f in axis1_formulas.items() if evaluate_formula(keywords, f)]
         matched2 = [name for name, f in axis2_formulas.items() if evaluate_formula(keywords, f)]
+        if not matched1:
+            matched1 = ["(未分類)"]
+        if not matched2:
+            matched2 = ["(未分類)"]
+        for a1 in matched1:
+            for a2 in matched2:
+                matrix[(a1, a2)].append(entry["id"])
+    return matrix
+
+
+def classify_patents_by_sections(database, axis1_formulas, axis2_formulas,
+                                  axis1_section="課題", axis2_section="解決手段"):
+    """
+    build_abstract_database() で作った、【課題】【解決手段】等の
+    セクションに分かれた要約データベース専用の分類関数。
+
+    classify_patents() は「1件の特許が持つ全キーワード」を両方の軸に
+    使うが、この関数は縦軸を「課題」セクションのキーワードだけ、
+    横軸を「解決手段」セクションのキーワードだけで判定するので、
+    より精密に「どんな課題を、どんな手段で解決しているか」の
+    マトリクスを作れる。
+
+    axis1_section / axis2_section: 各entryの"sections"辞書から
+    参照する見出し名（省略時は"課題"/"解決手段"）。
+    """
+    from collections import defaultdict
+
+    matrix = defaultdict(list)
+    for entry in database:
+        sections = entry.get("sections", {})
+        text1 = sections.get(axis1_section, "")
+        text2 = sections.get(axis2_section, "")
+        keywords1 = extract_abstract_keywords(text1) if text1 else set()
+        keywords2 = extract_abstract_keywords(text2) if text2 else set()
+
+        matched1 = [name for name, f in axis1_formulas.items() if evaluate_formula(keywords1, f)]
+        matched2 = [name for name, f in axis2_formulas.items() if evaluate_formula(keywords2, f)]
         if not matched1:
             matched1 = ["(未分類)"]
         if not matched2:
@@ -3796,3 +3833,255 @@ def print_white_space_cells(matrix, axis1_names, axis2_names):
         for a2 in axis2_names:
             if len(matrix.get((a1, a2), [])) == 0:
                 print(f"  「{a1}」×「{a2}」")
+
+
+# ============================================================
+# ㉔ 要約データの活用：J-PlatPatで一括取得できる「要約」を、
+#    ポートフォリオ分析（Explorer / Saturn V / CORE）に使えるようにする
+# ============================================================
+# 要約は請求項と違って「〜を有する」という定型構文を持たない、
+# より自然な文章であり、かつ多くの場合【課題】【解決手段】という
+# 見出しが付いている。この見出しを頼りに、そのままCORE
+# （縦軸＝課題、横軸＝解決手段）に使える形に整理する。
+
+def parse_abstract(text):
+    """
+    「【課題】〜。【解決手段】〜。」のような、要約に含まれる
+    見出しタグを頼りに、セクションごとの本文に分割する。
+
+    戻り値: {見出し名: 本文, ...}（見出しが1つも見つからなければ
+             {"全文": text} を返す）
+    """
+    pattern = _re_dep.compile(r"【([^】]+)】")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return {"全文": text.strip()}
+
+    sections = {}
+    for i, m in enumerate(matches):
+        name = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            sections[name] = body
+    return sections
+
+
+def extract_abstract_keywords(text):
+    """
+    請求項のような「を有する」構造を前提としない、一般的な日本語文
+    （要約等）から、名詞句をキーワードとして抽出する。
+    """
+    doc = nlp(_clean_claim_text(text))
+    components = extract_patent_components_general(doc)
+    return {c["text"] for c in components}
+
+
+def build_abstract_database(records, show_progress=True):
+    """
+    records: [(id, 要約テキスト), ...]
+
+    請求項用の build_patent_database() とは違い、「有する」の
+    階層構造は作らない（要約は請求項特有の構文を持たないため）。
+    代わりに、名詞句のキーワード抽出と、文章全体の埋め込み
+    ベクトル計算だけを行う。
+
+    Explorer・Saturn V・CORE は、いずれもこのデータベースを
+    build_patent_database() の代わりにそのまま使える。
+    """
+    model = _get_embed_model()
+    database = []
+    total = len(records)
+    for i, (rid, text) in enumerate(records):
+        if show_progress:
+            print(f"[{i+1}/{total}] {rid} を解析中...")
+        try:
+            sections = parse_abstract(text)
+            keywords = set()
+            for sec_text in sections.values():
+                keywords |= extract_abstract_keywords(sec_text)
+            embedding = model.encode([text], normalize_embeddings=True)[0]
+        except Exception as e:
+            if show_progress:
+                print(f"  → 解析エラー、スキップします: {e}")
+            continue
+
+        database.append({
+            "id": rid,
+            "text": text,
+            "sections": sections,
+            "keywords": keywords,
+            "doc_embedding": embedding,
+        })
+    return database
+
+
+def _entry_keywords(entry, kind="both"):
+    """
+    Explorer・COREの内部で使う共通ヘルパー。
+    build_patent_database()（請求項、relationsを持つ）と
+    build_abstract_database()（要約、keywordsを持つ）の
+    どちらの形式のデータベースが来ても、同じようにキーワード
+    集合を取り出せるようにする。
+    """
+    if "relations" in entry:
+        return extract_keywords_from_relations(entry["relations"], kind=kind)
+    return set(entry.get("keywords", set()))
+
+
+# ============================================================
+# ㉕ 構成部位ランキング・件数分布・レーダーチャート
+# ============================================================
+
+def rank_components(database, ids=None, kind="component", top_n=20):
+    """
+    ポートフォリオ全体（またはグループ）で、よく出てくる構成要素・動詞を
+    頻度順にランキングする（「構成部位」分析に相当）。
+    """
+    freq = build_keyword_frequency(database, ids=ids, kind=kind)
+    return freq.most_common(top_n)
+
+
+def plot_component_ranking(ranking, title="構成部位ランキング", theme="deepsea"):
+    """rank_components() の結果を横棒グラフにする"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    labels = [w for w, _ in ranking][::-1]
+    values = [c for _, c in ranking][::-1]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.35)))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.barh(labels, values, color=bar)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
+    ax.set_xlabel("出現件数", fontproperties=FONT_PROP, color=fg)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
+
+
+def compute_scope_distribution(database, ids=None):
+    """
+    build_patent_database()（請求項データベース、relationsを持つ）から、
+    各特許の「広さ・狭さスコア」を計算し、分布（件数分布）を作る。
+    要約データベースには使えない（請求項の構造が必要なため）。
+    """
+    target_ids = set(ids) if ids is not None else None
+    scores = []
+    for entry in database:
+        if target_ids is not None and entry["id"] not in target_ids:
+            continue
+        if "relations" not in entry:
+            continue
+        narrowness, breadth, detail = compute_claim_scope_score(entry["relations"])
+        scores.append({"id": entry["id"], "narrowness": narrowness, "breadth": breadth})
+    return scores
+
+
+def plot_scope_distribution(scores, title="クレームの広さ・狭さの分布", theme="deepsea", bins=10):
+    """compute_scope_distribution() の結果をヒストグラムにする"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    values = [s["narrowness"] for s in scores]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.hist(values, bins=bins, color=bar, edgecolor=fg, alpha=0.85)
+    ax.set_xlabel("狭さスコア（0=広い　1=狭い）", fontproperties=FONT_PROP, color=fg)
+    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=fg)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
+
+
+def compute_group_profile(database, ids):
+    """
+    グループ（自社／競合等）の「特徴プロファイル」を計算する。
+    レーダーチャート用に、複数の指標を0〜1に正規化してまとめる。
+    請求項データベース（relationsを持つ）が必要。
+    """
+    scope_list = compute_scope_distribution(database, ids)
+    target_ids = set(ids)
+    entries = [e for e in database if e["id"] in target_ids and "relations" in e]
+
+    if not entries:
+        return {}
+
+    avg_narrowness = sum(s["narrowness"] for s in scope_list) / len(scope_list) if scope_list else 0.0
+    avg_components = sum(
+        len({r["source"] for r in e["relations"]} | {r["target"] for r in e["relations"]})
+        for e in entries
+    ) / len(entries)
+    avg_relations = sum(len(e["relations"]) for e in entries) / len(entries)
+    avg_attribute = sum(
+        sum(1 for r in e["relations"] if r["type"] == "attribute") for e in entries
+    ) / len(entries)
+    unique_components = len(build_keyword_frequency(database, ids, kind="component"))
+
+    return {
+        "平均の狭さスコア": avg_narrowness,
+        "平均構成要素数": avg_components,
+        "平均関係数": avg_relations,
+        "平均数値スペック数": avg_attribute,
+        "構成要素の種類数": unique_components,
+    }
+
+
+def plot_radar_chart(profiles, title="グループ特徴比較", theme="deepsea"):
+    """
+    compute_group_profile() の結果を、複数グループ分まとめて
+    レーダーチャートにする。
+    profiles: {グループ名: compute_group_profile()の戻り値, ...}
+    """
+    import numpy as np
+
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    labels = list(next(iter(profiles.values())).keys())
+    n = len(labels)
+
+    # 指標ごとに、グループ間の最大値で正規化する（0〜1にそろえる）
+    max_per_label = {l: max(p[l] for p in profiles.values()) or 1 for l in labels}
+
+    angles = [i / n * 2 * np.pi for i in range(n)]
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    for i, (name, profile) in enumerate(profiles.items()):
+        values = [profile[l] / max_per_label[l] for l in labels]
+        values += values[:1]
+        color = palette[i % len(palette)]
+        ax.plot(angles, values, color=color, linewidth=2, label=name)
+        ax.fill(angles, values, color=color, alpha=0.2)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=10)
+    ax.set_yticklabels([])
+    ax.spines["polar"].set_color(grid)
+    ax.grid(color=grid)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg, pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), prop=FONT_PROP, facecolor=bg, labelcolor=fg)
+    plt.tight_layout()
+    return fig
