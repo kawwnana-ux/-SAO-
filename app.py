@@ -576,11 +576,39 @@ with tab5:
 
     db_source = st.radio(
         "使うデータベース",
-        ["請求項データベース（🔦タブで構築済みのもの）", "要約データベース（ここで新しく作る）"],
+        [
+            "請求項データベース（🔦タブで構築済みのもの）",
+            "要約データベース（ここで新しく作る）",
+            "フルメタデータCSV（出願日・出願人・FI等、ATLAS用）",
+        ],
         key="db_source_choice",
     )
 
-    if db_source.startswith("要約"):
+    if db_source.startswith("フルメタデータ"):
+        st.markdown("#### 🛰️ フルメタデータCSVを登録する")
+        st.caption(
+            "列名: 文献番号, 出願番号, 出願日, 公知日, 発明の名称, 出願人/権利者, "
+            "FI, 要約, 公開番号, 公告番号, 登録番号, 審判番号, その他, ステージ, "
+            "イベント詳細, 文献URL　を含むCSVをアップロードしてください。"
+        )
+        uploaded_meta_csv = st.file_uploader("CSVファイル", type=["csv"], key="meta_csv")
+        if st.button("🛰️ データベースを構築する", key="build_full_db_run"):
+            if uploaded_meta_csv is None:
+                st.warning("CSVファイルをアップロードしてください。")
+            else:
+                with st.spinner("解析中...（初回は埋め込みモデルの読み込みに1分程度かかります）"):
+                    try:
+                        content = uploaded_meta_csv.getvalue().decode("utf-8-sig")
+                        meta_records = pp.load_patent_metadata_csv(content)
+                        st.session_state.abstract_db = pp.build_full_database(meta_records, show_progress=False)
+                    except Exception as e:
+                        st.error(f"データベース構築中にエラーが発生しました: {e}")
+                        st.session_state.abstract_db = None
+        if st.session_state.abstract_db is not None:
+            st.success(f"✅ {len(st.session_state.abstract_db)} 件を登録済みです。")
+        db = st.session_state.abstract_db
+
+    elif db_source.startswith("要約"):
         st.markdown("#### 📄 要約をまとめて登録する")
         st.caption(
             "CSVファイル（列名: id, text）をアップロードするか、"
@@ -655,10 +683,44 @@ with tab5:
         group_a_ids = _parse_ids(group_a_text, all_ids[: len(all_ids) // 2] or all_ids)
         group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
-        sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
+        sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
+            "🛰️ ATLAS（基礎特許マップ）",
             "🔍 Explorer（キーワード探査）", "🪐 Saturn V（意味的俯瞰マップ）",
             "🧬 CORE（論理式分類）", "📊 構成部位・分布・比較",
         ])
+
+        with sub_tab_atlas:
+            has_metadata = any(e.get("出願日") for e in db)
+            if not has_metadata:
+                st.info("このデータベースには出願日等のメタデータがありません。「フルメタデータCSV」を選んで構築してください。")
+            else:
+                freq_choice = st.radio("時系列の単位", ["年", "月"], horizontal=True, key="atlas_freq")
+                if st.button("🛰️ 出願件数推移を見る", key="atlas_trend_run"):
+                    fig = pp.plot_filing_trend(db, freq="Y" if freq_choice == "年" else "M")
+                    st.pyplot(fig)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🏢 出願人ランキング", key="atlas_applicant_run"):
+                        ranking = pp.rank_by_field(db, "出願人")
+                        st.session_state.atlas_applicant_ranking = ranking
+                    if st.session_state.get("atlas_applicant_ranking"):
+                        fig = pp.plot_ranking_bar(st.session_state.atlas_applicant_ranking, title="出願人ランキング")
+                        st.pyplot(fig)
+                with col2:
+                    if st.button("🔬 FIランキング", key="atlas_fi_run"):
+                        ranking = pp.rank_by_field(db, "FI")
+                        st.session_state.atlas_fi_ranking = ranking
+                    if st.session_state.get("atlas_fi_ranking"):
+                        fig = pp.plot_ranking_bar(st.session_state.atlas_fi_ranking, title="FIランキング")
+                        st.pyplot(fig)
+
+                if st.button("🫧 出願人×FI バブルチャート", key="atlas_bubble_run"):
+                    try:
+                        fig = pp.plot_applicant_fi_bubble(db)
+                        st.pyplot(fig)
+                    except Exception as e:
+                        st.error(f"バブルチャート作成中にエラーが発生しました: {e}")
 
         # --- Explorer ---
         with sub_tab_explorer:

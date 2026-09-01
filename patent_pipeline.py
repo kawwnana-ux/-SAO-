@@ -4085,3 +4085,249 @@ def plot_radar_chart(profiles, title="グループ特徴比較", theme="deepsea"
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), prop=FONT_PROP, facecolor=bg, labelcolor=fg)
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㉖ Mission Control：メタデータ付きCSVの読み込み
+# ============================================================
+# 文献番号・出願番号・出願日・公知日・発明の名称・出願人/権利者・FI・
+# 要約・公開番号・公告番号・登録番号・審判番号・その他・ステージ・
+# イベント詳細・文献URL、という列を持つCSVを読み込み、
+# 全モジュール（ATLAS・MEGA・Saturn V・Explorer・CORE）で
+# 共通して使える形に正規化する。
+
+PATENT_METADATA_COLUMNS = [
+    "文献番号", "出願番号", "出願日", "公知日", "発明の名称", "出願人/権利者",
+    "FI", "要約", "公開番号", "公告番号", "登録番号", "審判番号",
+    "その他", "ステージ", "イベント詳細", "文献URL",
+]
+
+
+def load_patent_metadata_csv(csv_text):
+    """
+    上記の列を持つCSVのテキストを読み込み、
+    [{"id":.., "出願日":datetime, "出願人":[...], "FI":[...], "要約":.., ...}, ...]
+    のリストにして返す（Mission Controlの役割）。
+
+    ・出願人/権利者は「／」「、」「,」等で複数人書かれていることがあるので、
+      リストに分割しておく。
+    ・FIも同様に複数書かれていることがあるので、空白や「;」等で分割する。
+    ・出願日／公知日は日付型に変換する（変換できない場合はNoneのまま）。
+    """
+    import csv
+    import io
+    from datetime import datetime
+
+    def _split_applicants(value, seps=("／", "、", ",", ";", "；")):
+        if not value:
+            return []
+        text = value
+        for s in seps[1:]:
+            text = text.replace(s, seps[0])
+        return [v.strip() for v in text.split(seps[0]) if v.strip()]
+
+    def _split_fi(value, seps=("；", ";", "、", ",")):
+        # FIコード自体に「/」（メイングループ/サブグループの区切り）が
+        # 含まれるため、出願人の分割とは違い「/」では分割しない。
+        if not value:
+            return []
+        text = value
+        for s in seps[1:]:
+            text = text.replace(s, seps[0])
+        return [v.strip() for v in text.split(seps[0]) if v.strip()]
+
+    def _parse_date(value):
+        if not value:
+            return None
+        value = value.strip().replace("/", "-").replace(".", "-")
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    records = []
+    for i, row in enumerate(reader):
+        rid = row.get("文献番号") or row.get("出願番号") or row.get("公開番号") or f"行{i+1}"
+        records.append({
+            "id": rid,
+            "出願番号": row.get("出願番号", ""),
+            "出願日": _parse_date(row.get("出願日", "")),
+            "公知日": _parse_date(row.get("公知日", "")),
+            "発明の名称": row.get("発明の名称", ""),
+            "出願人": _split_applicants(row.get("出願人/権利者", "")),
+            "FI": _split_fi(row.get("FI", "")),
+            "要約": row.get("要約", ""),
+            "公開番号": row.get("公開番号", ""),
+            "ステージ": row.get("ステージ", ""),
+            "文献URL": row.get("文献URL", ""),
+        })
+    return records
+
+
+def build_full_database(metadata_records, show_progress=True):
+    """
+    load_patent_metadata_csv() の結果から、要約のSAO解析
+    （build_abstract_database相当）とメタデータを1つにまとめた
+    データベースを作る。ATLAS・MEGA・Saturn V・Explorer・COREの
+    すべてに共通して使える、一番リッチな形式。
+    """
+    abstract_records = [(r["id"], r["要約"]) for r in metadata_records if r.get("要約")]
+    abs_db = build_abstract_database(abstract_records, show_progress=show_progress)
+    abs_db_by_id = {e["id"]: e for e in abs_db}
+
+    database = []
+    for r in metadata_records:
+        entry = dict(r)
+        abs_entry = abs_db_by_id.get(r["id"])
+        if abs_entry is not None:
+            entry["sections"] = abs_entry["sections"]
+            entry["keywords"] = abs_entry["keywords"]
+            entry["doc_embedding"] = abs_entry["doc_embedding"]
+            entry["text"] = abs_entry["text"]
+        database.append(entry)
+    return database
+
+
+# ============================================================
+# ㉗ ATLAS：基礎特許マップ
+# ============================================================
+# 出願件数の時系列推移、出願人ランキング、FI（IPC）ランキングなど、
+# 特許分析において最も基本的な統計グラフを描画する。
+
+def _atlas_style(theme="deepsea"):
+    if theme == "deepsea":
+        return {"bg": "#04121C", "fg": "#E8FBFF", "bar": "#5FD4E0", "grid": "#1a3a4a"}
+    return {"bg": "#FFFFFF", "fg": "#233044", "bar": "#4C87C6", "grid": "#dddddd"}
+
+
+def plot_filing_trend(database, date_field="出願日", freq="Y", title="出願件数の推移", theme="deepsea"):
+    """
+    出願日（または公知日）を使って、件数の時系列推移を折れ線グラフにする。
+    freq: "Y"（年単位）または "M"（月単位）
+    """
+    from collections import Counter
+
+    counter = Counter()
+    for entry in database:
+        d = entry.get(date_field)
+        if d is None:
+            continue
+        key = d.year if freq == "Y" else (d.year, d.month)
+        counter[key] += 1
+
+    keys_sorted = sorted(counter.keys())
+    if freq == "Y":
+        labels = [str(k) for k in keys_sorted]
+    else:
+        labels = [f"{k[0]}-{k[1]:02d}" for k in keys_sorted]
+    values = [counter[k] for k in keys_sorted]
+
+    s = _atlas_style(theme)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor(s["bg"])
+    ax.set_facecolor(s["bg"])
+    ax.plot(labels, values, marker="o", color=s["bar"], linewidth=2)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
+    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=s["fg"])
+    ax.tick_params(colors=s["fg"], rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_fontproperties(FONT_PROP)
+    for spine in ax.spines.values():
+        spine.set_color(s["grid"])
+    ax.grid(True, color=s["grid"], alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def rank_by_field(database, field="出願人", top_n=15):
+    """
+    出願人やFIのような「リストを持つフィールド」で、
+    出現件数のランキングを作る。
+    """
+    from collections import Counter
+
+    counter = Counter()
+    for entry in database:
+        values = entry.get(field) or []
+        counter.update(set(values))
+    return counter.most_common(top_n)
+
+
+def plot_ranking_bar(ranking, title="ランキング", xlabel="件数", theme="deepsea"):
+    """rank_by_field() の結果を横棒グラフにする"""
+    s = _atlas_style(theme)
+    labels = [w for w, _ in ranking][::-1]
+    values = [c for _, c in ranking][::-1]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
+    fig.patch.set_facecolor(s["bg"])
+    ax.set_facecolor(s["bg"])
+    ax.barh(labels, values, color=s["bar"])
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
+    ax.set_xlabel(xlabel, fontproperties=FONT_PROP, color=s["fg"])
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
+    ax.tick_params(colors=s["fg"])
+    for spine in ax.spines.values():
+        spine.set_color(s["fg"])
+    plt.tight_layout()
+    return fig
+
+
+def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, title="出願人×FI バブルチャート", theme="deepsea"):
+    """
+    出願人 × FI の組み合わせごとの件数を、対数スケールのバブルの
+    大きさで表す散布図（バブルチャート）にする。
+    """
+    from collections import Counter
+
+    applicant_counter = Counter()
+    fi_counter = Counter()
+    for entry in database:
+        applicant_counter.update(set(entry.get("出願人") or []))
+        fi_counter.update(set(entry.get("FI") or []))
+
+    top_applicant_names = [a for a, _ in applicant_counter.most_common(top_applicants)]
+    top_fi_names = [f for f, _ in fi_counter.most_common(top_fi)]
+
+    pair_counter = Counter()
+    for entry in database:
+        for a in set(entry.get("出願人") or []):
+            if a not in top_applicant_names:
+                continue
+            for f in set(entry.get("FI") or []):
+                if f not in top_fi_names:
+                    continue
+                pair_counter[(a, f)] += 1
+
+    if not pair_counter:
+        raise ValueError("出願人・FIの組み合わせデータが見つかりません。")
+
+    import numpy as np
+
+    s = _atlas_style(theme)
+    fig, ax = plt.subplots(figsize=(max(8, len(top_fi_names) * 0.9), max(5, len(top_applicant_names) * 0.6)))
+    fig.patch.set_facecolor(s["bg"])
+    ax.set_facecolor(s["bg"])
+
+    for (a, f), count in pair_counter.items():
+        x = top_fi_names.index(f)
+        y = top_applicant_names.index(a)
+        size = 80 * np.log1p(count) ** 2 + 40
+        ax.scatter(x, y, s=size, color=s["bar"], alpha=0.7, edgecolors=s["fg"], linewidths=0.5)
+        ax.text(x, y, str(count), ha="center", va="center", fontsize=8, color=s["bg"])
+
+    ax.set_xticks(range(len(top_fi_names)))
+    ax.set_xticklabels(top_fi_names, rotation=45, ha="right", fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
+    ax.set_yticks(range(len(top_applicant_names)))
+    ax.set_yticklabels(top_applicant_names, fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
+    ax.tick_params(colors=s["fg"])
+    for spine in ax.spines.values():
+        spine.set_color(s["grid"])
+    ax.grid(True, color=s["grid"], alpha=0.2)
+    plt.tight_layout()
+    return fig
