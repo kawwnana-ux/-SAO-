@@ -3468,10 +3468,22 @@ def _parse_claim_ref(text):
     if any(c in span for c in ("から", "-", "ー", "～", "乃至")) and len(nums) >= 2:
         nums = list(range(nums[0], nums[-1] + 1))
     is_preamble_style = m.group(0).endswith("おいて")
+    match_end = m.end()
+    if not is_preamble_style:
+        # 「請求項１に記載の◯◯であって、〜」のように、参照表現の直後に
+        # 発明の名称を挟んでから「であって」「において」が続く場合も、
+        # 新しい限定文言がその後ろに続く「前置き型」とみなす
+        # （「において」が参照表現に直接くっついていない、この変則パターン）。
+        next_period = text.find("。", match_end)
+        search_end = next_period if next_period != -1 else len(text)
+        connector_m = _re_dep.search(r"(?:であって|において)", text[match_end:search_end])
+        if connector_m is not None:
+            is_preamble_style = True
+            match_end = match_end + connector_m.end()
     return {
         "numbers": sorted(set(nums)),
         "match_start": m.start(),
-        "match_end": m.end(),
+        "match_end": match_end,
         "is_preamble_style": is_preamble_style,
     }
 
