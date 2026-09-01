@@ -96,7 +96,7 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記"}
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定"}
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -1410,6 +1410,33 @@ def extract_direct_relations(doc, components):
                 )
                 if topic_comp is not None:
                     passive_target = topic_comp
+            else:
+                # head_componentが「文書の最後の語＝請求項タイトル」の場合、
+                # それは動詞から見て本当に近い係り先ではなく、連体修飾の
+                # 連鎖を辿った結果たまたま行き着いただけの可能性が高い。
+                # 「Ｘは、Ｙに隣接して配置され」のように、本当のtarget（Ｙ）が
+                # 「隣接して」という連用修飾語（advcl）自身のobl子として、
+                # 動詞から見て1段階深いところに埋め込まれていることがあるので、
+                # そちらを優先する。
+                last_real_token_i = len(doc) - 1
+                while last_real_token_i > 0 and doc[last_real_token_i].pos_ == "PUNCT":
+                    last_real_token_i -= 1
+                head_is_claim_title = head_component["end"] == last_real_token_i
+                if head_is_claim_title:
+                    for child in verb.children:
+                        if child.dep_ != "advcl":
+                            continue
+                        for gc in child.children:
+                            if gc.dep_ == "obl":
+                                gc_comp = (
+                                    find_component_by_token(components, gc.i)
+                                    or find_referenced_component(components, gc)
+                                )
+                                if gc_comp is not None:
+                                    passive_target = gc_comp
+                                    break
+                        if passive_target is not head_component:
+                            break
 
             source_candidates = []
             for child in verb.children:
@@ -1948,10 +1975,17 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     simplified = [r for r in relations if r not in to_remove]
 
     # ② 位置関係・直接関係の起点になっているのに、誰からも指されていない
-    #    ノードは、根の直接の子として補って繋ぐ
+    #    ノードは、根の直接の子として補って繋ぐ。
+    #    ただし「Ｘに設けられる（設置される）Ｙ」のような、ジェプソン形式の
+    #    前提装置（Ｘ）は、根の部品ではなく外側の文脈にすぎないので、
+    #    「設け」系の関係の中でしか登場しない語は補完の対象外にする。
     incoming2 = {}
     for r in simplified:
         incoming2.setdefault(r["target"], []).append(r)
+
+    outgoing = {}
+    for r in simplified:
+        outgoing.setdefault(r["source"], []).append(r)
 
     extra = []
     added = set()
@@ -1961,9 +1995,13 @@ def _simplify_hierarchy(relations, doc=None, components=None):
         s = r["source"]
         if s == root or s in added:
             continue
-        if s not in incoming2:
-            extra.append({"source": root, "relation": "有する", "target": s, "type": "has"})
-            added.add(s)
+        if s in incoming2:
+            continue
+        own_relations = outgoing.get(s, [])
+        if own_relations and all("設け" in x["relation"] for x in own_relations):
+            continue
+        extra.append({"source": root, "relation": "有する", "target": s, "type": "has"})
+        added.add(s)
 
     return simplified + extra
 
