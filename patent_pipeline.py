@@ -1028,6 +1028,60 @@ def extract_comparison_relations(doc, components):
             "type": "direct",
         })
 
+    # 「ＡがＢを超える（上回る／下回る／満たす）」のような、
+    # 動詞による比較・条件表現。ADJの場合と同じく、この動詞自身に
+    # nsubjが付いていないことが多く（「〜を超えた場合に〜する」の
+    # ように連体修飾として使われるため）、離れた場所にある別の動詞に
+    # 主語が誤って直結してしまっていることがあるので、
+    # head連鎖を遡ってnsubjを探す。
+    COMPARISON_VERBS = {"超える", "上回る", "下回る", "満たす"}
+    for verb in doc:
+        if verb.pos_ != "VERB" or verb.lemma_ not in COMPARISON_VERBS:
+            continue
+
+        obj_token = None
+        for c in verb.children:
+            if c.dep_ == "obj":
+                obj_token = c
+                break
+        if obj_token is None:
+            continue
+        target_comp = find_component_by_token(components, obj_token.i) or find_referenced_component(components, obj_token)
+        if target_comp is None:
+            continue
+
+        subj_token = None
+        for c in verb.children:
+            if c.dep_ == "nsubj":
+                subj_token = c
+                break
+        if subj_token is None:
+            cursor = verb
+            visited = set()
+            while cursor.i not in visited:
+                visited.add(cursor.i)
+                for c in cursor.children:
+                    if c.dep_ == "nsubj" and c.i < verb.i:
+                        subj_token = c
+                        break
+                if subj_token is not None:
+                    break
+                if cursor.head.i == cursor.i:
+                    break
+                cursor = cursor.head
+        if subj_token is None:
+            continue
+        source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
+        if source_comp is None or source_comp["text"] == target_comp["text"]:
+            continue
+
+        relations.append({
+            "source": source_comp["text"],
+            "relation": verb.text,
+            "target": target_comp["text"],
+            "type": "direct",
+        })
+
     return relations
 
 
@@ -1305,6 +1359,11 @@ def extract_direct_relations(doc, components):
             # extract_has_location_relations / extract_positional_relations の
             # 方で別途処理しているのでここでは扱わない
             continue
+        if verb.lemma_ in ("超える", "上回る", "下回る", "満たす"):
+            # extract_comparison_relations の方で、head連鎖を遡って
+            # 正しい主語を探す専用の処理をしているので、ここでは扱わない
+            # （そのまま扱うと、誤ったheadを拾って重複した関係になる）
+            continue
         if _is_negated(verb):
             # 「〜が行われない」のように否定されている場合、肯定の関係として
             # 抽出してしまうと意味が逆になるため、この動詞からは抽出しない。
@@ -1327,9 +1386,36 @@ def extract_direct_relations(doc, components):
             continue
 
         if _is_passive(verb):
-            # 受身：headが受け手（target）。「に」で係る語などが動作主（source）。
+            # 受身：通常はhead（動詞の係り先）が受け手（target）だが、
+            # 「Ｘは、Ｙと〜接続され」のように、動詞のheadがGiNZAの
+            # 長文誤解析で見当違いの場所（請求項タイトル等）を指して
+            # しまっている場合（＝head_componentがフォールバックでしか
+            # 見つからなかった場合）、「は」で明示的にマークされたobl子
+            # （実質的な主語＝本当の受け手）の方が正しいtargetであることが
+            # 多いので、そちらを優先する。
+            passive_target = head_component
+            topic_obl = None
+            for child in verb.children:
+                if (
+                    child.dep_ == "obl"
+                    and child.text not in RELATION_WORDS
+                    and any(c.dep_ == "case" and c.text == "は" for c in child.children)
+                ):
+                    topic_obl = child
+                    break
+            if topic_obl is not None:
+                topic_comp = (
+                    find_component_by_token(components, topic_obl.i)
+                    or find_referenced_component(components, topic_obl)
+                )
+                if topic_comp is not None:
+                    passive_target = topic_comp
+
             source_candidates = []
             for child in verb.children:
+                if topic_obl is not None and child.i == topic_obl.i:
+                    # targetとして使った語は、sourceの候補には入れない
+                    continue
                 if child.dep_ in ("obl", "nsubj"):
                     source_candidates.append(child)
                 elif child.dep_ == "advcl":
@@ -1348,12 +1434,12 @@ def extract_direct_relations(doc, components):
                     find_previous_component_by_word(components, child)
                     or find_referenced_component(components, child)
                 )
-                if source is None or source["text"] == head_component["text"]:
+                if source is None or source["text"] == passive_target["text"]:
                     continue
                 relations.append({
                     "source": source["text"],
                     "relation": verb.text,
-                    "target": head_component["text"],
+                    "target": passive_target["text"],
                     "type": "direct",
                 })
         else:
