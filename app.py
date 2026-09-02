@@ -684,9 +684,9 @@ with tab5:
         group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
-            "🗺️ 海図",
-            "🐡 群れ探査", "🌊 深海海流マップ",
-            "🪸 珊瑚礁分類", "🐙 生態プロファイル",
+            "🗺️ 基本統計分析",
+            "🐡 技術比較", "🌊 サーモグラフィ",
+            "🪸 ヒートマップ", "🐙 レーダーチャート",
         ])
 
         with sub_tab_atlas:
