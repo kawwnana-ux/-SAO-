@@ -584,12 +584,14 @@ with tab4:
 
                 st.divider()
                 st.markdown("#### 🕸️ 出願人×FI レーダーチャート")
+                axis_selection_1 = st.radio("軸の選び方", ["複数社共通（おすすめ）", "全体件数順"], horizontal=True, key="atlas_radar_axis_selection")
                 top_applicants_n = st.slider("対象にする出願人数（出願件数が多い順）", min_value=2, max_value=10, value=3, key="atlas_radar_applicants")
-                top_fi_n = st.slider("軸にするFIの数（出現件数が多い順）", min_value=3, max_value=10, value=5, key="atlas_radar_fi")
+                top_fi_n = st.slider("軸にするFIの数（出現件数が多い順）", min_value=3, max_value=30, value=8, key="atlas_radar_fi")
                 if st.button("🕸️ レーダーチャートを作る", key="atlas_radar_run"):
                     try:
                         profiles = pp.build_applicant_fi_radar_data(
-                            db, fi_level=fi_level, top_applicants=top_applicants_n, top_fi=top_fi_n
+                            db, fi_level=fi_level, top_applicants=top_applicants_n, top_fi=top_fi_n,
+                            axis_selection="複数社共通" if axis_selection_1.startswith("複数社") else "全体件数順",
                         )
                         st.session_state.atlas_radar_result = profiles
                     except Exception as e:
@@ -628,17 +630,22 @@ with tab4:
 
         # --- Explorer ---
         with sub_tab_explorer:
-            st.caption("🐡 貼り付けたデータ全体のキーワードを、CSV全結果をまとめた1つのワードクラウドにします。")
+            st.caption("🐡 CSV全結果をまとめた1つのワードクラウド、または出願人ごとのワードクラウドを表示します。")
             kind = st.radio("対象にするキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
+            applicant_groups = pp.get_applicant_groups(db, top_n=15)
+            scope_options = ["全体"] + list(applicant_groups.keys())
+            scope = st.selectbox("対象範囲", scope_options, key="explorer_scope")
+
             if st.button("🐠 解析する", key="explorer_run"):
-                st.session_state.explorer_result = pp.build_keyword_frequency(db, kind=kind_map[kind])
+                ids = applicant_groups[scope] if scope != "全体" else None
+                st.session_state.explorer_result = (scope, pp.build_keyword_frequency(db, ids=ids, kind=kind_map[kind]))
 
             if st.session_state.get("explorer_result") is not None:
-                freq_all = st.session_state.explorer_result
-                st.markdown("**全体のワードクラウド**")
-                fig = pp.plot_wordcloud(freq_all, title="キーワード頻度（全体）")
+                scope_used, freq_all = st.session_state.explorer_result
+                st.markdown(f"**{scope_used}のワードクラウド**")
+                fig = pp.plot_wordcloud(freq_all, title=f"キーワード頻度（{scope_used}）")
                 st.pyplot(fig)
                 st.dataframe(
                     [{"語": w, "件数": f} for w, f in freq_all.most_common(30)],
@@ -727,32 +734,19 @@ with tab4:
 
             st.divider()
 
-            st.markdown("#### 📈 分布（FIコード数／キーワード数）")
-            st.caption("発明の名称・要約から抽出したキーワードと、FIコードを使って分布を作ります。")
-            dist_metric = st.radio("分布の対象", ["FIコード数", "キーワード数"], horizontal=True, key="dist_metric")
-            if st.button("📈 分布を作る", key="dist_run"):
-                st.session_state.dist_result = pp.compute_metadata_distribution(db, metric=dist_metric)
-            if st.session_state.get("dist_result") is not None:
-                scores = st.session_state.dist_result
-                if not scores:
-                    st.warning("分布を作れるデータが見つかりませんでした。")
-                else:
-                    fig = pp.plot_metadata_distribution(scores, metric=dist_metric)
-                    st.pyplot(fig)
-
-            st.divider()
-
             st.markdown("#### 🕸️ 出願人ごとのFIレーダーチャート比較（自動）")
             st.caption("出願人ごとに、よく使うFI（サブクラス等）の件数を軸にして比較します。出願人情報が必要です。")
             radar_fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="rank_radar_fi_level")
+            axis_selection_2 = st.radio("軸の選び方", ["複数社共通（おすすめ）", "全体件数順"], horizontal=True, key="rank_radar_axis_selection")
             col1, col2 = st.columns(2)
             with col1:
                 radar_top_applicants = st.slider("対象にする出願人数", min_value=2, max_value=10, value=5, key="rank_radar_applicants")
             with col2:
-                radar_top_fi = st.slider("軸にするFIの数", min_value=3, max_value=10, value=6, key="rank_radar_fi_n")
+                radar_top_fi = st.slider("軸にするFIの数", min_value=3, max_value=30, value=8, key="rank_radar_fi_n")
             if st.button("🕸️ レーダーチャートを作る", key="radar_run"):
                 profiles = pp.build_applicant_fi_radar_data(
-                    db, fi_level=radar_fi_level, top_applicants=radar_top_applicants, top_fi=radar_top_fi
+                    db, fi_level=radar_fi_level, top_applicants=radar_top_applicants, top_fi=radar_top_fi,
+                    axis_selection="複数社共通" if axis_selection_2.startswith("複数社") else "全体件数順",
                 )
                 if not profiles:
                     st.warning("出願人情報が見つかりませんでした。フルメタデータCSVを使ってください。")

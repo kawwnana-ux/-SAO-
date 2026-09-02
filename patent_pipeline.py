@@ -4656,7 +4656,7 @@ def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, fi_level="�
 # ============================================================
 
 def build_applicant_fi_radar_data(database, applicants=None, fi_level="サブクラス",
-                                   top_applicants=5, top_fi=6):
+                                   top_applicants=5, top_fi=6, axis_selection="複数社共通"):
     """
     出願人ごとに、よく使うFI（サブクラス等）の件数をまとめ、
     plot_radar_chart() にそのまま渡せる形（{出願人名: {FI名: 件数, ...}, ...}）
@@ -4665,7 +4665,11 @@ def build_applicant_fi_radar_data(database, applicants=None, fi_level="サブク
     applicants: 対象にする出願人名のリスト（省略時は出現件数が多い順に
                 top_applicants件を自動選択する）
     fi_level: fi_to_subclass/fi_to_maingroupと同じ粒度指定
-    top_fi: レーダーの軸として使うFIの数（出現件数が多い順に選ぶ）
+    top_fi: レーダーの軸として使うFIの数
+    axis_selection: "複数社共通"（複数の出願人にまたがって出てくるFIを
+                    優先して軸にする。1社だけが突出したFIが軸になり、
+                    他社が軒並み0になって尖った形になるのを防ぐ）
+                    "全体件数順"（単純に全体の件数が多い順）
     """
     from collections import Counter
 
@@ -4684,10 +4688,28 @@ def build_applicant_fi_radar_data(database, applicants=None, fi_level="サブク
 
     fi_counter = Counter()
     for entry in database:
-        if not (set(entry.get("出願人") or []) & set(applicants)):
+        matched_applicants = set(entry.get("出願人") or []) & set(applicants)
+        if not matched_applicants:
             continue
         fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
-    fi_axes = [f for f, _ in fi_counter.most_common(top_fi)]
+
+    # FIごとに「何社が使っているか」を数える
+    fi_applicant_sets = {}
+    for entry in database:
+        matched_applicants = set(entry.get("出願人") or []) & set(applicants)
+        if not matched_applicants:
+            continue
+        for fi in {convert(v) for v in (entry.get("FI") or [])}:
+            fi_applicant_sets.setdefault(fi, set()).update(matched_applicants)
+
+    if axis_selection == "複数社共通":
+        # 「使っている社数」を最優先、同数なら全体件数が多い順にする
+        fi_axes = sorted(
+            fi_counter.keys(),
+            key=lambda f: (-len(fi_applicant_sets.get(f, set())), -fi_counter[f]),
+        )[:top_fi]
+    else:
+        fi_axes = [f for f, _ in fi_counter.most_common(top_fi)]
 
     profiles = {}
     for applicant in applicants:
