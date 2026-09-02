@@ -668,20 +668,10 @@ with tab5:
         all_ids = [e["id"] for e in db]
         st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
-        st.markdown("#### 🏷️ グループ分け（自社 / 競合など）")
-        st.caption("id をカンマまたは改行区切りで入力してください。両方に入れなかったidは自動的にグループBに含まれません。")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            group_a_text = st.text_area("グループA（例：自社）のid", value=st.session_state.group_a_ids, height=80, key="group_a_input")
-        with col_b:
-            group_b_text = st.text_area("グループB（例：競合）のid", value=st.session_state.group_b_ids, height=80, key="group_b_input")
-
-        def _parse_ids(text, fallback):
-            ids = [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]
-            return ids if ids else fallback
-
-        group_a_ids = _parse_ids(group_a_text, all_ids[: len(all_ids) // 2] or all_ids)
-        group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
+        # グループA/Bは、Explorer・Saturn V・生態プロファイルタブでのみ
+        # 使う（自社/競合比較用）。入力欄は各タブ側に必要なときだけ出す。
+        group_a_ids = all_ids[: len(all_ids) // 2] or all_ids
+        group_b_ids = [i for i in all_ids if i not in group_a_ids]
 
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
             "🗺️ 海図（ATLAS）",
@@ -771,6 +761,19 @@ with tab5:
         # --- Explorer ---
         with sub_tab_explorer:
             st.caption("🐡 2つの群れ（グループA・B）が、それぞれどんな言葉の縄張りを持っているかを泳ぎ回って探ります。")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                group_a_text = st.text_area("グループA（例：自社）のid（空欄なら前半を自動使用）", value="", height=80, key="group_a_input")
+            with col_b:
+                group_b_text = st.text_area("グループB（例：競合）のid（空欄なら残りを自動使用）", value="", height=80, key="group_b_input")
+
+            def _parse_ids(text, fallback):
+                ids = [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]
+                return ids if ids else fallback
+
+            group_a_ids = _parse_ids(group_a_text, group_a_ids)
+            group_b_ids = _parse_ids(group_b_text, group_b_ids)
+
             kind = st.radio("比較するキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
