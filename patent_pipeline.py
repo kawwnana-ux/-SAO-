@@ -5024,6 +5024,7 @@ def compute_activity_momentum(database, group_by="出願人", recent_years=3, co
     for g, counts in year_counts.items():
         recent_total = sum(counts.get(y, 0) for y in recent_range)
         compare_total = sum(counts.get(y, 0) for y in compare_range)
+        total_all = sum(counts.values())
         if compare_total > 0:
             cagr = (recent_total / compare_total) ** (1.0 / recent_years) - 1
         elif recent_total > 0:
@@ -5032,6 +5033,7 @@ def compute_activity_momentum(database, group_by="出願人", recent_years=3, co
             cagr = 0.0
         result[g] = {
             "活動量": recent_total,
+            "総出願件数": total_all,
             "勢い": cagr,
             "年別件数": dict(sorted(counts.items())),
         }
@@ -5062,11 +5064,11 @@ def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme
         bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
         palette = [s["edge"] for s in _BRANCH_PALETTE]
 
-    items = sorted(mega_data.items(), key=lambda x: -x[1]["活動量"])[:top_n]
+    items = sorted(mega_data.items(), key=lambda x: -x[1]["総出願件数"])[:top_n]
     if not items:
         raise ValueError("データが見つかりませんでした")
 
-    activities = [v["活動量"] for _, v in items]
+    activities = [v["総出願件数"] for _, v in items]
     momentums = [v["勢い"] for _, v in items]
     activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
 
@@ -5089,13 +5091,13 @@ def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme
 
     for i, (name, v) in enumerate(items):
         color = palette[i % len(palette)]
-        ax.scatter(v["活動量"], v["勢い"], s=140, color=color, edgecolors=fg, linewidths=0.8, zorder=5)
-        ax.annotate(name, (v["活動量"], v["勢い"]), fontsize=9, fontproperties=FONT_PROP,
+        ax.scatter(v["総出願件数"], v["勢い"], s=140, color=color, edgecolors=fg, linewidths=0.8, zorder=5)
+        ax.annotate(name, (v["総出願件数"], v["勢い"]), fontsize=9, fontproperties=FONT_PROP,
                     color=fg, xytext=(6, 6), textcoords="offset points", zorder=6)
 
     ax.set_xlim(0, x_max)
     ax.set_ylim(y_min, y_max)
-    ax.set_xlabel("活動量（直近の出願件数）", fontproperties=FONT_PROP, color=fg)
+    ax.set_xlabel("総出願量", fontproperties=FONT_PROP, color=fg)
     ax.set_ylabel("勢い（年平均成長率 CAGR）", fontproperties=FONT_PROP, color=fg)
     ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
     ax.tick_params(colors=fg)
@@ -5127,12 +5129,12 @@ def plot_mega_chart_interactive(mega_data, title="MEGA：活動量×勢い", top
         bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
         palette = [s["edge"] for s in _BRANCH_PALETTE]
 
-    items = sorted(mega_data.items(), key=lambda x: -x[1]["活動量"])[:top_n]
+    items = sorted(mega_data.items(), key=lambda x: -x[1]["総出願件数"])[:top_n]
     if not items:
         raise ValueError("データが見つかりませんでした")
 
     names = [name for name, _ in items]
-    activities = [v["活動量"] for _, v in items]
+    activities = [v["総出願件数"] for _, v in items]
     momentums = [v["勢い"] for _, v in items]
     activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
 
@@ -5157,7 +5159,7 @@ def plot_mega_chart_interactive(mega_data, title="MEGA：活動量×勢い", top
     fig.add_trace(go.Scatter(
         x=activities, y=momentums, mode="markers", text=names,
         marker=dict(size=16, color=colors, line=dict(width=1, color=fg)),
-        hovertemplate="%{text}<br>活動量: %{x}<br>勢い: %{y:.2f}<extra></extra>",
+        hovertemplate="%{text}<br>総出願件数: %{x}<br>勢い: %{y:.2f}<extra></extra>",
     ))
 
     for label, x_pos, y_pos, anchor in [
@@ -5171,7 +5173,7 @@ def plot_mega_chart_interactive(mega_data, title="MEGA：活動量×勢い", top
 
     fig.update_layout(
         title=title,
-        xaxis_title="活動量（直近の出願件数）", yaxis_title="勢い（年平均成長率 CAGR）",
+        xaxis_title="総出願量", yaxis_title="直近の成長率（CAGR）",
         plot_bgcolor=bg, paper_bgcolor=bg,
         font=dict(color=fg),
         xaxis=dict(gridcolor=grid, zerolinecolor=grid, range=[0, x_max]),

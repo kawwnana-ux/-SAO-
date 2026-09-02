@@ -624,6 +624,23 @@ with tab4:
                     hide_index=True, width='stretch',
                 )
 
+            st.divider()
+            st.markdown("#### 🌋 キーワード地形図")
+            st.caption("よく出てくるキーワードを地図上に配置し、頻度を山の高さ（色）で表します。赤い山ほど、その技術用語が密集しています。")
+            landscape_kind = st.radio("地形図の対象", ["構成要素", "動詞"], horizontal=True, key="landscape_kind")
+            top_n = st.slider("表示するキーワード数", min_value=10, max_value=80, value=40, key="landscape_top_n")
+            if st.button("🌋 地形図を作る", key="landscape_run"):
+                try:
+                    points_lc = pp.build_keyword_landscape(
+                        db, top_n=top_n, kind="component" if landscape_kind == "構成要素" else "verb"
+                    )
+                    st.session_state.landscape_result = points_lc
+                except Exception as e:
+                    st.error(f"地形図作成中にエラーが発生しました: {e}")
+            if st.session_state.get("landscape_result"):
+                fig = pp.plot_keyword_landscape(st.session_state.landscape_result, title="キーワード地形図")
+                st.pyplot(fig)
+
         # --- Saturn V ---
         with sub_tab_saturn:
             st.caption("特許同士の意味的な近さに基づいて地図上に配置します。似た内容の発明ほど近くに配置されます。")
@@ -646,23 +663,6 @@ with tab4:
                 fig = pp.plot_semantic_map_interactive(points, var, groups=groups, title="意味的俯瞰マップ")
                 st.plotly_chart(fig, width='stretch')
                 st.caption("意味的に近い特許同士が近くに配置されます。点にカーソルを合わせると文献番号が表示されます。")
-
-            st.divider()
-            st.markdown("#### 🌋 キーワード地形図")
-            st.caption("よく出てくるキーワードを地図上に配置し、頻度を山の高さ（色）で表します。赤い山ほど、その技術用語が密集しています。")
-            landscape_kind = st.radio("地形図の対象", ["構成要素", "動詞"], horizontal=True, key="landscape_kind")
-            top_n = st.slider("表示するキーワード数", min_value=10, max_value=80, value=40, key="landscape_top_n")
-            if st.button("🌋 地形図を作る", key="landscape_run"):
-                try:
-                    points_lc = pp.build_keyword_landscape(
-                        db, top_n=top_n, kind="component" if landscape_kind == "構成要素" else "verb"
-                    )
-                    st.session_state.landscape_result = points_lc
-                except Exception as e:
-                    st.error(f"地形図作成中にエラーが発生しました: {e}")
-            if st.session_state.get("landscape_result"):
-                fig = pp.plot_keyword_landscape(st.session_state.landscape_result, title="キーワード地形図")
-                st.pyplot(fig)
 
         # --- CORE ---
         with sub_tab_core:
