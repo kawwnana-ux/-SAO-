@@ -4984,3 +4984,35 @@ def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme
 
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㉜ 出願人ごとの自動グループ化（手作業のグループ分け不要）
+# ============================================================
+
+def get_applicant_groups(database, top_n=5):
+    """
+    データベースに「出願人」情報が含まれる場合、出願件数が多い順に
+    上位top_n件の出願人ごとに、idのリストをまとめる。
+    手作業でのグループ分けをせず、自動で比較グループを作るために使う。
+
+    戻り値: {出願人名: [id, id, ...], ...}（出願件数が多い順）
+            出願人情報が無いデータベースの場合は空の辞書を返す。
+    """
+    from collections import Counter, defaultdict
+
+    if not any(e.get("出願人") for e in database):
+        return {}
+
+    applicant_counter = Counter()
+    for entry in database:
+        applicant_counter.update(set(entry.get("出願人") or []))
+
+    top_applicants = [a for a, _ in applicant_counter.most_common(top_n)]
+    groups = defaultdict(list)
+    for entry in database:
+        for a in set(entry.get("出願人") or []):
+            if a in top_applicants:
+                groups[a].append(entry["id"])
+    # 出願件数の多い順を維持する
+    return {a: groups[a] for a in top_applicants if a in groups}

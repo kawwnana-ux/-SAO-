@@ -24,10 +24,6 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = None
 if "dependent_result" not in st.session_state:
     st.session_state.dependent_result = None
-if "group_a_ids" not in st.session_state:
-    st.session_state.group_a_ids = ""
-if "group_b_ids" not in st.session_state:
-    st.session_state.group_b_ids = ""
 if "abstract_db" not in st.session_state:
     st.session_state.abstract_db = None
 
@@ -668,11 +664,6 @@ with tab5:
         all_ids = [e["id"] for e in db]
         st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
-        # グループA/Bは、Explorer・Saturn V・生態プロファイルタブでのみ
-        # 使う（自社/競合比較用）。入力欄は各タブ側に必要なときだけ出す。
-        group_a_ids = all_ids[: len(all_ids) // 2] or all_ids
-        group_b_ids = [i for i in all_ids if i not in group_a_ids]
-
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
             "🗺️ 海図（ATLAS）",
             "🐡 群れ探査（Explorer）", "🌊 深海海流マップ（Saturn V）",
@@ -760,49 +751,58 @@ with tab5:
 
         # --- Explorer ---
         with sub_tab_explorer:
-            st.caption("🐡 2つの群れ（グループA・B）が、それぞれどんな言葉の縄張りを持っているかを泳ぎ回って探ります。")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                group_a_text = st.text_area("グループA（例：自社）のid（空欄なら前半を自動使用）", value="", height=80, key="group_a_input")
-            with col_b:
-                group_b_text = st.text_area("グループB（例：競合）のid（空欄なら残りを自動使用）", value="", height=80, key="group_b_input")
-
-            def _parse_ids(text, fallback):
-                ids = [x.strip() for x in text.replace("\n", ",").split(",") if x.strip()]
-                return ids if ids else fallback
-
-            group_a_ids = _parse_ids(group_a_text, group_a_ids)
-            group_b_ids = _parse_ids(group_b_text, group_b_ids)
-
-            kind = st.radio("比較するキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
+            st.caption("🐡 貼り付けたデータ全体のキーワードを泳ぎ回って探ります。出願人情報があれば、自動で上位の出願人同士を比較します。")
+            kind = st.radio("対象にするキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
-            if st.button("🐠 比較する", key="explorer_run"):
-                result = pp.compare_keyword_groups(db, group_a_ids, group_b_ids, kind=kind_map[kind])
-                st.session_state.explorer_result = result
+            applicant_groups = pp.get_applicant_groups(db, top_n=5)
+
+            if st.button("🐠 解析する", key="explorer_run"):
+                if applicant_groups:
+                    names = list(applicant_groups.keys())
+                    result = pp.compare_keyword_groups(
+                        db, applicant_groups[names[0]], applicant_groups[names[1]] if len(names) > 1 else [],
+                        kind=kind_map[kind],
+                    )
+                    st.session_state.explorer_result = (result, names[0], names[1] if len(names) > 1 else None)
+                else:
+                    freq_all = pp.build_keyword_frequency(db, kind=kind_map[kind])
+                    st.session_state.explorer_result = (freq_all, None, None)
 
             if st.session_state.get("explorer_result") is not None:
-                result = st.session_state.explorer_result
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**グループAのワードクラウド**")
-                    fig = pp.plot_wordcloud(result["freq_a"], title="グループA")
+                payload, name_a, name_b = st.session_state.explorer_result
+                if name_a is None:
+                    # 出願人情報がない場合：データ全体をまとめて1つのワードクラウドにする
+                    st.markdown("**全体のワードクラウド**")
+                    fig = pp.plot_wordcloud(payload, title="キーワード頻度（全体）")
                     st.pyplot(fig)
-                with col2:
-                    st.markdown("**グループBのワードクラウド**")
-                    fig = pp.plot_wordcloud(result["freq_b"], title="グループB")
-                    st.pyplot(fig)
+                    st.dataframe(
+                        [{"語": w, "件数": f} for w, f in payload.most_common(30)],
+                        hide_index=True, width='stretch',
+                    )
+                else:
+                    result = payload
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**{name_a}のワードクラウド**")
+                        fig = pp.plot_wordcloud(result["freq_a"], title=name_a)
+                        st.pyplot(fig)
+                    with col2:
+                        if name_b:
+                            st.markdown(f"**{name_b}のワードクラウド**")
+                            fig = pp.plot_wordcloud(result["freq_b"], title=name_b)
+                            st.pyplot(fig)
 
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.markdown(f"**共通する語（{len(result['common'])}件）**")
-                    st.dataframe([{"語": w, "A": a, "B": b} for w, a, b in result["common"]], hide_index=True, width='stretch')
-                with col2:
-                    st.markdown(f"**Aだけの語（{len(result['only_a'])}件）**")
-                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, width='stretch')
-                with col3:
-                    st.markdown(f"**Bだけの語（{len(result['only_b'])}件）**")
-                    st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, width='stretch')
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.markdown(f"**共通する語（{len(result['common'])}件）**")
+                        st.dataframe([{"語": w, name_a: a, name_b or "B": b} for w, a, b in result["common"]], hide_index=True, width='stretch')
+                    with col2:
+                        st.markdown(f"**{name_a}だけの語（{len(result['only_a'])}件）**")
+                        st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, width='stretch')
+                    with col3:
+                        st.markdown(f"**{name_b or 'B'}だけの語（{len(result['only_b'])}件）**")
+                        st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, width='stretch')
 
         # --- Saturn V ---
         with sub_tab_saturn:
@@ -810,8 +810,13 @@ with tab5:
             if st.button("🐋 マップを作成する", key="saturn_run"):
                 try:
                     points, var = pp.build_semantic_map(db)
-                    groups = {i: "グループA" for i in group_a_ids}
-                    groups.update({i: "グループB" for i in group_b_ids})
+                    applicant_groups = pp.get_applicant_groups(db, top_n=6)
+                    groups = None
+                    if applicant_groups:
+                        groups = {}
+                        for name, ids in applicant_groups.items():
+                            for i in ids:
+                                groups[i] = name
                     st.session_state.saturn_result = (points, var, groups)
                 except Exception as e:
                     st.error(f"マップ作成中にエラーが発生しました: {e}")
@@ -895,16 +900,19 @@ with tab5:
 
             st.divider()
 
-            st.markdown("#### 🕸️ グループ特徴のレーダーチャート比較")
-            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。")
+            st.markdown("#### 🕸️ 出願人ごとの特徴レーダーチャート比較（自動）")
+            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。出願人情報があれば自動で上位を比較します。")
             if st.button("🕸️ レーダーチャートを作る", key="radar_run"):
-                profile_a = pp.compute_group_profile(db, group_a_ids)
-                profile_b = pp.compute_group_profile(db, group_b_ids)
-                if not profile_a or not profile_b:
+                applicant_groups = pp.get_applicant_groups(db, top_n=5)
+                if applicant_groups:
+                    profiles = {name: pp.compute_group_profile(db, ids) for name, ids in applicant_groups.items()}
+                    profiles = {k: v for k, v in profiles.items() if v}
+                else:
+                    profiles = {"全体": pp.compute_group_profile(db, [e["id"] for e in db])}
+                if not profiles or not any(profiles.values()):
                     st.warning("請求項データベースを使ってください。")
                 else:
-                    st.session_state.radar_result = (profile_a, profile_b)
+                    st.session_state.radar_result = profiles
             if st.session_state.get("radar_result") is not None:
-                profile_a, profile_b = st.session_state.radar_result
-                fig = pp.plot_radar_chart({"グループA": profile_a, "グループB": profile_b})
+                fig = pp.plot_radar_chart(st.session_state.radar_result)
                 st.pyplot(fig)
