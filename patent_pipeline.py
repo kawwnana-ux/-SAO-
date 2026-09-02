@@ -5333,3 +5333,201 @@ def apply_applicant_normalization(database, group_keywords=None, field="出願�
         new_entry[f"{field}_元"] = original
         new_db.append(new_entry)
     return new_db
+
+
+# ============================================================
+# ㉟ 登録率分析：どのグループが権利化に成功しやすいか
+# ============================================================
+
+def _is_registered(entry):
+    """1件の特許が登録済みかどうかを判定する"""
+    if entry.get("登録番号"):
+        return True
+    stage = entry.get("ステージ") or ""
+    return "登録" in stage
+
+
+def compute_registration_rate(database, group_by="出願人", fi_level="サブクラス", top_n=15):
+    """
+    グループ（出願人・FI・発明の名称のキーワード）ごとに、
+    登録済みの割合（登録率）を計算する。
+
+    group_by: "出願人"、"FI"、"キーワード"（発明の名称から抽出）
+    戻り値: [{"グループ": .., "総数": .., "登録数": .., "登録率": ..}, ...]
+            （総数が多い順、上位top_n件）
+    """
+    from collections import defaultdict
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    counts = defaultdict(lambda: {"総数": 0, "登録数": 0})
+    for entry in database:
+        registered = _is_registered(entry)
+        if group_by == "出願人":
+            groups = set(entry.get("出願人") or [])
+        elif group_by == "FI":
+            groups = {convert(v) for v in (entry.get("FI") or [])}
+        else:
+            groups = extract_abstract_keywords(entry.get("発明の名称") or "")
+        for g in groups:
+            counts[g]["総数"] += 1
+            if registered:
+                counts[g]["登録数"] += 1
+
+    result = []
+    for g, c in counts.items():
+        result.append({
+            "グループ": g,
+            "総数": c["総数"],
+            "登録数": c["登録数"],
+            "登録率": c["登録数"] / c["総数"] if c["総数"] else 0.0,
+        })
+    result.sort(key=lambda x: -x["総数"])
+    return result[:top_n]
+
+
+def plot_registration_rate(rows, title="登録率", theme="deepsea"):
+    """compute_registration_rate() の結果を横棒グラフにする（登録率でソート）"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    rows_sorted = sorted(rows, key=lambda x: x["登録率"])
+    labels = [f'{r["グループ"]}（{r["登録数"]}/{r["総数"]}）' for r in rows_sorted]
+    values = [r["登録率"] * 100 for r in rows_sorted]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.barh(labels, values, color=bar)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
+    ax.set_xlabel("登録率（%）", fontproperties=FONT_PROP, color=fg)
+    ax.set_xlim(0, 100)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================
+# ㊱ 権利化期間分析：どのグループ・技術が早く／遅く公開されるか
+# ============================================================
+
+def compute_time_to_publication(database, group_by="出願人", fi_level="サブクラス", top_n=15):
+    """
+    グループ（出願人・FI）ごとに、出願日から公知日までの日数（権利化に
+    かかった期間の目安）の平均・中央値を計算する。
+    出願日・公知日の両方がある行だけを対象にする。
+
+    戻り値: [{"グループ": .., "件数": .., "平均日数": .., "中央値日数": ..}, ...]
+            （件数が多い順、上位top_n件）
+    """
+    from collections import defaultdict
+    import statistics
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    days_by_group = defaultdict(list)
+    for entry in database:
+        d1 = entry.get("出願日")
+        d2 = entry.get("公知日")
+        if d1 is None or d2 is None:
+            continue
+        days = (d2 - d1).days
+        if days < 0:
+            continue
+        if group_by == "出願人":
+            groups = set(entry.get("出願人") or [])
+        else:
+            groups = {convert(v) for v in (entry.get("FI") or [])}
+        for g in groups:
+            days_by_group[g].append(days)
+
+    result = []
+    for g, days_list in days_by_group.items():
+        result.append({
+            "グループ": g,
+            "件数": len(days_list),
+            "平均日数": statistics.mean(days_list),
+            "中央値日数": statistics.median(days_list),
+        })
+    result.sort(key=lambda x: -x["件数"])
+    return result[:top_n]
+
+
+def plot_time_to_publication(rows, title="出願から公知までの期間", theme="deepsea"):
+    """compute_time_to_publication() の結果を横棒グラフにする（平均日数でソート）"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    rows_sorted = sorted(rows, key=lambda x: x["平均日数"])
+    labels = [f'{r["グループ"]}（{r["件数"]}件）' for r in rows_sorted]
+    values = [r["平均日数"] / 365.25 for r in rows_sorted]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.barh(labels, values, color=bar)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
+    ax.set_xlabel("平均期間（年）", fontproperties=FONT_PROP, color=fg)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================
+# ㊲ 技術の「先願者」年表：どのマスを誰が最初に押さえたか
+# ============================================================
+
+def find_first_filers(database, top_keywords=25, top_fi=25, fi_level="サブクラス",
+                       title_field="発明の名称"):
+    """
+    build_keyword_fi_matrix() と同じ「キーワード×FI」のマス目について、
+    各マスに最も早く出願したのが誰（どの出願人）で、いつだったかを求める。
+    「この技術の組み合わせは、実はどの会社が先行して押さえていたか」を
+    可視化するために使う。
+
+    戻り値: [{"キーワード":.., "FI":.., "最初の出願人":.., "最初の出願日":..,
+              "件数":..}, ...]（キーワード×FIのマスごとに1行、出願日が早い順）
+    """
+    matrix, keyword_list, fi_list = build_keyword_fi_matrix(
+        database, top_keywords=top_keywords, top_fi=top_fi, fi_level=fi_level, title_field=title_field
+    )
+    db_by_id = {e["id"]: e for e in database}
+
+    rows = []
+    for (kw, fi), ids in matrix.items():
+        entries = [db_by_id[i] for i in ids if i in db_by_id and db_by_id[i].get("出願日") is not None]
+        if not entries:
+            continue
+        entries.sort(key=lambda e: e["出願日"])
+        first = entries[0]
+        rows.append({
+            "キーワード": kw,
+            "FI": fi,
+            "最初の出願人": "、".join(first.get("出願人") or ["（不明）"]),
+            "最初の出願日": first["出願日"],
+            "件数": len(entries),
+        })
+    rows.sort(key=lambda r: r["最初の出願日"])
+    return rows

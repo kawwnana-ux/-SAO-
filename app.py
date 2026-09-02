@@ -761,3 +761,53 @@ with tab4:
                     )
                 fig = pp.plot_mega_chart_interactive(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
                 st.plotly_chart(fig, width='stretch')
+
+            st.divider()
+
+            st.markdown("#### 📋 登録率分析")
+            st.caption("グループ（出願人・FI・キーワード）ごとに、どのくらい登録に成功しているかを比較します。")
+            reg_group_by = st.radio("グループの単位", ["出願人", "FI", "キーワード"], horizontal=True, key="reg_group_by")
+            reg_fi_level = st.radio("FIの粒度（FI選択時のみ）", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="reg_fi_level")
+            if st.button("📋 登録率を見る", key="reg_run"):
+                st.session_state.reg_result = pp.compute_registration_rate(db, group_by=reg_group_by, fi_level=reg_fi_level)
+            if st.session_state.get("reg_result"):
+                fig = pp.plot_registration_rate(st.session_state.reg_result, title=f"登録率（{reg_group_by}別）")
+                st.pyplot(fig)
+
+            st.divider()
+
+            st.markdown("#### ⏱️ 権利化期間分析")
+            st.caption("グループ（出願人・FI）ごとに、出願日から公知日までの期間（権利化にかかる期間の目安）を比較します。")
+            ttp_group_by = st.radio("グループの単位", ["出願人", "FI"], horizontal=True, key="ttp_group_by")
+            ttp_fi_level = st.radio("FIの粒度（FI選択時のみ）", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="ttp_fi_level")
+            if st.button("⏱️ 期間を見る", key="ttp_run"):
+                st.session_state.ttp_result = pp.compute_time_to_publication(db, group_by=ttp_group_by, fi_level=ttp_fi_level)
+            if st.session_state.get("ttp_result"):
+                fig = pp.plot_time_to_publication(st.session_state.ttp_result, title=f"出願から公知までの期間（{ttp_group_by}別）")
+                st.pyplot(fig)
+
+            st.divider()
+
+            st.markdown("#### 🏁 技術の「先願者」年表")
+            st.caption("発明の名称のキーワード×FIの組み合わせごとに、最初に出願したのが誰・いつだったかを一覧にします。")
+            has_title_field = any(e.get("発明の名称") for e in db)
+            if not has_title_field:
+                st.info("このデータベースには「発明の名称」がありません。「フルメタデータCSV」で構築してください。")
+            else:
+                first_filer_fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="first_filer_fi_level")
+                if st.button("🏁 年表を作る", key="first_filer_run"):
+                    st.session_state.first_filer_result = pp.find_first_filers(db, fi_level=first_filer_fi_level)
+                if st.session_state.get("first_filer_result"):
+                    rows = st.session_state.first_filer_result
+                    st.dataframe(
+                        [
+                            {
+                                "キーワード": r["キーワード"], "FI": r["FI"],
+                                "最初の出願人": r["最初の出願人"],
+                                "最初の出願日": r["最初の出願日"].strftime("%Y-%m-%d") if r["最初の出願日"] else "",
+                                "件数": r["件数"],
+                            }
+                            for r in rows
+                        ],
+                        hide_index=True, width='stretch',
+                    )
