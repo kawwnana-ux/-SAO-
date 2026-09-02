@@ -457,11 +457,35 @@ with tab4:
         [
             "要約データベース（ここで新しく作る）",
             "フルメタデータCSV（出願日・出願人・FI等、ATLAS用）",
+            "請求項＋メタデータCSV（出願人・FI等、ホワイトスペース分析用）",
         ],
         key="db_source_choice",
     )
 
-    if db_source.startswith("フルメタデータ"):
+    if db_source.startswith("請求項＋"):
+        st.markdown("#### 📜 請求項＋メタデータCSVを登録する")
+        st.caption(
+            "列名: id（省略可）, 出願人, FI（またはFI/IPC）, 請求項本文, "
+            "発明の名称（任意）, 出願日（任意）, 特許番号（任意）　を含むCSVをアップロードしてください。"
+        )
+        uploaded_claims_csv = st.file_uploader("CSVファイル", type=["csv"], key="claims_csv")
+        if st.button("📜 データベースを構築する", key="build_claims_db_run"):
+            if uploaded_claims_csv is None:
+                st.warning("CSVファイルをアップロードしてください。")
+            else:
+                with st.spinner("請求項をSAO解析中..."):
+                    try:
+                        content = uploaded_claims_csv.getvalue().decode("utf-8-sig")
+                        claims_records = pp.load_claims_with_metadata_csv(content)
+                        st.session_state.abstract_db = pp.build_claims_metadata_database(claims_records, show_progress=False)
+                    except Exception as e:
+                        st.error(f"データベース構築中にエラーが発生しました: {e}")
+                        st.session_state.abstract_db = None
+        if st.session_state.abstract_db is not None:
+            st.success(f"✅ {len(st.session_state.abstract_db)} 件を登録済みです。")
+        db = st.session_state.abstract_db
+
+    elif db_source.startswith("フルメタデータ"):
         st.markdown("#### 🛰️ フルメタデータCSVを登録する")
         st.caption(
             "列名: 文献番号, 出願番号, 出願日, 公知日, 発明の名称, 出願人/権利者, "
@@ -606,13 +630,28 @@ with tab4:
             kind = st.radio("対象にするキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
+            has_claim_field_ex = any("relations" in e for e in db)
+            has_title_field_ex = any(e.get("発明の名称") for e in db)
+            source_options_ex = ["自動"]
+            if has_claim_field_ex:
+                source_options_ex.append("請求項")
+            if has_title_field_ex:
+                source_options_ex.append("発明の名称")
+            explorer_source = st.radio("キーワードの検索元", source_options_ex, horizontal=True, key="explorer_source")
+
+            exclude_text = st.text_input("除外キーワード（カンマ区切り）", value="", key="explorer_exclude")
+            exclude_list = [w.strip() for w in exclude_text.split(",") if w.strip()]
+
             applicant_groups = pp.get_applicant_groups(db, top_n=15)
             scope_options = ["全体"] + list(applicant_groups.keys())
             scope = st.selectbox("対象範囲", scope_options, key="explorer_scope")
 
             if st.button("🐠 解析する", key="explorer_run"):
                 ids = applicant_groups[scope] if scope != "全体" else None
-                st.session_state.explorer_result = (scope, pp.build_keyword_frequency(db, ids=ids, kind=kind_map[kind]))
+                freq = pp.build_keyword_frequency(
+                    db, ids=ids, kind=kind_map[kind], source=explorer_source, exclude=exclude_list
+                )
+                st.session_state.explorer_result = (scope, freq)
 
             if st.session_state.get("explorer_result") is not None:
                 scope_used, freq_all = st.session_state.explorer_result
@@ -661,17 +700,26 @@ with tab4:
             if st.session_state.get("saturn_result") is not None:
                 points, var, groups = st.session_state.saturn_result
                 fig = pp.plot_semantic_map_interactive(points, var, groups=groups, title="意味的俯瞰マップ")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, width='content')
                 st.caption("意味的に近い特許同士が近くに配置されます。点にカーソルを合わせると文献番号が表示されます。")
 
         # --- CORE ---
         with sub_tab_core:
-            st.caption("発明の名称から自動抽出したキーワードとFIサブクラスのマス目に特許を分類します。件数が0のマスが、まだ誰も出願していないホワイトスペース候補です。")
-            st.markdown("#### 🐚 自動ホワイトスペースマップ（発明の名称×FIサブクラス）")
+            st.caption("キーワードとFIサブクラスのマス目に特許を分類します。件数が0のマスが、まだ誰も出願していないホワイトスペース候補です。")
+            st.markdown("#### 🐚 自動ホワイトスペースマップ")
             has_title_field = any(e.get("発明の名称") for e in db)
-            if not has_title_field:
-                st.info("このデータベースには「発明の名称」がありません。「フルメタデータCSV」で構築してください。")
+            has_claim_field = any("relations" in e for e in db)
+            source_options = []
+            if has_claim_field:
+                source_options.append("請求項")
+            if has_title_field:
+                source_options.append("発明の名称")
+            if not source_options:
+                st.info("このデータベースには「発明の名称」も請求項もありません。「フルメタデータCSV」または「請求項＋メタデータCSV」で構築してください。")
             else:
+                kwfi_source = st.radio("キーワードの抽出元", source_options, horizontal=True, key="kwfi_source")
+                applicant_options = sorted({a for e in db for a in (e.get("出願人") or [])})
+                kwfi_applicants = st.multiselect("出願人で絞り込む（空欄なら全件）", applicant_options, key="kwfi_applicants")
                 col1, col2 = st.columns(2)
                 with col1:
                     n_keywords = st.slider("縦軸のキーワード数", min_value=5, max_value=50, value=20, key="kwfi_n_keywords")
@@ -681,14 +729,15 @@ with tab4:
                 if st.button("🐚 自動でマップを作る", key="kwfi_run"):
                     try:
                         matrix_kw, kw_list, fi_list = pp.build_keyword_fi_matrix(
-                            db, top_keywords=n_keywords, top_fi=n_fi, fi_level=kwfi_fi_level
+                            db, top_keywords=n_keywords, top_fi=n_fi, fi_level=kwfi_fi_level,
+                            source=kwfi_source, applicant_filter=kwfi_applicants or None,
                         )
                         st.session_state.kwfi_result = (matrix_kw, kw_list, fi_list)
                     except Exception as e:
                         st.error(f"マップ作成中にエラーが発生しました: {e}")
                 if st.session_state.get("kwfi_result") is not None:
                     matrix_kw, kw_list, fi_list = st.session_state.kwfi_result
-                    fig = pp.plot_keyword_fi_heatmap(matrix_kw, kw_list, fi_list, title="発明の名称×FI ホワイトスペースマップ")
+                    fig = pp.plot_keyword_fi_heatmap(matrix_kw, kw_list, fi_list, title=f"{kwfi_source}×FI ホワイトスペースマップ")
                     st.pyplot(fig)
                     st.caption("色が濃いマスほど出願件数が多く、白いマスがホワイトスペース候補です。")
 

@@ -3739,20 +3739,42 @@ def extract_keywords_from_relations(relations, kind="both"):
     return keywords
 
 
-def build_keyword_frequency(database, ids=None, kind="both"):
+def build_keyword_frequency(database, ids=None, kind="both", source="自動", exclude=None):
     """
-    database（build_patent_database() または build_abstract_database() の
-    戻り値）から、指定したid群（省略時は全件）のキーワード出現頻度を
-    集計する。「出現した件数」で数える（1件の中で同じ語が何度出ても1件とする）。
+    database（build_patent_database() 等の戻り値）から、指定したid群
+    （省略時は全件）のキーワード出現頻度を集計する。
+    「出現した件数」で数える（1件の中で同じ語が何度出ても1件とする）。
+
+    source: "自動"（各エントリの持っている情報に応じて自動判定。
+            従来の挙動）、"請求項"（請求項をSAO解析した構成要素を
+            強制的に使う。"relations"を持たないエントリは無視される）、
+            "発明の名称"（発明の名称から抽出したキーワードを強制的に
+            使う。kind="verb"の場合は動詞を取れないため空になる）
+    exclude: 除外したいキーワードのリスト（集計結果から取り除く）
     """
     from collections import Counter
 
     counter = Counter()
     target_ids = set(ids) if ids is not None else None
+    exclude_set = set(exclude) if exclude else set()
     for entry in database:
         if target_ids is not None and entry["id"] not in target_ids:
             continue
-        keywords = _entry_keywords(entry, kind=kind)
+        if source == "請求項":
+            keywords = (
+                extract_keywords_from_relations(entry["relations"], kind=kind)
+                if "relations" in entry else set()
+            )
+        elif source == "発明の名称":
+            if kind == "verb":
+                keywords = set()
+            else:
+                title = entry.get("発明の名称", "") or ""
+                keywords = extract_abstract_keywords(title) if title else set()
+        else:
+            keywords = _entry_keywords(entry, kind=kind)
+        if exclude_set:
+            keywords = keywords - exclude_set
         counter.update(keywords)
     return counter
 
@@ -3975,8 +3997,9 @@ def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
         plot_bgcolor=bg, paper_bgcolor=bg,
         font=dict(color=fg),
         xaxis=dict(gridcolor=grid, zerolinecolor=grid),
-        yaxis=dict(gridcolor=grid, zerolinecolor=grid),
+        yaxis=dict(gridcolor=grid, zerolinecolor=grid, scaleanchor="x", scaleratio=1),
         legend=dict(bgcolor=bg, bordercolor=grid),
+        width=700, height=700,
     )
     return fig
 
@@ -4895,10 +4918,15 @@ def plot_keyword_landscape(points, title="キーワード地形図", grid_size=2
 # 色が濃いマスほど出願が多く、白いマスがホワイトスペース候補。
 
 def build_keyword_fi_matrix(database, top_keywords=25, top_fi=25, fi_level="サブクラス",
-                             title_field="発明の名称"):
+                             title_field="発明の名称", source="発明の名称", applicant_filter=None):
     """
-    database: build_full_database() 等の戻り値
-              （"発明の名称"と"FI"の両方を持つデータベース）
+    database: build_full_database() や build_claims_metadata_database() 等の戻り値
+
+    source: "発明の名称"（発明の名称からキーワードを抽出）、
+            "請求項"（請求項本文をSAO解析した構成要素をキーワードとして使う。
+            database の各エントリが "relations" を持っている必要がある）
+    applicant_filter: 出願人名のリストを指定すると、その出願人が
+                       関わる特許だけに絞り込んでからマトリクスを作る
 
     戻り値: (matrix, keyword_list, fi_list)
         matrix: {(キーワード, FI): [id, id, ...], ...}
@@ -4914,12 +4942,19 @@ def build_keyword_fi_matrix(database, top_keywords=25, top_fi=25, fi_level="サ�
     else:
         convert = lambda x: x
 
+    if applicant_filter:
+        applicant_set = set(applicant_filter)
+        database = [e for e in database if set(e.get("出願人") or []) & applicant_set]
+
     entry_keywords = []
     keyword_counter = Counter()
     fi_counter = Counter()
     for entry in database:
-        title = entry.get(title_field, "") or ""
-        kws = extract_abstract_keywords(title) if title else set()
+        if source == "請求項":
+            kws = _entry_keywords(entry, kind="component")
+        else:
+            title = entry.get(title_field, "") or ""
+            kws = extract_abstract_keywords(title) if title else set()
         entry_keywords.append(kws)
         keyword_counter.update(kws)
         fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
@@ -5531,3 +5566,85 @@ def find_first_filers(database, top_keywords=25, top_fi=25, fi_level="サブク�
         })
     rows.sort(key=lambda r: r["最初の出願日"])
     return rows
+
+
+# ============================================================
+# ㊳ 請求項データベース（メタデータ付き）の読み込み・構築
+# ============================================================
+# 「id,特許番号,出願日,出願人,発明の名称,FI/IPC,請求項番号,請求項本文」
+# 形式のCSV（Dataset A用テンプレート）を読み込み、請求項本文をSAO解析
+# した上で、出願人・FIのメタデータと合わせたデータベースを作る。
+# これにより「請求項から抽出した構成要素×FI」のホワイトスペースマップ
+# や、出願人別の絞り込みができるようになる。
+
+def load_claims_with_metadata_csv(csv_text):
+    """
+    請求項本文とメタデータ（出願人・FI等）を両方持つCSVを読み込む。
+    列名: id（省略可）, 出願人（または出願人/権利者）, FI（またはFI/IPC）,
+          請求項本文, 発明の名称（任意）, 出願日（任意）, 特許番号（任意）
+    """
+    import csv
+    import io
+    from datetime import datetime
+
+    def _split_multi(value, seps=("／", "、", ",", ";", "；")):
+        if not value:
+            return []
+        text = value
+        for s in seps[1:]:
+            text = text.replace(s, seps[0])
+        return [v.strip() for v in text.split(seps[0]) if v.strip()]
+
+    def _parse_date(value):
+        if not value:
+            return None
+        value = value.strip().replace("/", "-").replace(".", "-")
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    records = []
+    for i, row in enumerate(reader):
+        text = (row.get("請求項本文") or row.get("text") or "").strip()
+        if not text:
+            continue
+        rid = row.get("id") or row.get("特許番号") or f"行{i+1}"
+        applicant_raw = row.get("出願人") or row.get("出願人/権利者") or ""
+        fi_raw = row.get("FI/IPC") or row.get("FI") or ""
+        records.append({
+            "id": rid,
+            "出願人": _split_multi(applicant_raw),
+            "FI": _split_multi(fi_raw),
+            "請求項本文": text,
+            "発明の名称": (row.get("発明の名称") or "").strip(),
+            "出願日": _parse_date(row.get("出願日", "")),
+            "特許番号": (row.get("特許番号") or "").strip(),
+        })
+    return records
+
+
+def build_claims_metadata_database(records, show_progress=True):
+    """
+    load_claims_with_metadata_csv() の結果から、各行の請求項本文を
+    SAO解析し、メタデータ（出願人・FI等）と合わせたデータベースを作る。
+    """
+    database = []
+    total = len(records)
+    for i, r in enumerate(records):
+        if show_progress:
+            print(f"[{i+1}/{total}] {r['id']} を解析中...")
+        try:
+            _, relations = analyze_claim(r["請求項本文"])
+        except Exception as e:
+            if show_progress:
+                print(f"  → 解析エラー、スキップします: {e}")
+            continue
+        entry = dict(r)
+        entry["relations"] = relations
+        entry["text"] = r["請求項本文"]
+        database.append(entry)
+    return database
