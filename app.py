@@ -542,13 +542,13 @@ with tab4:
         st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
-            "🗺️ 海図（ATLAS）",
-            "🐡 群れ探査（Explorer）", "🌊 深海海流マップ（Saturn V）",
-            "🪸 珊瑚礁分類（CORE）", "🐙 生態プロファイル",
+            "📊 基礎統計",
+            "🔍 キーワード分析", "🗺️ 類似度マップ",
+            "🧩 分類マップ", "🏢 出願人比較",
         ])
 
         with sub_tab_atlas:
-            st.caption("🧭 出願の海を一望する海図。件数の潮流・出願人という船団・FIという漁場を俯瞰します。")
+            st.caption("出願件数の推移、出願人ランキング、FIランキングなど、基本的な統計を確認できます。")
             has_metadata = any(e.get("出願日") for e in db)
             if not has_metadata:
                 st.info("このデータベースには出願日等のメタデータがありません。「フルメタデータCSV」を選んで構築してください。")
@@ -582,55 +582,9 @@ with tab4:
                     except Exception as e:
                         st.error(f"バブルチャート作成中にエラーが発生しました: {e}")
 
-                st.divider()
-                st.markdown("#### 🕸️ 出願人×FI レーダーチャート")
-                axis_selection_1 = st.radio("軸の選び方", ["複数社共通（おすすめ）", "全体件数順"], horizontal=True, key="atlas_radar_axis_selection")
-                top_applicants_n = st.slider("対象にする出願人数（出願件数が多い順）", min_value=2, max_value=10, value=3, key="atlas_radar_applicants")
-                top_fi_n = st.slider("軸にするFIの数（出現件数が多い順）", min_value=3, max_value=30, value=8, key="atlas_radar_fi")
-                if st.button("🕸️ レーダーチャートを作る", key="atlas_radar_run"):
-                    try:
-                        profiles = pp.build_applicant_fi_radar_data(
-                            db, fi_level=fi_level, top_applicants=top_applicants_n, top_fi=top_fi_n,
-                            axis_selection="複数社共通" if axis_selection_1.startswith("複数社") else "全体件数順",
-                        )
-                        st.session_state.atlas_radar_result = profiles
-                    except Exception as e:
-                        st.error(f"レーダーチャート作成中にエラーが発生しました: {e}")
-                if st.session_state.get("atlas_radar_result"):
-                    fig = pp.plot_radar_chart(st.session_state.atlas_radar_result, title=f"出願人×FI（{fi_level}）")
-                    st.pyplot(fig)
-
-                st.divider()
-                st.markdown("#### 🌪️ MEGA：動態分析（活動量×勢い）")
-                st.caption("直近の出願件数（活動量）と、その伸び率（勢い）から、リーダー・新興・成熟・衰退のどのフェーズにあるかを診断します。")
-                mega_group_by = st.radio("グループの単位", ["出願人", "FI"], horizontal=True, key="mega_group_by")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    mega_recent = st.slider("直近とみなす年数", min_value=1, max_value=5, value=3, key="mega_recent")
-                with col2:
-                    mega_compare = st.slider("比較対象の年数", min_value=1, max_value=5, value=3, key="mega_compare")
-                with col3:
-                    mega_top_n = st.slider("表示する件数", min_value=3, max_value=30, value=10, key="mega_top_n")
-                if st.button("🌪️ MEGAを診断する", key="mega_run"):
-                    try:
-                        mega_data, latest_year = pp.compute_activity_momentum(
-                            db, group_by=mega_group_by, recent_years=mega_recent, compare_years=mega_compare
-                        )
-                        if not mega_data:
-                            st.warning("出願日のデータが見つかりませんでした。")
-                        else:
-                            st.session_state.mega_result = (mega_data, latest_year)
-                    except Exception as e:
-                        st.error(f"MEGA診断中にエラーが発生しました: {e}")
-                if st.session_state.get("mega_result") is not None:
-                    mega_data, latest_year = st.session_state.mega_result
-                    st.caption(f"最新の出願年（{latest_year}年）を基準に計算しています。")
-                    fig = pp.plot_mega_chart(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
-                    st.pyplot(fig)
-
         # --- Explorer ---
         with sub_tab_explorer:
-            st.caption("🐡 CSV全結果をまとめた1つのワードクラウド、または出願人ごとのワードクラウドを表示します。")
+            st.caption("CSV全体をまとめたワードクラウド、または出願人ごとのワードクラウドを表示します。")
             kind = st.radio("対象にするキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
@@ -654,7 +608,7 @@ with tab4:
 
         # --- Saturn V ---
         with sub_tab_saturn:
-            st.caption("🌊 意味の海流に乗せて、特許たちを漂わせます。似た内容の発明ほど、潮に流されて近くに寄り集まります。")
+            st.caption("特許同士の意味的な近さに基づいて地図上に配置します。似た内容の発明ほど近くに配置されます。")
             if st.button("🐋 マップを作成する", key="saturn_run"):
                 try:
                     points, var = pp.build_semantic_map(db)
@@ -694,7 +648,7 @@ with tab4:
 
         # --- CORE ---
         with sub_tab_core:
-            st.caption("🪸 発明の名称から自動抽出したキーワードと、FIサブクラスのマス目に特許を住まわせます。誰も住んでいない白いマスが、まだ誰も棲みついていない空白地帯です。")
+            st.caption("発明の名称から自動抽出したキーワードとFIサブクラスのマス目に特許を分類します。件数が0のマスが、まだ誰も出願していないホワイトスペース候補です。")
             st.markdown("#### 🐚 自動ホワイトスペースマップ（発明の名称×FIサブクラス）")
             has_title_field = any(e.get("発明の名称") for e in db)
             if not has_title_field:
@@ -722,7 +676,7 @@ with tab4:
 
         # --- 構成部位ランキング・件数分布・レーダーチャート ---
         with sub_tab_rank:
-            st.caption("🐙 この海域によく生息する部位のランキング、群れの体格分布、そして群れ同士の生態比較です。")
+            st.caption("構成要素・動詞のランキング、出願人ごとの特徴比較（FIレーダーチャート）、動態分析（MEGA）を確認できます。")
             st.markdown("#### 🦑 構成部位ランキング（全体）")
             rank_kind = st.radio("ランキングの対象", ["構成要素", "動詞"], horizontal=True, key="rank_kind")
             if st.button("🦑 ランキングを作る", key="rank_run"):
@@ -754,4 +708,38 @@ with tab4:
                     st.session_state.radar_result = profiles
             if st.session_state.get("radar_result") is not None:
                 fig = pp.plot_radar_chart(st.session_state.radar_result, title=f"出願人×FI（{radar_fi_level}）")
+                st.pyplot(fig)
+
+            st.divider()
+
+            st.markdown("#### 🌪️ MEGA：動態分析（活動量×勢い）")
+            st.caption("直近の出願件数（活動量）と、その伸び率（勢い）から、リーダー・新興・成熟・衰退のどのフェーズにあるかを診断します。")
+            mega_group_by = st.radio("グループの単位", ["出願人", "FI"], horizontal=True, key="mega_group_by")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                mega_recent = st.slider("直近とみなす年数", min_value=1, max_value=5, value=3, key="mega_recent")
+            with col2:
+                mega_compare = st.slider("比較対象の年数", min_value=1, max_value=5, value=3, key="mega_compare")
+            with col3:
+                mega_top_n = st.slider("表示する件数", min_value=3, max_value=30, value=10, key="mega_top_n")
+            if st.button("🌪️ MEGAを診断する", key="mega_run"):
+                try:
+                    mega_data, latest_year, used_recent, used_compare = pp.compute_activity_momentum(
+                        db, group_by=mega_group_by, recent_years=mega_recent, compare_years=mega_compare
+                    )
+                    if not mega_data:
+                        st.warning("出願日のデータが見つかりませんでした。")
+                    else:
+                        st.session_state.mega_result = (mega_data, latest_year, used_recent, used_compare)
+                except Exception as e:
+                    st.error(f"MEGA診断中にエラーが発生しました: {e}")
+            if st.session_state.get("mega_result") is not None:
+                mega_data, latest_year, used_recent, used_compare = st.session_state.mega_result
+                st.caption(f"最新の出願年（{latest_year}年）を基準に計算しています。")
+                if used_recent != mega_recent or used_compare != mega_compare:
+                    st.caption(
+                        f"⚠️ データの年範囲が指定した期間より狭かったため、"
+                        f"直近{used_recent}年・比較{used_compare}年に自動調整しました。"
+                    )
+                fig = pp.plot_mega_chart(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
                 st.pyplot(fig)

@@ -4932,9 +4932,21 @@ def compute_activity_momentum(database, group_by="出願人", recent_years=3, co
 
     all_years = sorted({y for counts in year_counts.values() for y in counts.keys()})
     if not all_years:
-        return {}, None
+        return {}, None, recent_years, compare_years
 
     latest_year = all_years[-1]
+    earliest_year = all_years[0]
+    span = latest_year - earliest_year + 1
+
+    # 指定された期間（recent_years + compare_years）がデータの実際の
+    # 年範囲より広い場合、そのままでは「比較期間」に実績が存在せず、
+    # 全グループが判定不能な「新興」扱いに落ちてしまう。
+    # その場合は、実際の年範囲を半分ずつに自動で割り直す。
+    if span < recent_years + compare_years:
+        half = max(1, span // 2)
+        recent_years = half
+        compare_years = span - half if span - half > 0 else half
+
     recent_range = range(latest_year - recent_years + 1, latest_year + 1)
     compare_range = range(latest_year - recent_years - compare_years + 1, latest_year - recent_years + 1)
 
@@ -4953,7 +4965,7 @@ def compute_activity_momentum(database, group_by="出願人", recent_years=3, co
             "勢い": cagr,
             "年別件数": dict(sorted(counts.items())),
         }
-    return result, latest_year
+    return result, latest_year, recent_years, compare_years
 
 
 def classify_phase(activity, momentum, activity_threshold):
