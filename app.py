@@ -740,6 +740,34 @@ with tab5:
                     fig = pp.plot_radar_chart(st.session_state.atlas_radar_result, title=f"出願人×FI（{fi_level}）")
                     st.pyplot(fig)
 
+                st.divider()
+                st.markdown("#### 🌪️ MEGA：動態分析（活動量×勢い）")
+                st.caption("直近の出願件数（活動量）と、その伸び率（勢い）から、リーダー・新興・成熟・衰退のどのフェーズにあるかを診断します。")
+                mega_group_by = st.radio("グループの単位", ["出願人", "FI"], horizontal=True, key="mega_group_by")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    mega_recent = st.slider("直近とみなす年数", min_value=1, max_value=5, value=3, key="mega_recent")
+                with col2:
+                    mega_compare = st.slider("比較対象の年数", min_value=1, max_value=5, value=3, key="mega_compare")
+                with col3:
+                    mega_top_n = st.slider("表示する件数", min_value=3, max_value=30, value=10, key="mega_top_n")
+                if st.button("🌪️ MEGAを診断する", key="mega_run"):
+                    try:
+                        mega_data, latest_year = pp.compute_activity_momentum(
+                            db, group_by=mega_group_by, recent_years=mega_recent, compare_years=mega_compare
+                        )
+                        if not mega_data:
+                            st.warning("出願日のデータが見つかりませんでした。")
+                        else:
+                            st.session_state.mega_result = (mega_data, latest_year)
+                    except Exception as e:
+                        st.error(f"MEGA診断中にエラーが発生しました: {e}")
+                if st.session_state.get("mega_result") is not None:
+                    mega_data, latest_year = st.session_state.mega_result
+                    st.caption(f"最新の出願年（{latest_year}年）を基準に計算しています。")
+                    fig = pp.plot_mega_chart(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
+                    st.pyplot(fig)
+
         # --- Explorer ---
         with sub_tab_explorer:
             st.caption("🐡 2つの群れ（グループA・B）が、それぞれどんな言葉の縄張りを持っているかを泳ぎ回って探ります。")
@@ -856,6 +884,36 @@ with tab5:
                 fig = pp.plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ")
                 st.pyplot(fig)
                 st.caption("枠で囲まれた0件のマスが、まだ組み合わせのない技術（ホワイトスペース）の候補です。")
+
+            st.divider()
+            st.markdown("#### 🐚 自動ホワイトスペースマップ（発明の名称×FIサブクラス）")
+            st.caption(
+                "カテゴリの手入力は不要です。フルメタデータCSVの「発明の名称」から自動でキーワードを抽出し、"
+                "縦軸＝キーワード、横軸＝FIサブクラス（データに含まれる全種類）の出願件数マップを自動で作ります。"
+            )
+            has_title_field = any(e.get("発明の名称") for e in db)
+            if not has_title_field:
+                st.info("このデータベースには「発明の名称」がありません。「フルメタデータCSV」で構築してください。")
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    n_keywords = st.slider("縦軸のキーワード数", min_value=5, max_value=50, value=20, key="kwfi_n_keywords")
+                with col2:
+                    n_fi = st.slider("横軸のFI数", min_value=5, max_value=50, value=20, key="kwfi_n_fi")
+                kwfi_fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="kwfi_fi_level")
+                if st.button("🐚 自動でマップを作る", key="kwfi_run"):
+                    try:
+                        matrix_kw, kw_list, fi_list = pp.build_keyword_fi_matrix(
+                            db, top_keywords=n_keywords, top_fi=n_fi, fi_level=kwfi_fi_level
+                        )
+                        st.session_state.kwfi_result = (matrix_kw, kw_list, fi_list)
+                    except Exception as e:
+                        st.error(f"マップ作成中にエラーが発生しました: {e}")
+                if st.session_state.get("kwfi_result") is not None:
+                    matrix_kw, kw_list, fi_list = st.session_state.kwfi_result
+                    fig = pp.plot_keyword_fi_heatmap(matrix_kw, kw_list, fi_list, title="発明の名称×FI ホワイトスペースマップ")
+                    st.pyplot(fig)
+                    st.caption("色が濃いマスほど出願件数が多く、白いマスがホワイトスペース候補です。")
 
         # --- 構成部位ランキング・件数分布・レーダーチャート ---
         with sub_tab_rank:

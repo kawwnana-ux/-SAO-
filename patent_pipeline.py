@@ -4767,3 +4767,217 @@ def plot_keyword_landscape(points, title="キーワード地形図", grid_size=2
         spine.set_visible(False)
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㉚ キーワード×FIサブクラスのホワイトスペースマップ（全自動）
+# ============================================================
+# COREとは違い、カテゴリを手入力する必要がない。発明の名称から
+# 自動でキーワードを抽出し、縦軸＝キーワード、横軸＝FIサブクラス
+# （データに含まれる全種類）の出願件数マトリクスを自動で作る。
+# 色が濃いマスほど出願が多く、白いマスがホワイトスペース候補。
+
+def build_keyword_fi_matrix(database, top_keywords=25, top_fi=25, fi_level="サブクラス",
+                             title_field="発明の名称"):
+    """
+    database: build_full_database() 等の戻り値
+              （"発明の名称"と"FI"の両方を持つデータベース）
+
+    戻り値: (matrix, keyword_list, fi_list)
+        matrix: {(キーワード, FI): [id, id, ...], ...}
+        keyword_list: 縦軸に使うキーワード（出現件数が多い順）
+        fi_list: 横軸に使うFI（出現件数が多い順）
+    """
+    from collections import Counter
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    entry_keywords = []
+    keyword_counter = Counter()
+    fi_counter = Counter()
+    for entry in database:
+        title = entry.get(title_field, "") or ""
+        kws = extract_abstract_keywords(title) if title else set()
+        entry_keywords.append(kws)
+        keyword_counter.update(kws)
+        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
+
+    keyword_list = [w for w, _ in keyword_counter.most_common(top_keywords)]
+    fi_list = [f for f, _ in fi_counter.most_common(top_fi)]
+    keyword_set = set(keyword_list)
+    fi_set = set(fi_list)
+
+    matrix = {}
+    for entry, kws in zip(database, entry_keywords):
+        fis = {convert(v) for v in (entry.get("FI") or [])} & fi_set
+        for kw in kws & keyword_set:
+            for fi in fis:
+                matrix.setdefault((kw, fi), []).append(entry["id"])
+
+    return matrix, keyword_list, fi_list
+
+
+def plot_keyword_fi_heatmap(matrix, keyword_list, fi_list, title="キーワード×FI ホワイトスペースマップ"):
+    """build_keyword_fi_matrix() の結果をヒートマップにする"""
+    import numpy as np
+
+    arr = np.zeros((len(keyword_list), len(fi_list)), dtype=int)
+    for i, kw in enumerate(keyword_list):
+        for j, fi in enumerate(fi_list):
+            arr[i, j] = len(matrix.get((kw, fi), []))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(fi_list) * 0.5), max(6, len(keyword_list) * 0.35)))
+    im = ax.imshow(arr, cmap="YlOrRd", aspect="auto", vmin=0)
+    ax.set_xticks(range(len(fi_list)))
+    ax.set_xticklabels(fi_list, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(keyword_list)))
+    ax.set_yticklabels(keyword_list, fontproperties=FONT_PROP, fontsize=9)
+
+    vmax = arr.max() if arr.max() > 0 else 1
+    for i in range(len(keyword_list)):
+        for j in range(len(fi_list)):
+            val = int(arr[i, j])
+            if val == 0:
+                continue
+            ax.text(j, i, str(val), ha="center", va="center",
+                    color="black" if val < vmax / 2 else "white", fontsize=7)
+
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("出願件数", fontproperties=FONT_PROP)
+    plt.tight_layout()
+    return fig
+
+
+# ============================================================
+# ㉛ MEGA：動態分析（活動量×勢いのフェーズ診断）
+# ============================================================
+
+def compute_activity_momentum(database, group_by="出願人", recent_years=3, compare_years=3):
+    """
+    各グループ（出願人 or FI）ごとに、直近recent_years年間の
+    出願件数（活動量）と、その直前compare_years年間からのCAGR
+    （年平均成長率＝勢い）を計算する。
+
+    group_by: "出願人" または "FI"（どちらもリストを持つフィールド）
+    """
+    from collections import defaultdict
+
+    if group_by == "FI":
+        def get_groups(entry):
+            return {fi_to_subclass(v) for v in (entry.get("FI") or [])}
+    else:
+        def get_groups(entry):
+            return set(entry.get(group_by) or [])
+
+    year_counts = defaultdict(lambda: defaultdict(int))
+    for entry in database:
+        d = entry.get("出願日")
+        if d is None:
+            continue
+        for g in get_groups(entry):
+            year_counts[g][d.year] += 1
+
+    all_years = sorted({y for counts in year_counts.values() for y in counts.keys()})
+    if not all_years:
+        return {}, None
+
+    latest_year = all_years[-1]
+    recent_range = range(latest_year - recent_years + 1, latest_year + 1)
+    compare_range = range(latest_year - recent_years - compare_years + 1, latest_year - recent_years + 1)
+
+    result = {}
+    for g, counts in year_counts.items():
+        recent_total = sum(counts.get(y, 0) for y in recent_range)
+        compare_total = sum(counts.get(y, 0) for y in compare_range)
+        if compare_total > 0:
+            cagr = (recent_total / compare_total) ** (1.0 / recent_years) - 1
+        elif recent_total > 0:
+            cagr = 1.0  # 直前期間に実績がなく、直近だけ出願がある＝新興とみなす
+        else:
+            cagr = 0.0
+        result[g] = {
+            "活動量": recent_total,
+            "勢い": cagr,
+            "年別件数": dict(sorted(counts.items())),
+        }
+    return result, latest_year
+
+
+def classify_phase(activity, momentum, activity_threshold):
+    """活動量と勢いから、リーダー/新興/成熟/衰退の4象限に分類する"""
+    if activity >= activity_threshold:
+        return "リーダー" if momentum >= 0 else "成熟"
+    else:
+        return "新興" if momentum >= 0 else "衰退"
+
+
+def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme="deepsea"):
+    """
+    compute_activity_momentum() の結果を、活動量(x)×勢い(y)の
+    散布図にする。4象限がそれぞれ「リーダー・新興・成熟・衰退」に
+    対応し、点の位置からその技術・出願人が今どのフェーズにあるかが
+    分かる。
+    """
+    import numpy as np
+
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    items = sorted(mega_data.items(), key=lambda x: -x[1]["活動量"])[:top_n]
+    if not items:
+        raise ValueError("データが見つかりませんでした")
+
+    activities = [v["活動量"] for _, v in items]
+    momentums = [v["勢い"] for _, v in items]
+    activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    x_max = max(activities) * 1.3 + 1
+    y_max = max(max(momentums), 0.1) * 1.3
+    y_min = min(min(momentums), -0.1) * 1.3
+
+    # 4象限の背景色（薄く）
+    ax.axvspan(activity_threshold, x_max, 0.5, 1, color=palette[0], alpha=0.08)
+    ax.axvspan(0, activity_threshold, 0.5, 1, color=palette[1], alpha=0.08)
+    ax.axvspan(activity_threshold, x_max, 0, 0.5, color=palette[2], alpha=0.08)
+    ax.axvspan(0, activity_threshold, 0, 0.5, color=palette[3], alpha=0.08)
+
+    ax.axhline(0, color=grid, linewidth=1)
+    ax.axvline(activity_threshold, color=grid, linewidth=1, linestyle="--")
+
+    for i, (name, v) in enumerate(items):
+        color = palette[i % len(palette)]
+        ax.scatter(v["活動量"], v["勢い"], s=140, color=color, edgecolors=fg, linewidths=0.8, zorder=5)
+        ax.annotate(name, (v["活動量"], v["勢い"]), fontsize=9, fontproperties=FONT_PROP,
+                    color=fg, xytext=(6, 6), textcoords="offset points", zorder=6)
+
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel("活動量（直近の出願件数）", fontproperties=FONT_PROP, color=fg)
+    ax.set_ylabel("勢い（年平均成長率 CAGR）", fontproperties=FONT_PROP, color=fg)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(grid)
+
+    label_style = dict(fontproperties=FONT_PROP, fontsize=11, color=fg, alpha=0.6)
+    ax.text(x_max * 0.98, y_max * 0.92, "リーダー", ha="right", **label_style)
+    ax.text(activity_threshold * 0.4, y_max * 0.92, "新興", ha="center", **label_style)
+    ax.text(x_max * 0.98, y_min * 0.92, "成熟", ha="right", **label_style)
+    ax.text(activity_threshold * 0.4, y_min * 0.92, "衰退", ha="center", **label_style)
+
+    plt.tight_layout()
+    return fig
