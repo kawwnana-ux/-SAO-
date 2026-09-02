@@ -838,59 +838,8 @@ with tab5:
 
         # --- CORE ---
         with sub_tab_core:
-            st.caption("🪸 縦軸・横軸で区切った珊瑚礁のマス目に特許を住まわせます。誰も住んでいない白いマスが、まだ誰も棲みついていない空白地帯です。")
-            st.caption(
-                "各カテゴリを「カテゴリ名: キーワード1, キーワード2」の形で、1行に1カテゴリずつ入力してください。"
-                "そのカテゴリに割り当てるには、キーワードのうち1つでも含まれていればOKです。"
-            )
-            col1, col2 = st.columns(2)
-            with col1:
-                axis1_text = st.text_area(
-                    "縦軸のカテゴリ",
-                    height=150,
-                    placeholder="電気系: 電極, 温度センサ, 半導体層\n機構系: 車輪, アーム, ハンドル",
-                    key="axis1_text",
-                )
-            with col2:
-                axis2_text = st.text_area(
-                    "横軸のカテゴリ",
-                    height=150,
-                    placeholder="接続あり: 接続\n取り付けあり: 取り付け",
-                    key="axis2_text",
-                )
-
-            def _parse_axis(text):
-                axis = {}
-                for line in text.strip().split("\n"):
-                    if ":" not in line:
-                        continue
-                    name, kws = line.split(":", 1)
-                    keywords = [k.strip() for k in kws.split(",") if k.strip()]
-                    if name.strip() and keywords:
-                        axis[name.strip()] = {"any_of": keywords}
-                return axis
-
-            if st.button("🧬 分類する", key="core_run"):
-                axis1_formulas = _parse_axis(axis1_text)
-                axis2_formulas = _parse_axis(axis2_text)
-                if not axis1_formulas or not axis2_formulas:
-                    st.warning("縦軸・横軸の両方に、少なくとも1つのカテゴリを定義してください。")
-                else:
-                    matrix = pp.classify_patents(db, axis1_formulas, axis2_formulas)
-                    st.session_state.core_result = (matrix, list(axis1_formulas.keys()) + ["(未分類)"], list(axis2_formulas.keys()) + ["(未分類)"])
-
-            if st.session_state.get("core_result") is not None:
-                matrix, axis1_names, axis2_names = st.session_state.core_result
-                fig = pp.plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ")
-                st.pyplot(fig)
-                st.caption("枠で囲まれた0件のマスが、まだ組み合わせのない技術（ホワイトスペース）の候補です。")
-
-            st.divider()
+            st.caption("🪸 発明の名称から自動抽出したキーワードと、FIサブクラスのマス目に特許を住まわせます。誰も住んでいない白いマスが、まだ誰も棲みついていない空白地帯です。")
             st.markdown("#### 🐚 自動ホワイトスペースマップ（発明の名称×FIサブクラス）")
-            st.caption(
-                "カテゴリの手入力は不要です。フルメタデータCSVの「発明の名称」から自動でキーワードを抽出し、"
-                "縦軸＝キーワード、横軸＝FIサブクラス（データに含まれる全種類）の出願件数マップを自動で作ります。"
-            )
             has_title_field = any(e.get("発明の名称") for e in db)
             if not has_title_field:
                 st.info("このデータベースには「発明の名称」がありません。「フルメタデータCSV」で構築してください。")

@@ -4347,12 +4347,18 @@ def load_patent_metadata_csv(csv_text):
         # 新しいFIコードではなく、直前のコードの一部である。
         # 数字だけのトークンは、独立したコードとして分割せず、
         # 直前のコードに「,数字」の形でくっつける。
+        # 「＠」「@」はFIの展開記号に付随する記号で、数字にそのまま
+        # くっついていることがあるため（例：「101＠」）、判定の前に
+        # 取り除いておく（そうしないと"101＠"がisdigit()に失敗し、
+        # 独立した無効なコードとして混入してしまう）。
         if not value:
             return []
         text = value
         for s in seps[1:]:
             text = text.replace(s, seps[0])
         raw_tokens = [v.strip() for v in text.split(seps[0]) if v.strip()]
+        raw_tokens = [t.strip("＠@ \t") for t in raw_tokens]
+        raw_tokens = [t for t in raw_tokens if t]
 
         merged = []
         for t in raw_tokens:
