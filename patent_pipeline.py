@@ -4410,24 +4410,46 @@ def load_patent_metadata_csv(csv_text):
 
 def build_full_database(metadata_records, show_progress=True):
     """
-    load_patent_metadata_csv() の結果から、要約のSAO解析
-    （build_abstract_database相当）とメタデータを1つにまとめた
-    データベースを作る。ATLAS・MEGA・Saturn V・Explorer・COREの
-    すべてに共通して使える、一番リッチな形式。
-    """
-    abstract_records = [(r["id"], r["要約"]) for r in metadata_records if r.get("要約")]
-    abs_db = build_abstract_database(abstract_records, show_progress=show_progress)
-    abs_db_by_id = {e["id"]: e for e in abs_db}
+    load_patent_metadata_csv() の結果から、要約（あれば）と発明の名称の
+    両方からキーワードを抽出し、メタデータと1つにまとめたデータベースを
+    作る。ATLAS・MEGA・Saturn V・Explorer・COREのすべてに共通して
+    使える、一番リッチな形式。
 
+    要約が空の行でも、発明の名称からキーワード・埋め込みベクトルを
+    計算するので、キーワードが空になって後段のワードクラウド等が
+    エラーになることはない。
+    """
+    model = _get_embed_model()
+    total = len(metadata_records)
     database = []
-    for r in metadata_records:
+    for i, r in enumerate(metadata_records):
+        if show_progress:
+            print(f"[{i+1}/{total}] {r['id']} を解析中...")
         entry = dict(r)
-        abs_entry = abs_db_by_id.get(r["id"])
-        if abs_entry is not None:
-            entry["sections"] = abs_entry["sections"]
-            entry["keywords"] = abs_entry["keywords"]
-            entry["doc_embedding"] = abs_entry["doc_embedding"]
-            entry["text"] = abs_entry["text"]
+        title = (r.get("発明の名称") or "").strip()
+        abstract = (r.get("要約") or "").strip()
+        combined_text = (title + "。" + abstract) if abstract else title
+
+        try:
+            sections = parse_abstract(abstract) if abstract else {}
+            keywords = set()
+            for sec_text in sections.values():
+                keywords |= extract_abstract_keywords(sec_text)
+            if title:
+                keywords |= extract_abstract_keywords(title)
+            embed_source = combined_text or r["id"]
+            embedding = model.encode([embed_source], normalize_embeddings=True)[0]
+        except Exception as e:
+            if show_progress:
+                print(f"  → 解析エラー、スキップします: {e}")
+            keywords = set()
+            sections = {}
+            embedding = None
+
+        entry["sections"] = sections
+        entry["keywords"] = keywords
+        entry["doc_embedding"] = embedding
+        entry["text"] = combined_text
         database.append(entry)
     return database
 
@@ -5016,3 +5038,78 @@ def get_applicant_groups(database, top_n=5):
                 groups[a].append(entry["id"])
     # 出願件数の多い順を維持する
     return {a: groups[a] for a in top_applicants if a in groups}
+
+
+# ============================================================
+# ㉝ メタデータ（発明の名称・FI）だけで完結する分布・プロファイル
+# ============================================================
+# 請求項データベース（relationsを持つ）がなくても、
+# 「発明の名称」から抽出したキーワード数や、FIコード数を使って、
+# クレームの広さ・狭さの分布や、出願人ごとの特徴比較の代わりにする。
+
+def compute_metadata_distribution(database, ids=None, metric="キーワード数"):
+    """
+    請求項データベースを使わず、発明の名称のキーワード数や
+    FIコード数の分布を作る（compute_scope_distribution() の代わり）。
+
+    metric: "キーワード数"（発明の名称から抽出した語の種類数）
+            "FIコード数"（付与されているFIコードの種類数）
+    """
+    target_ids = set(ids) if ids is not None else None
+    scores = []
+    for entry in database:
+        if target_ids is not None and entry["id"] not in target_ids:
+            continue
+        if metric == "FIコード数":
+            value = len(set(entry.get("FI") or []))
+        else:
+            value = len(_entry_keywords(entry, kind="component"))
+        scores.append({"id": entry["id"], "value": value})
+    return scores
+
+
+def plot_metadata_distribution(scores, metric="キーワード数", title=None, theme="deepsea", bins=10):
+    """compute_metadata_distribution() の結果をヒストグラムにする"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    values = [s["value"] for s in scores]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.hist(values, bins=bins, color=bar, edgecolor=fg, alpha=0.85)
+    ax.set_xlabel(metric, fontproperties=FONT_PROP, color=fg)
+    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=fg)
+    ax.set_title(title or f"{metric}の分布", fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
+
+
+def compute_metadata_group_profile(database, ids):
+    """
+    請求項データベースを使わず、発明の名称・FIのメタデータだけで
+    グループ（出願人等）の特徴プロファイルを作る
+    （compute_group_profile() の代わり）。レーダーチャート用。
+    """
+    target_ids = set(ids)
+    entries = [e for e in database if e["id"] in target_ids]
+    if not entries:
+        return {}
+
+    avg_keywords = sum(len(_entry_keywords(e, kind="component")) for e in entries) / len(entries)
+    avg_fi = sum(len(set(e.get("FI") or [])) for e in entries) / len(entries)
+    unique_keywords = len(build_keyword_frequency(database, ids, kind="component"))
+    unique_fi = len({fi_to_subclass(v) for e in entries for v in (e.get("FI") or [])})
+
+    return {
+        "出願件数": len(entries),
+        "平均キーワード数": avg_keywords,
+        "平均FIコード数": avg_fi,
+        "キーワードの種類数": unique_keywords,
+        "FIサブクラスの種類数": unique_fi,
+    }

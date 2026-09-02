@@ -886,31 +886,42 @@ with tab5:
 
             st.divider()
 
-            st.markdown("#### 📈 クレームの広さ・狭さの分布")
-            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。")
-            if st.button("📈 分布を作る", key="dist_run"):
-                scores = pp.compute_scope_distribution(db)
-                if not scores:
-                    st.warning("請求項データベースを使ってください。")
-                else:
-                    st.session_state.dist_result = scores
+            st.markdown("#### 📈 分布（広さ・狭さ、またはFI/キーワード数）")
+            has_relations = any("relations" in e for e in db)
+            if has_relations:
+                st.caption("請求項データベースなので、クレームの広さ・狭さのスコアで分布を作ります。")
+                if st.button("📈 分布を作る", key="dist_run"):
+                    st.session_state.dist_result = ("scope", pp.compute_scope_distribution(db))
+            else:
+                st.caption("請求項データベースではないため、代わりにFIコード数（またはキーワード数）の分布を作ります。")
+                dist_metric = st.radio("分布の対象", ["FIコード数", "キーワード数"], horizontal=True, key="dist_metric")
+                if st.button("📈 分布を作る", key="dist_run"):
+                    st.session_state.dist_result = (dist_metric, pp.compute_metadata_distribution(db, metric=dist_metric))
             if st.session_state.get("dist_result") is not None:
-                fig = pp.plot_scope_distribution(st.session_state.dist_result)
-                st.pyplot(fig)
+                metric, scores = st.session_state.dist_result
+                if not scores:
+                    st.warning("分布を作れるデータが見つかりませんでした。")
+                elif metric == "scope":
+                    fig = pp.plot_scope_distribution(scores)
+                    st.pyplot(fig)
+                else:
+                    fig = pp.plot_metadata_distribution(scores, metric=metric)
+                    st.pyplot(fig)
 
             st.divider()
 
             st.markdown("#### 🕸️ 出願人ごとの特徴レーダーチャート比較（自動）")
-            st.caption("請求項データベースのみ使えます（要約データベースでは計算できません）。出願人情報があれば自動で上位を比較します。")
+            st.caption("出願人情報があれば自動で上位を比較します。請求項データベースがあればクレームの特徴を、無ければFI/キーワードの特徴を使います。")
             if st.button("🕸️ レーダーチャートを作る", key="radar_run"):
                 applicant_groups = pp.get_applicant_groups(db, top_n=5)
+                profile_fn = pp.compute_group_profile if has_relations else pp.compute_metadata_group_profile
                 if applicant_groups:
-                    profiles = {name: pp.compute_group_profile(db, ids) for name, ids in applicant_groups.items()}
+                    profiles = {name: profile_fn(db, ids) for name, ids in applicant_groups.items()}
                     profiles = {k: v for k, v in profiles.items() if v}
                 else:
-                    profiles = {"全体": pp.compute_group_profile(db, [e["id"] for e in db])}
+                    profiles = {"全体": profile_fn(db, [e["id"] for e in db])}
                 if not profiles or not any(profiles.values()):
-                    st.warning("請求項データベースを使ってください。")
+                    st.warning("レーダーチャートを作れるデータが見つかりませんでした。")
                 else:
                     st.session_state.radar_result = profiles
             if st.session_state.get("radar_result") is not None:
