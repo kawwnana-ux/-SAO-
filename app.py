@@ -741,6 +741,48 @@ with tab4:
                     st.pyplot(fig)
                     st.caption("色が濃いマスほど出願件数が多く、白いマスがホワイトスペース候補です。")
 
+            st.divider()
+            st.markdown("#### 🔮 キーワード→FI推薦（母集団作成支援）")
+            st.caption(
+                "入力したキーワードを含む特許を実際のデータから検索し、その特許群でよく使われている"
+                "FIを出現率つきで推薦します。J-PlatPatで検索条件（FI）を決める際の参考にしてください。"
+            )
+            fi_reco_keywords_text = st.text_input("キーワード（カンマ区切りで複数指定できます）", value="", key="fi_reco_keywords")
+            fi_reco_match_mode = st.radio(
+                "複数キーワードの扱い", ["いずれか（OR）", "すべて（AND）"], horizontal=True, key="fi_reco_match_mode"
+            )
+            fi_reco_fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="fi_reco_fi_level")
+            if st.button("🔮 FIを推薦する", key="fi_reco_run"):
+                kws = [k.strip() for k in fi_reco_keywords_text.split(",") if k.strip()]
+                if not kws:
+                    st.warning("キーワードを1つ以上入力してください。")
+                else:
+                    result = pp.recommend_fi_for_keywords(
+                        db, kws,
+                        match_mode="すべて" if fi_reco_match_mode.startswith("すべて") else "いずれか",
+                        fi_level=fi_reco_fi_level,
+                    )
+                    st.session_state.fi_reco_result = result
+            if st.session_state.get("fi_reco_result") is not None:
+                result = st.session_state.fi_reco_result
+                if result["matched_count"] == 0:
+                    st.warning("指定したキーワードを含む特許が見つかりませんでした。")
+                else:
+                    st.caption(f"キーワードにマッチした特許: {result['matched_count']}件")
+                    fig = pp.plot_fi_recommendations(result, title="キーワード→FI推薦")
+                    st.pyplot(fig)
+                    st.dataframe(
+                        [
+                            {
+                                "FI": r["FI"], "件数": r["件数"],
+                                "出現率": f'{r["スコア"]*100:.1f}%',
+                                "サンプルid": "、".join(r["サンプルid"]),
+                            }
+                            for r in result["recommendations"]
+                        ],
+                        hide_index=True, width='stretch',
+                    )
+
         # --- 構成部位ランキング・件数分布・レーダーチャート ---
         with sub_tab_rank:
             st.caption("構成要素・動詞のランキング、出願人ごとの特徴比較（FIレーダーチャート）、動態分析（MEGA）を確認できます。")

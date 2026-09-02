@@ -5648,3 +5648,113 @@ def build_claims_metadata_database(records, show_progress=True):
         entry["text"] = r["請求項本文"]
         database.append(entry)
     return database
+
+
+# ============================================================
+# ㊴ キーワード → FI推薦（J-PlatPat検索式の作成支援）
+# ============================================================
+# 単純なAI推測ではなく、「実際のデータの中で、そのキーワードを含む
+# 特許にどのFIが多く付与されているか」を統計的に集計し、根拠（出現率・
+# 実例）付きで推薦する。J-PlatPatで検索条件（FI）を決める際の
+# 参考情報として使う。
+
+def _entry_searchable_text(entry):
+    """
+    出願人検索用に、そのエントリが持っているテキスト情報
+    （発明の名称・要約・請求項本文）を全部つなげたものを返す。
+    """
+    parts = []
+    for field in ("発明の名称", "text", "請求項本文"):
+        v = entry.get(field)
+        if v:
+            parts.append(v)
+    return "".join(parts)
+
+
+def recommend_fi_for_keywords(database, keywords, match_mode="いずれか", fi_level="サブクラス", top_n=10):
+    """
+    指定したキーワードを含む特許を検索し、その特許群でよく使われている
+    FIを、出現率（スコア）付きで推薦する。
+
+    keywords: 検索したいキーワードのリスト
+    match_mode: "いずれか"（OR、キーワードのうち1つでも含まれていればよい）
+                "すべて"（AND、全部のキーワードを含む特許だけを対象にする。
+                キーワードの組み合わせによる推薦に使う）
+    fi_level: fi_to_subclass/fi_to_maingroupと同じ粒度指定
+
+    戻り値: {
+        "matched_count": マッチした特許の件数,
+        "recommendations": [
+            {"FI": .., "件数": .., "スコア": .., "サンプルid": [id, ...]}, ...
+        ]（スコアが高い順）
+    }
+    """
+    from collections import Counter, defaultdict
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    keywords = [k for k in keywords if k]
+    matched = []
+    for entry in database:
+        text = _entry_searchable_text(entry)
+        if not text:
+            continue
+        if match_mode == "すべて":
+            ok = all(kw in text for kw in keywords)
+        else:
+            ok = any(kw in text for kw in keywords)
+        if ok:
+            matched.append(entry)
+
+    fi_counter = Counter()
+    fi_examples = defaultdict(list)
+    for entry in matched:
+        fis = {convert(v) for v in (entry.get("FI") or [])}
+        for fi in fis:
+            fi_counter[fi] += 1
+            if len(fi_examples[fi]) < 5:
+                fi_examples[fi].append(entry["id"])
+
+    total = len(matched)
+    recommendations = []
+    for fi, count in fi_counter.most_common(top_n):
+        recommendations.append({
+            "FI": fi,
+            "件数": count,
+            "スコア": count / total if total else 0.0,
+            "サンプルid": fi_examples[fi],
+        })
+
+    return {"matched_count": total, "recommendations": recommendations}
+
+
+def plot_fi_recommendations(result, title="キーワード→FI推薦", theme="deepsea"):
+    """recommend_fi_for_keywords() の結果を横棒グラフ（出現率）にする"""
+    if theme == "deepsea":
+        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
+    else:
+        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
+
+    recs = list(reversed(result["recommendations"]))
+    labels = [f'{r["FI"]}（{r["件数"]}/{result["matched_count"]}件）' for r in recs]
+    values = [r["スコア"] * 100 for r in recs]
+
+    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    ax.barh(labels, values, color=bar)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontproperties=FONT_PROP, fontsize=9, color=fg)
+    ax.set_xlabel("出現率（%）", fontproperties=FONT_PROP, color=fg)
+    ax.set_xlim(0, 100)
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
+    ax.tick_params(colors=fg)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+    plt.tight_layout()
+    return fig
