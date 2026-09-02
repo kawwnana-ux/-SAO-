@@ -96,7 +96,7 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定"}
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向"}
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -187,8 +187,18 @@ def extract_patent_components_general(doc):
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
-        if token.pos_ in {"NOUN", "PROPN"}:
-            if _is_counter_word(token):
+        if token.pos_ in {"NOUN", "PROPN"} or (
+            token.pos_ == "NUM"
+            and i + 1 < len(doc)
+            and doc[i + 1].pos_ in {"NOUN", "PROPN"}
+            and not _is_counter_word(doc[i + 1])
+        ):
+            # 「三次元」のように、数詞がそのまま名詞の一部になっている
+            # 複合語（"第１の基板"のように間に"の"を挟まないもの）にも対応する。
+            # ただし「２枚」「１種」のような「数字＋助数詞」（この後に
+            # 「の」＋本当の名詞が続く）は、複合語の開始として扱わない
+            # （helper _is_counter_word で判定）。
+            if token.pos_ in {"NOUN", "PROPN"} and _is_counter_word(token):
                 i += 1
                 continue
             start = i
