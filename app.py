@@ -643,7 +643,8 @@ with tab4:
 
             if st.session_state.get("saturn_result") is not None:
                 points, var, groups = st.session_state.saturn_result
-                fig = pp.plot_semantic_map(points, var, groups=groups, title="意味的俯瞰マップ")
+                max_labels = st.slider("表示するラベル数（多いと重なって読みにくくなります）", min_value=0, max_value=min(200, len(points)), value=min(40, len(points)), key="saturn_max_labels")
+                fig = pp.plot_semantic_map(points, var, groups=groups, title="意味的俯瞰マップ", max_labels=max_labels if max_labels > 0 else None)
                 st.pyplot(fig)
                 st.caption("意味的に近い特許同士が近くに配置されます。距離が近いほど、内容が似ていることを示します。")
 

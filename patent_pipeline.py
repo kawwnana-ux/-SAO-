@@ -3863,12 +3863,17 @@ def build_semantic_map(database, n_components=2):
     return points, pca.explained_variance_ratio_
 
 
-def plot_semantic_map(points, explained_variance=None, groups=None, title="意味的俯瞰マップ", theme="deepsea"):
+def plot_semantic_map(points, explained_variance=None, groups=None, title="意味的俯瞰マップ",
+                       theme="deepsea", max_labels=40):
     """
     build_semantic_map() の結果を、散布図として描画する。
 
     groups: {id: グループ名, ...} を渡すと、グループごとに色分けする
             （例：自社 vs 競合の比較地図にする場合）。
+    max_labels: ラベル（文献番号等）を表示する点の最大数。
+                点の数がこれを超える場合、ラベルはランダムに間引いて
+                表示する（全部表示すると重なって読めなくなるため）。
+                Noneを指定すると、件数に関わらず全部表示する。
     """
     if theme == "deepsea":
         bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
@@ -3895,7 +3900,14 @@ def plot_semantic_map(points, explained_variance=None, groups=None, title="意�
         ys = [p["y"] for p in points]
         ax.scatter(xs, ys, s=90, alpha=0.85, color=palette[0], edgecolors=fg, linewidths=0.6)
 
-    for p in points:
+    if max_labels is not None and len(points) > max_labels:
+        import random
+        rng = random.Random(0)
+        labeled_points = rng.sample(points, max_labels)
+    else:
+        labeled_points = points
+
+    for p in labeled_points:
         ax.annotate(str(p["id"]), (p["x"], p["y"]), fontsize=8, fontproperties=FONT_PROP,
                     color=fg, xytext=(4, 4), textcoords="offset points")
 
