@@ -18,10 +18,6 @@ if "single_result" not in st.session_state:
     st.session_state.single_result = None
 if "compare_result" not in st.session_state:
     st.session_state.compare_result = None
-if "patent_db" not in st.session_state:
-    st.session_state.patent_db = None
-if "search_results" not in st.session_state:
-    st.session_state.search_results = None
 if "dependent_result" not in st.session_state:
     st.session_state.dependent_result = None
 if "abstract_db" not in st.session_state:
@@ -141,8 +137,8 @@ st.markdown(
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索",
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🪸 1つの請求項を解析", "🐚 2つの請求項を比較",
     "🪼 従属請求項を展開", "🔭 ポートフォリオ分析",
 ])
 
@@ -364,122 +360,9 @@ with tab2:
 
 
 # ============================================================
-# タブ③：複数の請求項をデータベース化して、1件をまとめて検索する
+# タブ③：従属請求項を、親請求項の内容も含めて完全な形に展開する
 # ============================================================
 with tab3:
-    st.subheader("🗄️ ステップ１：比較対象の請求項をまとめて登録する")
-    st.caption(
-        "CSVファイル（列名: id, text）をアップロードするか、"
-        "下のテキストエリアに「-----」で区切って複数の請求項を貼り付けてください。"
-    )
-
-    uploaded_csv = st.file_uploader("CSVファイル（id, text の2列）", type=["csv"])
-    bulk_text = st.text_area(
-        "またはここに、請求項を「-----」で区切って貼り付ける",
-        height=180,
-        placeholder="1件目の請求項テキスト...\n-----\n2件目の請求項テキスト...\n-----\n3件目の請求項テキスト...",
-        key="bulk_text",
-    )
-
-    if st.button("📚 データベースを構築する", key="build_db_run"):
-        records = []
-        if uploaded_csv is not None:
-            import csv
-            import io
-
-            content = uploaded_csv.getvalue().decode("utf-8-sig")
-            reader = csv.DictReader(io.StringIO(content))
-            for row in reader:
-                rid = row.get("id") or row.get("番号") or f"行{len(records)+1}"
-                text = row.get("text") or row.get("本文") or ""
-                if text.strip():
-                    records.append((rid, text.strip()))
-        elif bulk_text.strip():
-            parts = [p.strip() for p in bulk_text.split("-----") if p.strip()]
-            records = [(f"請求項{i+1}", p) for i, p in enumerate(parts)]
-
-        if not records:
-            st.warning("CSVのアップロード、またはテキストの貼り付けのどちらかを行ってください。")
-        else:
-            with st.spinner(f"{len(records)} 件を解析してデータベースを構築中...（初回は埋め込みモデルの読み込みに1分程度かかります）"):
-                try:
-                    db = pp.build_patent_database(records, show_progress=False)
-                    st.session_state.patent_db = db
-                    st.session_state.search_results = None
-                except Exception as e:
-                    st.error(f"データベース構築中にエラーが発生しました: {e}")
-                    st.session_state.patent_db = None
-
-    if st.session_state.patent_db is not None:
-        st.success(f"✅ {len(st.session_state.patent_db)} 件を登録済みです。")
-        with st.expander("登録済みの一覧を見る"):
-            st.dataframe(
-                [{"id": e["id"], "本文（先頭50文字）": e["text"][:50] + "..."} for e in st.session_state.patent_db],
-                width='stretch',
-                hide_index=True,
-            )
-
-    st.divider()
-
-    st.subheader("🔦 ステップ２：調べたい請求項を検索する")
-    query_text = st.text_area(
-        "検索したい請求項テキスト",
-        height=160,
-        key="query_text",
-    )
-    col_topk, col_rerank = st.columns(2)
-    with col_topk:
-        top_k = st.slider("粗い絞り込みで残す件数", min_value=3, max_value=30, value=10)
-    with col_rerank:
-        rerank_k = st.slider("精密な再評価をする件数（上位から）", min_value=1, max_value=10, value=5)
-
-    if st.button("🔍 検索する", key="search_run"):
-        if st.session_state.patent_db is None:
-            st.warning("先にステップ１でデータベースを構築してください。")
-        elif not query_text.strip():
-            st.warning("検索したい請求項テキストを入力してください。")
-        else:
-            with st.spinner("検索中..."):
-                try:
-                    results = pp.search_similar_claims(
-                        query_text, st.session_state.patent_db, top_k=top_k, rerank_k=rerank_k
-                    )
-                    st.session_state.search_results = results
-                except Exception as e:
-                    st.error(f"検索中にエラーが発生しました: {e}")
-                    st.session_state.search_results = None
-
-    if st.session_state.search_results is not None:
-        results = st.session_state.search_results
-        st.markdown(f"#### 🏆 検索結果（上位{len(results)}件）")
-
-        for i, r in enumerate(results):
-            has_precise = "precise_score" in r
-            score_label = f"精密スコア {r['precise_score']:.3f}" if has_precise else f"粗いスコア {r['fast_score']:.3f}"
-            with st.expander(f"{i+1}位　【{r['id']}】　{score_label}"):
-                st.write(r["text"])
-                st.caption(f"粗いスコア: {r['fast_score']:.3f}" + (f" ／ 精密スコア: {r['precise_score']:.3f}" if has_precise else ""))
-                if has_precise:
-                    matches_sorted = sorted(r["matches"], key=lambda x: -x[2])
-                    st.dataframe(
-                        [
-                            {
-                                "類似度": round(sim, 2),
-                                "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
-                                "クエリ側": " / ".join(ta),
-                                "この請求項側": " / ".join(tb),
-                            }
-                            for ta, tb, sim in matches_sorted
-                        ],
-                        width='stretch',
-                        hide_index=True,
-                    )
-
-
-# ============================================================
-# タブ④：従属請求項を、親請求項の内容も含めて完全な形に展開する
-# ============================================================
-with tab4:
     st.subheader("📜 ステップ１：請求項群を貼り付ける")
     st.caption(
         "実際の公報の書き方（【請求項１】【請求項２】…）のまま、"
@@ -561,19 +444,17 @@ with tab4:
 
 
 # ============================================================
-# タブ⑤：ポートフォリオ分析（Explorer / Saturn V / CORE）
+# タブ④：ポートフォリオ分析（Explorer / Saturn V / CORE）
 # ============================================================
-with tab5:
+with tab4:
     st.caption(
-        "このタブでは、タブ「🔦 まとめて検索」で構築した請求項データベース、"
-        "またはここで新しく作る「要約」データベースのどちらかを使えます。"
-        "要約はJ-PlatPat等で一括ダウンロードしやすいため、大量の分析に向いています。"
+        "このタブでは、「要約」データベース、または「フルメタデータCSV」のどちらかを使えます。"
+        "どちらもJ-PlatPat等で一括ダウンロードしやすいため、手作業なしで大量の分析ができます。"
     )
 
     db_source = st.radio(
         "使うデータベース",
         [
-            "請求項データベース（🔦タブで構築済みのもの）",
             "要約データベース（ここで新しく作る）",
             "フルメタデータCSV（出願日・出願人・FI等、ATLAS用）",
         ],
@@ -604,7 +485,7 @@ with tab5:
             st.success(f"✅ {len(st.session_state.abstract_db)} 件を登録済みです。")
         db = st.session_state.abstract_db
 
-    elif db_source.startswith("要約"):
+    else:
         st.markdown("#### 📄 要約をまとめて登録する")
         st.caption(
             "CSVファイル（列名: id, text）をアップロードするか、"
@@ -653,10 +534,6 @@ with tab5:
                     width='stretch', hide_index=True,
                 )
         db = st.session_state.abstract_db
-    else:
-        db = st.session_state.patent_db
-        if db is None:
-            st.info("先に「🔦 まとめて検索」タブでデータベースを構築してください。")
 
     if db is None:
         pass
@@ -751,58 +628,22 @@ with tab5:
 
         # --- Explorer ---
         with sub_tab_explorer:
-            st.caption("🐡 貼り付けたデータ全体のキーワードを泳ぎ回って探ります。出願人情報があれば、自動で上位の出願人同士を比較します。")
+            st.caption("🐡 貼り付けたデータ全体のキーワードを、CSV全結果をまとめた1つのワードクラウドにします。")
             kind = st.radio("対象にするキーワードの種類", ["構成要素＋動詞", "構成要素のみ", "動詞のみ"], horizontal=True, key="explorer_kind")
             kind_map = {"構成要素＋動詞": "both", "構成要素のみ": "component", "動詞のみ": "verb"}
 
-            applicant_groups = pp.get_applicant_groups(db, top_n=5)
-
             if st.button("🐠 解析する", key="explorer_run"):
-                if applicant_groups:
-                    names = list(applicant_groups.keys())
-                    result = pp.compare_keyword_groups(
-                        db, applicant_groups[names[0]], applicant_groups[names[1]] if len(names) > 1 else [],
-                        kind=kind_map[kind],
-                    )
-                    st.session_state.explorer_result = (result, names[0], names[1] if len(names) > 1 else None)
-                else:
-                    freq_all = pp.build_keyword_frequency(db, kind=kind_map[kind])
-                    st.session_state.explorer_result = (freq_all, None, None)
+                st.session_state.explorer_result = pp.build_keyword_frequency(db, kind=kind_map[kind])
 
             if st.session_state.get("explorer_result") is not None:
-                payload, name_a, name_b = st.session_state.explorer_result
-                if name_a is None:
-                    # 出願人情報がない場合：データ全体をまとめて1つのワードクラウドにする
-                    st.markdown("**全体のワードクラウド**")
-                    fig = pp.plot_wordcloud(payload, title="キーワード頻度（全体）")
-                    st.pyplot(fig)
-                    st.dataframe(
-                        [{"語": w, "件数": f} for w, f in payload.most_common(30)],
-                        hide_index=True, width='stretch',
-                    )
-                else:
-                    result = payload
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown(f"**{name_a}のワードクラウド**")
-                        fig = pp.plot_wordcloud(result["freq_a"], title=name_a)
-                        st.pyplot(fig)
-                    with col2:
-                        if name_b:
-                            st.markdown(f"**{name_b}のワードクラウド**")
-                            fig = pp.plot_wordcloud(result["freq_b"], title=name_b)
-                            st.pyplot(fig)
-
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.markdown(f"**共通する語（{len(result['common'])}件）**")
-                        st.dataframe([{"語": w, name_a: a, name_b or "B": b} for w, a, b in result["common"]], hide_index=True, width='stretch')
-                    with col2:
-                        st.markdown(f"**{name_a}だけの語（{len(result['only_a'])}件）**")
-                        st.dataframe([{"語": w, "件数": f} for w, f in result["only_a"]], hide_index=True, width='stretch')
-                    with col3:
-                        st.markdown(f"**{name_b or 'B'}だけの語（{len(result['only_b'])}件）**")
-                        st.dataframe([{"語": w, "件数": f} for w, f in result["only_b"]], hide_index=True, width='stretch')
+                freq_all = st.session_state.explorer_result
+                st.markdown("**全体のワードクラウド**")
+                fig = pp.plot_wordcloud(freq_all, title="キーワード頻度（全体）")
+                st.pyplot(fig)
+                st.dataframe(
+                    [{"語": w, "件数": f} for w, f in freq_all.most_common(30)],
+                    hide_index=True, width='stretch',
+                )
 
         # --- Saturn V ---
         with sub_tab_saturn:
@@ -901,19 +742,22 @@ with tab5:
 
             st.divider()
 
-            st.markdown("#### 🕸️ 出願人ごとの特徴レーダーチャート比較（自動）")
-            st.caption("発明の名称・要約から抽出したキーワードと、FIコードを使って特徴を比較します。出願人情報があれば自動で上位を比較します。")
+            st.markdown("#### 🕸️ 出願人ごとのFIレーダーチャート比較（自動）")
+            st.caption("出願人ごとに、よく使うFI（サブクラス等）の件数を軸にして比較します。出願人情報が必要です。")
+            radar_fi_level = st.radio("FIの粒度", ["サブクラス", "メイングループ", "そのまま"], horizontal=True, key="rank_radar_fi_level")
+            col1, col2 = st.columns(2)
+            with col1:
+                radar_top_applicants = st.slider("対象にする出願人数", min_value=2, max_value=10, value=5, key="rank_radar_applicants")
+            with col2:
+                radar_top_fi = st.slider("軸にするFIの数", min_value=3, max_value=10, value=6, key="rank_radar_fi_n")
             if st.button("🕸️ レーダーチャートを作る", key="radar_run"):
-                applicant_groups = pp.get_applicant_groups(db, top_n=5)
-                if applicant_groups:
-                    profiles = {name: pp.compute_metadata_group_profile(db, ids) for name, ids in applicant_groups.items()}
-                    profiles = {k: v for k, v in profiles.items() if v}
-                else:
-                    profiles = {"全体": pp.compute_metadata_group_profile(db, [e["id"] for e in db])}
-                if not profiles or not any(profiles.values()):
-                    st.warning("レーダーチャートを作れるデータが見つかりませんでした。")
+                profiles = pp.build_applicant_fi_radar_data(
+                    db, fi_level=radar_fi_level, top_applicants=radar_top_applicants, top_fi=radar_top_fi
+                )
+                if not profiles:
+                    st.warning("出願人情報が見つかりませんでした。フルメタデータCSVを使ってください。")
                 else:
                     st.session_state.radar_result = profiles
             if st.session_state.get("radar_result") is not None:
-                fig = pp.plot_radar_chart(st.session_state.radar_result)
+                fig = pp.plot_radar_chart(st.session_state.radar_result, title=f"出願人×FI（{radar_fi_level}）")
                 st.pyplot(fig)
