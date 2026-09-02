@@ -3923,6 +3923,64 @@ def plot_semantic_map(points, explained_variance=None, groups=None, title="意�
     return fig
 
 
+def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
+                                   title="意味的俯瞰マップ", theme="deepsea"):
+    """
+    plot_semantic_map() のインタラクティブ版（Plotly）。
+    普段は丸だけを表示し、カーソルを合わせた点だけ文献番号（id）を
+    ツールチップで表示する。戻り値は plotly.graph_objects.Figure で、
+    Streamlitでは st.plotly_chart(戻り値) で表示できる。
+    """
+    import plotly.graph_objects as go
+
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    fig = go.Figure()
+
+    if groups:
+        group_names = sorted(set(groups.values()))
+        color_of = {g: palette[i % len(palette)] for i, g in enumerate(group_names)}
+        for g in group_names:
+            pts = [p for p in points if groups.get(p["id"]) == g]
+            fig.add_trace(go.Scatter(
+                x=[p["x"] for p in pts], y=[p["y"] for p in pts],
+                mode="markers", name=g,
+                marker=dict(size=11, color=color_of[g], line=dict(width=1, color=fg)),
+                text=[p["id"] for p in pts],
+                hovertemplate="%{text}<extra>" + g + "</extra>",
+            ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=[p["x"] for p in points], y=[p["y"] for p in points],
+            mode="markers",
+            marker=dict(size=11, color=palette[0], line=dict(width=1, color=fg)),
+            text=[p["id"] for p in points],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+    xlabel = "第1主成分"
+    ylabel = "第2主成分"
+    if explained_variance is not None and len(explained_variance) >= 2:
+        xlabel = f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）"
+        ylabel = f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）"
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=xlabel, yaxis_title=ylabel,
+        plot_bgcolor=bg, paper_bgcolor=bg,
+        font=dict(color=fg),
+        xaxis=dict(gridcolor=grid, zerolinecolor=grid),
+        yaxis=dict(gridcolor=grid, zerolinecolor=grid),
+        legend=dict(bgcolor=bg, bordercolor=grid),
+    )
+    return fig
+
+
 # ============================================================
 # ㉓ CORE：論理式分類・ヒートマップ
 # ============================================================
@@ -5051,6 +5109,75 @@ def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme
     ax.text(activity_threshold * 0.4, y_min * 0.92, "衰退", ha="center", **label_style)
 
     plt.tight_layout()
+    return fig
+
+
+def plot_mega_chart_interactive(mega_data, title="MEGA：活動量×勢い", top_n=15, theme="deepsea"):
+    """
+    plot_mega_chart() のインタラクティブ版（Plotly）。
+    普段は丸だけを表示し、カーソルを合わせた点だけ出願人（またはFI）名を
+    ツールチップで表示する。戻り値は plotly.graph_objects.Figure。
+    """
+    import plotly.graph_objects as go
+
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    items = sorted(mega_data.items(), key=lambda x: -x[1]["活動量"])[:top_n]
+    if not items:
+        raise ValueError("データが見つかりませんでした")
+
+    names = [name for name, _ in items]
+    activities = [v["活動量"] for _, v in items]
+    momentums = [v["勢い"] for _, v in items]
+    activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
+
+    x_max = max(activities) * 1.3 + 1
+    y_max = max(max(momentums), 0.1) * 1.3
+    y_min = min(min(momentums), -0.1) * 1.3
+
+    fig = go.Figure()
+    # 4象限の背景色
+    fig.add_shape(type="rect", x0=activity_threshold, x1=x_max, y0=0, y1=y_max,
+                  fillcolor=palette[0], opacity=0.08, line_width=0)
+    fig.add_shape(type="rect", x0=0, x1=activity_threshold, y0=0, y1=y_max,
+                  fillcolor=palette[1], opacity=0.08, line_width=0)
+    fig.add_shape(type="rect", x0=activity_threshold, x1=x_max, y0=y_min, y1=0,
+                  fillcolor=palette[2], opacity=0.08, line_width=0)
+    fig.add_shape(type="rect", x0=0, x1=activity_threshold, y0=y_min, y1=0,
+                  fillcolor=palette[3], opacity=0.08, line_width=0)
+    fig.add_hline(y=0, line_color=grid)
+    fig.add_vline(x=activity_threshold, line_color=grid, line_dash="dash")
+
+    colors = [palette[i % len(palette)] for i in range(len(items))]
+    fig.add_trace(go.Scatter(
+        x=activities, y=momentums, mode="markers", text=names,
+        marker=dict(size=16, color=colors, line=dict(width=1, color=fg)),
+        hovertemplate="%{text}<br>活動量: %{x}<br>勢い: %{y:.2f}<extra></extra>",
+    ))
+
+    for label, x_pos, y_pos, anchor in [
+        ("リーダー", x_max * 0.98, y_max * 0.95, "right"),
+        ("新興", activity_threshold * 0.4, y_max * 0.95, "center"),
+        ("成熟", x_max * 0.98, y_min * 0.95, "right"),
+        ("衰退", activity_threshold * 0.4, y_min * 0.95, "center"),
+    ]:
+        fig.add_annotation(x=x_pos, y=y_pos, text=label, showarrow=False,
+                           font=dict(color=fg, size=13), opacity=0.6, xanchor=anchor)
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="活動量（直近の出願件数）", yaxis_title="勢い（年平均成長率 CAGR）",
+        plot_bgcolor=bg, paper_bgcolor=bg,
+        font=dict(color=fg),
+        xaxis=dict(gridcolor=grid, zerolinecolor=grid, range=[0, x_max]),
+        yaxis=dict(gridcolor=grid, zerolinecolor=grid, range=[y_min, y_max]),
+        showlegend=False,
+    )
     return fig
 
 

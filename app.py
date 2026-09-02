@@ -643,10 +643,9 @@ with tab4:
 
             if st.session_state.get("saturn_result") is not None:
                 points, var, groups = st.session_state.saturn_result
-                max_labels = st.slider("表示するラベル数（多いと重なって読みにくくなります）", min_value=0, max_value=min(200, len(points)), value=min(40, len(points)), key="saturn_max_labels")
-                fig = pp.plot_semantic_map(points, var, groups=groups, title="意味的俯瞰マップ", max_labels=max_labels if max_labels > 0 else None)
-                st.pyplot(fig)
-                st.caption("意味的に近い特許同士が近くに配置されます。距離が近いほど、内容が似ていることを示します。")
+                fig = pp.plot_semantic_map_interactive(points, var, groups=groups, title="意味的俯瞰マップ")
+                st.plotly_chart(fig, width='stretch')
+                st.caption("意味的に近い特許同士が近くに配置されます。点にカーソルを合わせると文献番号が表示されます。")
 
             st.divider()
             st.markdown("#### 🌋 キーワード地形図")
@@ -760,5 +759,5 @@ with tab4:
                         f"⚠️ データの年範囲が指定した期間より狭かったため、"
                         f"直近{used_recent}年・比較{used_compare}年に自動調整しました。"
                     )
-                fig = pp.plot_mega_chart(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
-                st.pyplot(fig)
+                fig = pp.plot_mega_chart_interactive(mega_data, title=f"MEGA：{mega_group_by}別の活動量×勢い", top_n=mega_top_n)
+                st.plotly_chart(fig, width='stretch')
