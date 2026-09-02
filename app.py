@@ -541,6 +541,24 @@ with tab4:
         all_ids = [e["id"] for e in db]
         st.success(f"✅ {len(db)} 件のデータベースを利用します。")
 
+        has_applicant_field = any(e.get("出願人") for e in db)
+        if has_applicant_field:
+            with st.expander("🏷️ 出願人の名寄せ（グループ会社をまとめる）"):
+                st.caption(
+                    "「東芝デバイス＆ストレージ株式会社」のような子会社・関連会社を、"
+                    "「東芝」のような親会社名にまとめます。カンマ区切りで、まとめたい語を指定してください。"
+                )
+                norm_keywords_text = st.text_input(
+                    "まとめる語（カンマ区切り）",
+                    value=", ".join(pp.DEFAULT_APPLICANT_GROUP_KEYWORDS),
+                    key="norm_keywords",
+                )
+                if st.button("🏷️ 名寄せを適用する", key="apply_norm_run"):
+                    keywords = [k.strip() for k in norm_keywords_text.split(",") if k.strip()]
+                    db = pp.apply_applicant_normalization(db, group_keywords=keywords)
+                    st.session_state.abstract_db = db
+                    st.success("名寄せを適用しました。")
+
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
             "📊 基礎統計",
             "🔍 キーワード分析", "🗺️ 類似度マップ",

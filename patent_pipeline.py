@@ -5147,3 +5147,48 @@ def compute_metadata_group_profile(database, ids):
         "キーワードの種類数": unique_keywords,
         "FIサブクラスの種類数": unique_fi,
     }
+
+
+# ============================================================
+# ㉞ 出願人の名寄せ（グループ会社をまとめる）
+# ============================================================
+# 「株式会社東芝」「東芝デバイス＆ストレージ株式会社」「東芝マテリアル
+# 株式会社」のような、同じグループの子会社・関連会社がバラバラの
+# 出願人として扱われてしまう問題に対応する。
+
+DEFAULT_APPLICANT_GROUP_KEYWORDS = ["富士電機", "三菱電機", "ローム", "東芝"]
+
+
+def normalize_applicant_name(name, group_keywords=None):
+    """
+    出願人名を、グループ会社に共通する親会社名に正規化する。
+    例：「東芝デバイス＆ストレージ株式会社」→「東芝」
+
+    group_keywords で指定した語のいずれかが出願人名に含まれていれば、
+    その語（＝親会社名）を正規化後の名前として返す。どれにも一致
+    しなければ、元の名前をそのまま返す。
+    複数の語に一致する場合は、一番長く一致した語を優先する
+    （誤って短い語に丸められるのを防ぐため）。
+    """
+    keywords = group_keywords if group_keywords is not None else DEFAULT_APPLICANT_GROUP_KEYWORDS
+    matched = [kw for kw in keywords if kw and kw in name]
+    if not matched:
+        return name
+    return max(matched, key=len)
+
+
+def apply_applicant_normalization(database, group_keywords=None, field="出願人"):
+    """
+    データベース全体の出願人名を正規化した、新しいデータベースを返す
+    （元のデータベースは変更しない）。正規化前の名前は
+    "{field}_元" というキーにそのまま保存しておく。
+    """
+    new_db = []
+    for entry in database:
+        new_entry = dict(entry)
+        original = entry.get(field) or []
+        normalized = sorted({normalize_applicant_name(n, group_keywords) for n in original})
+        new_entry[field] = normalized
+        new_entry[f"{field}_元"] = original
+        new_db.append(new_entry)
+    return new_db
