@@ -4624,3 +4624,146 @@ def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, fi_level="�
     ax.grid(True, color=s["grid"], alpha=0.2)
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㉘ 出願人×FI（IPCサブクラス等）のレーダーチャート
+# ============================================================
+
+def build_applicant_fi_radar_data(database, applicants=None, fi_level="サブクラス",
+                                   top_applicants=5, top_fi=6):
+    """
+    出願人ごとに、よく使うFI（サブクラス等）の件数をまとめ、
+    plot_radar_chart() にそのまま渡せる形（{出願人名: {FI名: 件数, ...}, ...}）
+    にする。
+
+    applicants: 対象にする出願人名のリスト（省略時は出現件数が多い順に
+                top_applicants件を自動選択する）
+    fi_level: fi_to_subclass/fi_to_maingroupと同じ粒度指定
+    top_fi: レーダーの軸として使うFIの数（出現件数が多い順に選ぶ）
+    """
+    from collections import Counter
+
+    if fi_level == "サブクラス":
+        convert = fi_to_subclass
+    elif fi_level == "メイングループ":
+        convert = fi_to_maingroup
+    else:
+        convert = lambda x: x
+
+    if applicants is None:
+        applicant_counter = Counter()
+        for entry in database:
+            applicant_counter.update(set(entry.get("出願人") or []))
+        applicants = [a for a, _ in applicant_counter.most_common(top_applicants)]
+
+    fi_counter = Counter()
+    for entry in database:
+        if not (set(entry.get("出願人") or []) & set(applicants)):
+            continue
+        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
+    fi_axes = [f for f, _ in fi_counter.most_common(top_fi)]
+
+    profiles = {}
+    for applicant in applicants:
+        counts = Counter()
+        for entry in database:
+            if applicant not in (entry.get("出願人") or []):
+                continue
+            counts.update({convert(v) for v in (entry.get("FI") or [])})
+        profiles[applicant] = {fi: counts.get(fi, 0) for fi in fi_axes}
+
+    return profiles
+
+
+# ============================================================
+# ㉙ キーワード地形図（等高線ヒートマップ）
+# ============================================================
+# よく出てくるキーワードを、意味の近さに基づいて地図上に配置し、
+# 頻度を「山の高さ」として等高線で表現する。密集している場所ほど
+# 赤く盛り上がった「山」になり、技術用語の集中地帯が一目で分かる。
+
+def build_keyword_landscape(database, top_n=40, kind="component"):
+    """
+    ポートフォリオ全体でよく出てくるキーワードを取り出し、
+    意味的な近さに基づいて2次元の座標を計算する。
+
+    戻り値: [{"word":.., "freq":.., "x":.., "y":..}, ...]
+    """
+    import numpy as np
+    from sklearn.decomposition import PCA
+
+    freq = build_keyword_frequency(database, kind=kind)
+    top_words = freq.most_common(top_n)
+    if not top_words:
+        return []
+
+    words = [w for w, _ in top_words]
+    freqs = [f for _, f in top_words]
+
+    model = _get_embed_model()
+    embeddings = model.encode(words, normalize_embeddings=True)
+
+    n_comp = min(2, max(len(words) - 1, 1))
+    pca = PCA(n_components=n_comp)
+    coords = pca.fit_transform(embeddings)
+    if coords.shape[1] < 2:
+        coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
+
+    points = []
+    for w, f, xy in zip(words, freqs, coords):
+        points.append({"word": w, "freq": f, "x": float(xy[0]), "y": float(xy[1])})
+    return points
+
+
+def plot_keyword_landscape(points, title="キーワード地形図", grid_size=200, bandwidth=None):
+    """
+    build_keyword_landscape() の結果を、等高線の地形図（ヒートマップ）
+    として描画する。山（赤い部分）が、意味的に近いキーワードが
+    密集している＝技術的に厚みのある領域を表す。
+    """
+    import numpy as np
+    import matplotlib.patheffects as pe
+
+    if not points:
+        raise ValueError("キーワードが見つかりませんでした")
+
+    xs = np.array([p["x"] for p in points])
+    ys = np.array([p["y"] for p in points])
+    freqs = np.array([p["freq"] for p in points], dtype=float)
+
+    x_pad = (xs.max() - xs.min()) * 0.25 + 1e-6
+    y_pad = (ys.max() - ys.min()) * 0.25 + 1e-6
+    x_lin = np.linspace(xs.min() - x_pad, xs.max() + x_pad, grid_size)
+    y_lin = np.linspace(ys.min() - y_pad, ys.max() + y_pad, grid_size)
+    X, Y = np.meshgrid(x_lin, y_lin)
+
+    if bandwidth is None:
+        span = max(xs.max() - xs.min(), ys.max() - ys.min())
+        bandwidth = span / 7 + 1e-6
+
+    Z = np.zeros_like(X)
+    for x, y, f in zip(xs, ys, freqs):
+        Z += f * np.exp(-((X - x) ** 2 + (Y - y) ** 2) / (2 * bandwidth ** 2))
+
+    fig, ax = plt.subplots(figsize=(11, 9))
+    ax.contourf(X, Y, Z, levels=30, cmap="turbo")
+    ax.contour(X, Y, Z, levels=12, colors="white", linewidths=0.3, alpha=0.35)
+
+    max_freq = freqs.max() if freqs.max() > 0 else 1
+    for p in points:
+        size = 9 + 9 * (p["freq"] / max_freq)
+        ax.text(
+            p["x"], p["y"], p["word"], fontsize=size, fontproperties=FONT_PROP,
+            ha="center", va="center", color="white",
+            path_effects=[pe.withStroke(linewidth=2.5, foreground="black")],
+            zorder=5,
+        )
+
+    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    plt.tight_layout()
+    return fig

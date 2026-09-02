@@ -724,6 +724,22 @@ with tab5:
                     except Exception as e:
                         st.error(f"バブルチャート作成中にエラーが発生しました: {e}")
 
+                st.divider()
+                st.markdown("#### 🕸️ 出願人×FI レーダーチャート")
+                top_applicants_n = st.slider("対象にする出願人数（出願件数が多い順）", min_value=2, max_value=10, value=3, key="atlas_radar_applicants")
+                top_fi_n = st.slider("軸にするFIの数（出現件数が多い順）", min_value=3, max_value=10, value=5, key="atlas_radar_fi")
+                if st.button("🕸️ レーダーチャートを作る", key="atlas_radar_run"):
+                    try:
+                        profiles = pp.build_applicant_fi_radar_data(
+                            db, fi_level=fi_level, top_applicants=top_applicants_n, top_fi=top_fi_n
+                        )
+                        st.session_state.atlas_radar_result = profiles
+                    except Exception as e:
+                        st.error(f"レーダーチャート作成中にエラーが発生しました: {e}")
+                if st.session_state.get("atlas_radar_result"):
+                    fig = pp.plot_radar_chart(st.session_state.atlas_radar_result, title=f"出願人×FI（{fi_level}）")
+                    st.pyplot(fig)
+
         # --- Explorer ---
         with sub_tab_explorer:
             st.caption("🐡 2つの群れ（グループA・B）が、それぞれどんな言葉の縄張りを持っているかを泳ぎ回って探ります。")
@@ -774,6 +790,23 @@ with tab5:
                 fig = pp.plot_semantic_map(points, var, groups=groups, title="意味的俯瞰マップ")
                 st.pyplot(fig)
                 st.caption("意味的に近い特許同士が近くに配置されます。距離が近いほど、内容が似ていることを示します。")
+
+            st.divider()
+            st.markdown("#### 🌋 キーワード地形図")
+            st.caption("よく出てくるキーワードを地図上に配置し、頻度を山の高さ（色）で表します。赤い山ほど、その技術用語が密集しています。")
+            landscape_kind = st.radio("地形図の対象", ["構成要素", "動詞"], horizontal=True, key="landscape_kind")
+            top_n = st.slider("表示するキーワード数", min_value=10, max_value=80, value=40, key="landscape_top_n")
+            if st.button("🌋 地形図を作る", key="landscape_run"):
+                try:
+                    points_lc = pp.build_keyword_landscape(
+                        db, top_n=top_n, kind="component" if landscape_kind == "構成要素" else "verb"
+                    )
+                    st.session_state.landscape_result = points_lc
+                except Exception as e:
+                    st.error(f"地形図作成中にエラーが発生しました: {e}")
+            if st.session_state.get("landscape_result"):
+                fig = pp.plot_keyword_landscape(st.session_state.landscape_result, title="キーワード地形図")
+                st.pyplot(fig)
 
         # --- CORE ---
         with sub_tab_core:
