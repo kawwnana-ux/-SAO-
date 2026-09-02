@@ -4342,27 +4342,24 @@ def load_patent_metadata_csv(csv_text):
     def _split_fi(value, seps=("；", ";", "、", ",")):
         # FIコード自体に「/」（メイングループ/サブグループの区切り）が
         # 含まれるため、出願人の分割とは違い「/」では分割しない。
-        # また、「Ｈ１０Ｋ８５／６０，１５０」のように、FIコードの後ろに
-        # コンマ＋数字だけの「展開記号（細分）」が続くことがあり、これは
-        # 新しいFIコードではなく、直前のコードの一部である。
-        # 数字だけのトークンは、独立したコードとして分割せず、
-        # 直前のコードに「,数字」の形でくっつける。
-        # 「＠」「@」はFIの展開記号に付随する記号で、数字にそのまま
-        # くっついていることがあるため（例：「101＠」）、判定の前に
-        # 取り除いておく（そうしないと"101＠"がisdigit()に失敗し、
-        # 独立した無効なコードとして混入してしまう）。
+        # 「＠Ｚ」「＠Ａ」等は、FIコードの正式な一部（展開記号）であり、
+        # ノイズではないので取り除かない。
+        # 一方、「Ｈ１０Ｋ８５／６０，１５０」や「Ｂ２３Ｋ３５／３０，３１０＠Ｃ」
+        # のように、FIコードの後ろにコンマ＋「数字（＋＠記号）」だけの
+        # 「展開記号（細分）」が続くことがあり、これは新しいFIコードでは
+        # なく、直前のコードの一部である。このパターンに一致するトークンは
+        # 独立したコードとして分割せず、直前のコードに結合する。
         if not value:
             return []
         text = value
         for s in seps[1:]:
             text = text.replace(s, seps[0])
         raw_tokens = [v.strip() for v in text.split(seps[0]) if v.strip()]
-        raw_tokens = [t.strip("＠@ \t") for t in raw_tokens]
-        raw_tokens = [t for t in raw_tokens if t]
 
+        sub_position_pattern = _re_dep.compile(r"^[0-9]+(?:[＠@][A-Za-zＡ-Ｚａ-ｚ0-9０-９]+)?$")
         merged = []
         for t in raw_tokens:
-            if t.isdigit() and merged:
+            if sub_position_pattern.match(t) and merged:
                 merged[-1] = merged[-1] + "," + t
             else:
                 merged.append(t)
