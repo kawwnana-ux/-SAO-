@@ -543,7 +543,7 @@ with tab4:
             col1, col2 = st.columns([3, 2])
             with col1:
                 st.markdown("#### 🪸 構成要素間の関係図")
-                graph = pp.build_graphviz(relations, title="構成要素間関係（展開後）", theme="deepsea")
+                graph = pp.build_graphviz(relations, title="構成要素間関係（展開後）", theme="deepsea", color_by="claim")
                 st.graphviz_chart(graph, width='stretch')
 
                 st.markdown("#### 🐙 クレームの広さ・狭さ")
@@ -684,9 +684,9 @@ with tab5:
         group_b_ids = _parse_ids(group_b_text, [i for i in all_ids if i not in group_a_ids])
 
         sub_tab_atlas, sub_tab_explorer, sub_tab_saturn, sub_tab_core, sub_tab_rank = st.tabs([
-            "🗺️ 基本統計分析",
-            "🐡 技術比較", "🌊 サーモグラフィ",
-            "🪸 ヒートマップ", "🐙 レーダーチャート",
+            "🗺️ 海図（ATLAS）",
+            "🐡 群れ探査（Explorer）", "🌊 深海海流マップ（Saturn V）",
+            "🪸 珊瑚礁分類（CORE）", "🐙 生態プロファイル",
         ])
 
         with sub_tab_atlas:

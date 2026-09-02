@@ -1393,6 +1393,21 @@ def extract_direct_relations(doc, components):
             fallback = find_target_component_from_verb(components, verb)
             head_component = fallback[0] if fallback else None
         if head_component is None:
+            # それでも見つからない場合、「Ｘは、…を検出し、…を算出する」の
+            # ように、この動詞自体は次の動詞（算出）に連なっているだけで
+            # 直接の相手を持たないように見えても、動詞自身の目的語（obj）が
+            # あれば、それをtargetとして使う。
+            own_obj = None
+            for child in verb.children:
+                if child.dep_ == "obj":
+                    own_obj = child
+                    break
+            if own_obj is not None:
+                head_component = (
+                    find_component_by_token(components, own_obj.i)
+                    or find_referenced_component(components, own_obj)
+                )
+        if head_component is None:
             continue
 
         if _is_passive(verb):
@@ -1938,6 +1953,7 @@ def _simplify_hierarchy(relations, doc=None, components=None):
                 "relation": "有する",
                 "target": s,
                 "type": "has",
+                "claim_number": r.get("claim_number"),
             })
             added.add(s)
         return relations + extra
@@ -2010,7 +2026,7 @@ def _simplify_hierarchy(relations, doc=None, components=None):
         own_relations = outgoing.get(s, [])
         if own_relations and all("設け" in x["relation"] for x in own_relations):
             continue
-        extra.append({"source": root, "relation": "有する", "target": s, "type": "has"})
+        extra.append({"source": root, "relation": "有する", "target": s, "type": "has", "claim_number": r.get("claim_number")})
         added.add(s)
 
     return simplified + extra
@@ -2334,10 +2350,41 @@ _DEEPSEA_PALETTE = [
 _DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
 
 
-def build_graphviz(final_relations, title=None, theme="deepsea"):
+def _assign_claim_colors(final_relations):
+    """
+    analyze_dependent_claim() が付与した claim_number を使って、
+    どのノードがどの請求項に由来するかを求め、請求項番号ごとに
+    違う色を割り当てる（同じ請求項の追加分は同じ色になる）。
+
+    ノードが複数の関係に登場する場合、一番小さい請求項番号
+    （＝一番早く登場した請求項）を採用する。
+    """
+    node_claim = {}
+    for r in final_relations:
+        num = r.get("claim_number")
+        if num is None:
+            continue
+        for n in (r["source"], r["target"]):
+            if n not in node_claim or num < node_claim[n]:
+                node_claim[n] = num
+
+    claim_numbers = sorted(set(node_claim.values()))
+    color_of_claim = {num: i % len(_BRANCH_PALETTE) for i, num in enumerate(claim_numbers)}
+
+    styles = {}
+    for n, num in node_claim.items():
+        styles[n] = _BRANCH_PALETTE[color_of_claim[num]]
+    return styles, node_claim
+
+
+def build_graphviz(final_relations, title=None, theme="deepsea", color_by="branch"):
     """
     analyze_claim()等が返した関係リストを、Graphvizのdotエンジンで
     階層型に自動レイアウトしたグラフとして組み立てる。
+
+    color_by: "branch"（既定。根から見た大枝ごとに色分け）、
+              "claim"（analyze_dependent_claim()の結果専用。
+              どの請求項番号に由来するノードかで色分けする）
 
     戻り値は graphviz.Digraph オブジェクト。
     Jupyter/Colabではそのまま表示でき、Streamlitでは
@@ -2364,7 +2411,17 @@ def build_graphviz(final_relations, title=None, theme="deepsea"):
     if len(G.nodes()) == 0:
         return g
 
-    node_styles, _root = _assign_branch_colors(G)
+    node_claim = {}
+    if color_by == "claim":
+        node_styles, node_claim = _assign_claim_colors(final_relations)
+        # claim_numberが分からないノード（孤立ノード補完の前に消えた等）は
+        # 通常の大枝ベースの色分けで補う
+        branch_styles, _root = _assign_branch_colors(G)
+        for n in G.nodes():
+            if n not in node_styles:
+                node_styles[n] = branch_styles.get(n, _BRANCH_PALETTE[0])
+    else:
+        node_styles, _root = _assign_branch_colors(G)
 
     palette = _DEEPSEA_PALETTE if theme == "deepsea" else _BRANCH_PALETTE
     root_style = _DEEPSEA_ROOT if theme == "deepsea" else _ROOT_STYLE
@@ -2384,8 +2441,12 @@ def build_graphviz(final_relations, title=None, theme="deepsea"):
     added = set()
     for n in G.nodes():
         style = _style_for(n)
+        label = n
+        if color_by == "claim" and n in node_claim:
+            label = f"【請求項{node_claim[n]}】\n{n}"
         g.node(
             n,
+            label=label,
             fillcolor=style["fill"],
             color=style["border"],
             fontcolor=style["font"],
@@ -3587,13 +3648,19 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
             # 孤立ノードを無理に根へ繋げる処理はまだかけない
             # （全部合体させたあとで、最後に1回だけ行う）
             _, relations, _ = _extract_raw_relations(fragment_text)
-        all_relations.extend(relations)
+        for r in relations:
+            r = dict(r)
+            r["claim_number"] = num
+            all_relations.append(r)
 
     seen_keys = set()
     unique_relations = []
     for r in all_relations:
         key = (r["source"], r["relation"], r["target"], r["type"])
         if key in seen_keys:
+            # 同じ関係が複数の請求項で繰り返し登場する場合、
+            # 一番最初（＝一番根本の請求項）に登場した方の
+            # claim_numberを採用する
             continue
         seen_keys.add(key)
         unique_relations.append(r)
