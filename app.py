@@ -137,9 +137,9 @@ st.markdown(
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🪸 1つの請求項を解析", "🐚 2つの請求項を比較",
-    "🪼 従属請求項を展開", "🔭 ポートフォリオ分析",
+    "🪼 従属請求項を展開", "🔭 ポートフォリオ分析", "📋 記載チェック",
 ])
 
 
@@ -174,6 +174,16 @@ with tab1:
     # 結果を表示
     if st.session_state.single_result is not None:
         relations = st.session_state.single_result["relations"]
+
+        confidence = pp.assess_claim_confidence(text)
+        level_emoji = {"高": "📗", "中": "📙", "低": "📕"}
+        st.markdown(f"#### {level_emoji[confidence['level']]} 信頼度：{confidence['level']}")
+        if confidence["reasons"]:
+            st.caption("以下のパターンが含まれているため、念のため本文と照らし合わせることをおすすめします。")
+            for r in confidence["reasons"]:
+                st.write(f"- {r}")
+        else:
+            st.caption("既知の弱点パターンには当てはまりませんでした。抽出結果をそのまま信頼しやすい請求項です。")
 
         if not relations:
             st.info("関係が抽出できませんでした。文の書き方を見直してみてください。")
@@ -902,3 +912,74 @@ with tab4:
                         ],
                         hide_index=True, width='stretch',
                     )
+
+
+# ============================================================
+# タブ⑤：記載チェック（「前記」整合性・明確性リスク）
+# ============================================================
+with tab5:
+    st.subheader("📋 記載チェック")
+    st.caption(
+        "SAO抽出の精度とは別に、実際の知財実務でチェックされている観点（「前記」参照の整合性、"
+        "明確性要件違反になりやすい表現）を自動で検出します。"
+    )
+
+    check_mode = st.radio("チェックの種類", ["「前記」整合性チェック", "明確性リスクチェック"], horizontal=True, key="check_mode")
+
+    if check_mode == "「前記」整合性チェック":
+        st.markdown("#### 「前記Ｘ」「該Ｘ」が、従属先に一度も登場していないかを確認します")
+        st.caption(
+            "複数の請求項を「【請求項１】〜」の形式で貼り付けてください。"
+            "指定した請求項番号について、その従属先（さらにその従属先）を遡って「前記」の整合性を確認します。"
+        )
+        claims_block_text = st.text_area(
+            "請求項全文（【請求項１】〜の形式）",
+            height=220,
+            placeholder="【請求項1】\n…を備えることを特徴とする多機能ペン。\n【請求項2】\n前記…は、…であることを特徴とする請求項1に記載の多機能ペン。",
+            key="zenki_claims_text",
+        )
+        target_claim_num = st.number_input("チェックしたい請求項番号", min_value=1, value=1, step=1, key="zenki_target")
+        if st.button("📋 チェックする", key="zenki_check_run"):
+            if not claims_block_text.strip():
+                st.warning("請求項全文を入力してください。")
+            else:
+                try:
+                    claims_dict = pp.parse_claims_block(claims_block_text)
+                    if target_claim_num not in claims_dict:
+                        st.error(f"請求項{target_claim_num}が見つかりませんでした。認識した請求項番号: {sorted(claims_dict.keys())}")
+                    else:
+                        warnings = pp.check_zenki_consistency(target_claim_num, claims_dict)
+                        st.session_state.zenki_result = warnings
+                except Exception as e:
+                    st.error(f"チェック中にエラーが発生しました: {e}")
+        if st.session_state.get("zenki_result") is not None:
+            warnings = st.session_state.zenki_result
+            if not warnings:
+                st.success("✅ 「前記」の不整合は見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(warnings)} 件の疑わしい箇所が見つかりました。")
+                for w in warnings:
+                    st.write(f"- 請求項{w['claim_number']}で「前記{w['term']}」（または「該{w['term']}」）と記載されていますが、"
+                             f"「{w['term']}」がそれより前（従属先を含む）に登場していません。")
+
+    else:
+        st.markdown("#### 明確性要件違反になりやすい表現を検出します")
+        clarity_text = st.text_area(
+            "請求項テキスト",
+            height=180,
+            placeholder="例：所定の条件を満たす場合に、適切な処理を行う制御手段を備える装置。",
+            key="clarity_text",
+        )
+        if st.button("📋 チェックする", key="clarity_check_run"):
+            if not clarity_text.strip():
+                st.warning("請求項テキストを入力してください。")
+            else:
+                st.session_state.clarity_result = pp.check_clarity_risks(clarity_text)
+        if st.session_state.get("clarity_result") is not None:
+            findings = st.session_state.clarity_result
+            if not findings:
+                st.success("✅ 既知のリスクパターンは見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(findings)} 件の注意点が見つかりました。")
+                for f in findings:
+                    st.write(f"- **「{f['phrase']}」**：{f['reason']}")

@@ -1385,6 +1385,48 @@ def extract_direct_relations(doc, components):
             # 別途処理しているのでここでは扱わない（重複防止）
             continue
 
+        # 「ＡはＢに対して〜される」のような、動詞が「に対して」格を
+        # 持つ受身文は、その「に対して」格こそが本当のtarget（何に対して
+        # 行われるか）であり、nsubj（受け手として書かれている方）が
+        # sourceになる。これは通常の受身（head=target）とは逆のパターン
+        # なので、他の処理より先に、専用のロジックで処理する。
+        if _is_passive(verb):
+            taisite_obl = None
+            for child in verb.children:
+                if child.dep_ == "obl":
+                    for c2 in child.children:
+                        if c2.dep_ == "case" and any(
+                            gc.dep_ == "fixed" and gc.text in ("対し", "対して")
+                            for gc in c2.children
+                        ):
+                            taisite_obl = child
+                            break
+                if taisite_obl is not None:
+                    break
+            if taisite_obl is not None:
+                nsubj_tok = None
+                for child in verb.children:
+                    if child.dep_ == "nsubj":
+                        nsubj_tok = child
+                        break
+                if nsubj_tok is not None:
+                    source_c = (
+                        find_component_by_token(components, nsubj_tok.i)
+                        or find_referenced_component(components, nsubj_tok)
+                    )
+                    target_c = (
+                        find_component_by_token(components, taisite_obl.i)
+                        or find_referenced_component(components, taisite_obl)
+                    )
+                    if source_c is not None and target_c is not None and source_c["text"] != target_c["text"]:
+                        relations.append({
+                            "source": source_c["text"],
+                            "relation": verb.text,
+                            "target": target_c["text"],
+                            "type": "direct",
+                        })
+                        continue
+
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
         if head_component is None:
@@ -1463,10 +1505,40 @@ def extract_direct_relations(doc, components):
                         if passive_target is not head_component:
                             break
 
+            # 「ＡはＢによりＣに対して位置決めされる」のような、手段格
+            # （により）と対象格（に対して）を同時に持つ受身文に対応する。
+            # 「により」は動作の手段であって、動作主でも受け手でもないので
+            # source/targetの候補から完全に除外する。
+            # 「に対して」は動作の対象（＝実質的な受け手）を表すので、
+            # 見つかった場合はそちらをtargetとして最優先で使う。
+            means_oblique_idx = set()
+            taishite_target = None
+            for child in verb.children:
+                if child.dep_ != "obl":
+                    continue
+                fixed_texts = {gc.text for gc in child.children if gc.dep_ == "fixed"}
+                if "より" in fixed_texts:
+                    means_oblique_idx.add(child.i)
+                elif "対し" in fixed_texts:
+                    means_oblique_idx.add(child.i)
+                    if taishite_target is None:
+                        comp = (
+                            find_component_by_token(components, child.i)
+                            or find_referenced_component(components, child)
+                        )
+                        if comp is not None:
+                            taishite_target = comp
+            if taishite_target is not None:
+                passive_target = taishite_target
+
             source_candidates = []
             for child in verb.children:
                 if topic_obl is not None and child.i == topic_obl.i:
                     # targetとして使った語は、sourceの候補には入れない
+                    continue
+                if child.i in means_oblique_idx:
+                    # 「により」「に対して」で係る語は、上ですでに処理済み
+                    # なので、通常のsource候補としては扱わない
                     continue
                 if child.dep_ in ("obl", "nsubj"):
                     source_candidates.append(child)
@@ -1589,19 +1661,29 @@ def extract_direct_relations(doc, components):
                 if child.dep_ != "obj":
                     continue
 
-                # 「Ａ及びＢを含み」のように、objの前に「及び」等で
-                # 繋がれた項目がある場合、それはGiNZAの解析上、objの
-                # nmod修飾語として表れる。見逃さないよう、objの前に
-                # 「及び」「又は」等のcc（等位接続）子がある場合は、
-                # そのnmod修飾語も対象に加える。
+                # 「Ａ、Ｂ、Ｃ及びＤを含み」のように、objの前に「及び」等で
+                # 繋がれた項目が複数ある場合、それはGiNZAの解析上、
+                # 「及び」に近い項目からobjに向かって、nmod修飾語の連鎖
+                # として表れる（Ａ→Ｂ→Ｃ→Ｄのように、途中には「及び」が
+                # 付かないことが多い）。objの直接の子に「及び」「又は」
+                # 等のcc（等位接続）子が見つかったら、これは列挙だと
+                # 判断し、そこから続くnmodの連鎖を全部たどる。
                 obj_candidates = [child]
-                for nm in child.children:
-                    if nm.dep_ == "nmod" and nm.i < child.i:
-                        has_cc_between = any(
-                            gc.dep_ == "cc" and nm.i < gc.i < child.i for gc in child.children
-                        )
-                        if has_cc_between:
-                            obj_candidates.append(nm)
+                has_enum_cc = any(gc.dep_ == "cc" for gc in child.children)
+                if has_enum_cc:
+                    cursor = child
+                    seen_ids = {cursor.i}
+                    while True:
+                        nmod_child = None
+                        for nm in cursor.children:
+                            if nm.dep_ == "nmod" and nm.i < cursor.i and nm.i not in seen_ids:
+                                nmod_child = nm
+                                break
+                        if nmod_child is None:
+                            break
+                        obj_candidates.append(nmod_child)
+                        seen_ids.add(nmod_child.i)
+                        cursor = nmod_child
 
                 for obj_cand in obj_candidates:
                     target = (
@@ -5758,3 +5840,352 @@ def plot_fi_recommendations(result, title="キーワード→FI推薦", theme="d
         spine.set_color(fg)
     plt.tight_layout()
     return fig
+
+
+# ============================================================
+# ㊵ SAO抽出精度の定量評価（適合率・再現率・F1値）
+# ============================================================
+# 人手で作った正解SAOトリプルと、システムの抽出結果を比較して、
+# 定量的に精度を評価する。卒論の「検証実験」章にそのまま使える。
+
+def _normalize_relation_for_match(text):
+    """
+    動詞の活用形の違い（「有し」「有する」「有している」等）を吸収する
+    ために、関係のテキストから漢字部分だけを取り出して正規化する。
+    """
+    return "".join(_re_dep.findall(r"[一-龥]+", text)) or text
+
+
+def evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=True):
+    """
+    システムが抽出したSAOトリプル（predicted_relations）と、
+    人手で作った正解トリプル（gold_triples）を比較し、
+    適合率（Precision）・再現率（Recall）・F1値を計算する。
+
+    predicted_relations / gold_triples: どちらも
+        {"source":.., "relation":.., "target":..} の形の辞書のリスト
+        （"type"キーは比較に使わない）
+
+    lenient_relation_match: Trueの場合、relation（動詞部分）の比較を、
+        漢字部分だけを取り出して行う（「有し」「有する」「有している」の
+        ような活用の違いを吸収するため）。片方がもう片方の漢字部分を
+        含んでいればよい（「決め」と「位置決めされる」のような、
+        複合語の一部一致も許容する）。
+        Falseの場合はrelationも完全一致でなければ正解としない。
+
+    戻り値: {
+        "precision":.., "recall":.., "f1":..,
+        "正解数":.., "システム抽出数":.., "正解データ数":..,
+        "matched_pred": [...]（正解した抽出結果）,
+        "unmatched_pred": [...]（システムが誤って抽出した関係）,
+        "unmatched_gold": [...]（システムが見逃した関係）,
+    }
+    """
+    def _match(p, g):
+        if p["source"] != g["source"] or p["target"] != g["target"]:
+            return False
+        if p["relation"] == g["relation"]:
+            return True
+        if lenient_relation_match:
+            pn = _normalize_relation_for_match(p["relation"])
+            gn = _normalize_relation_for_match(g["relation"])
+            return pn == gn or pn in gn or gn in pn
+        return False
+
+    matched_gold_idx = set()
+    matched_pred_idx = set()
+    for pi, p in enumerate(predicted_relations):
+        for gi, g in enumerate(gold_triples):
+            if gi in matched_gold_idx:
+                continue
+            if _match(p, g):
+                matched_pred_idx.add(pi)
+                matched_gold_idx.add(gi)
+                break
+
+    matched_pred = [predicted_relations[i] for i in sorted(matched_pred_idx)]
+    unmatched_pred = [p for i, p in enumerate(predicted_relations) if i not in matched_pred_idx]
+    unmatched_gold = [g for i, g in enumerate(gold_triples) if i not in matched_gold_idx]
+
+    tp = len(matched_pred_idx)
+    precision = tp / len(predicted_relations) if predicted_relations else 0.0
+    recall = tp / len(gold_triples) if gold_triples else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "正解数": tp,
+        "システム抽出数": len(predicted_relations),
+        "正解データ数": len(gold_triples),
+        "matched_pred": matched_pred,
+        "unmatched_pred": unmatched_pred,
+        "unmatched_gold": unmatched_gold,
+    }
+
+
+def print_evaluation_report(predicted_relations, gold_triples, name="請求項", lenient_relation_match=True):
+    """evaluate_triples() の結果を、人が読みやすい形で表示する"""
+    result = evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=lenient_relation_match)
+    print(f"=== {name} の評価 ===")
+    print(f"適合率(Precision): {result['precision']*100:5.1f}%  （{result['正解数']}/{result['システム抽出数']}）")
+    print(f"再現率(Recall):    {result['recall']*100:5.1f}%  （{result['正解数']}/{result['正解データ数']}）")
+    print(f"F1値:              {result['f1']*100:5.1f}%")
+    if result["unmatched_pred"]:
+        print("--- システムが誤って抽出した関係（誤検出） ---")
+        for r in result["unmatched_pred"]:
+            print(f"  {r['source']} --{r['relation']}--> {r['target']}")
+    if result["unmatched_gold"]:
+        print("--- システムが見逃した関係（未検出） ---")
+        for r in result["unmatched_gold"]:
+            print(f"  {r['source']} --{r['relation']}--> {r['target']}")
+    return result
+
+
+def batch_evaluate(test_cases, lenient_relation_match=True):
+    """
+    複数の請求項をまとめて評価する。
+
+    test_cases: [(名前, 請求項テキスト, 正解トリプルのリスト), ...]
+                または、難易度カテゴリ別集計もしたい場合は
+                [(名前, 請求項テキスト, 正解トリプルのリスト, 難易度カテゴリ), ...]
+
+    マイクロ平均（全件の正解数・抽出数・正解データ数を合算してから
+    Precision/Recall/F1を計算。件数の多い請求項の影響が大きくなる）と、
+    マクロ平均（各件のF1を単純平均。すべての請求項を対等に扱う）の
+    両方を返す。難易度カテゴリを指定していれば、カテゴリ別の集計も返す。
+    """
+    from collections import defaultdict
+
+    results = []
+    for case in test_cases:
+        if len(case) == 4:
+            name, text, gold, category = case
+        else:
+            name, text, gold = case
+            category = None
+        _, predicted = analyze_claim(text)
+        result = evaluate_triples(predicted, gold, lenient_relation_match=lenient_relation_match)
+        result["name"] = name
+        result["category"] = category
+        results.append(result)
+
+    total_tp = sum(r["正解数"] for r in results)
+    total_pred = sum(r["システム抽出数"] for r in results)
+    total_gold = sum(r["正解データ数"] for r in results)
+    micro_precision = total_tp / total_pred if total_pred else 0.0
+    micro_recall = total_tp / total_gold if total_gold else 0.0
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if (micro_precision + micro_recall) > 0 else 0.0
+    )
+
+    macro_precision = sum(r["precision"] for r in results) / len(results) if results else 0.0
+    macro_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
+    macro_f1 = sum(r["f1"] for r in results) / len(results) if results else 0.0
+
+    category_summary = {}
+    if any(r["category"] for r in results):
+        by_cat = defaultdict(list)
+        for r in results:
+            by_cat[r["category"] or "(未分類)"].append(r)
+        for cat, rs in by_cat.items():
+            tp = sum(r["正解数"] for r in rs)
+            pred = sum(r["システム抽出数"] for r in rs)
+            gold_n = sum(r["正解データ数"] for r in rs)
+            p = tp / pred if pred else 0.0
+            rcl = tp / gold_n if gold_n else 0.0
+            f = 2 * p * rcl / (p + rcl) if (p + rcl) > 0 else 0.0
+            category_summary[cat] = {"件数": len(rs), "precision": p, "recall": rcl, "f1": f}
+
+    return {
+        "results": results,
+        "micro": {"precision": micro_precision, "recall": micro_recall, "f1": micro_f1},
+        "macro": {"precision": macro_precision, "recall": macro_recall, "f1": macro_f1},
+        "category_summary": category_summary,
+    }
+
+
+def print_batch_evaluation_report(batch_result):
+    """batch_evaluate() の結果を、人が読みやすい形で表示する"""
+    print("=== 全体（マイクロ平均） ===")
+    m = batch_result["micro"]
+    print(f"適合率: {m['precision']*100:5.1f}%  再現率: {m['recall']*100:5.1f}%  F1: {m['f1']*100:5.1f}%")
+    print()
+    print("=== 全体（マクロ平均） ===")
+    M = batch_result["macro"]
+    print(f"適合率: {M['precision']*100:5.1f}%  再現率: {M['recall']*100:5.1f}%  F1: {M['f1']*100:5.1f}%")
+
+    if batch_result["category_summary"]:
+        print()
+        print("=== 難易度カテゴリ別 ===")
+        for cat, s in batch_result["category_summary"].items():
+            print(f"{cat}（{s['件数']}件）: 適合率{s['precision']*100:5.1f}%  再現率{s['recall']*100:5.1f}%  F1{s['f1']*100:5.1f}%")
+
+    print()
+    print("=== 請求項ごとの詳細 ===")
+    for r in batch_result["results"]:
+        cat_label = f"[{r['category']}] " if r.get("category") else ""
+        print(
+            f"{cat_label}{r['name']}: 適合率{r['precision']*100:5.1f}%  再現率{r['recall']*100:5.1f}%  "
+            f"F1{r['f1']*100:5.1f}%  （抽出{r['システム抽出数']}件中{r['正解数']}件正解、正解データ{r['正解データ数']}件）"
+        )
+
+
+# ============================================================
+# ㊶ 信頼度フラグ：この請求項の抽出結果は信頼できるか
+# ============================================================
+# これまでの検証で分かった「SAO抽出が苦手なパターン」を請求項の
+# テキストから事前に検出し、抽出結果をそのまま信じてよいか、
+# それとも人間が読み直すべきかの目安を示す。知財担当者が、
+# 「怪しい部分だけ確認する」形で読む速度を上げるために使う。
+
+def assess_claim_confidence(text):
+    """
+    請求項のテキストを解析し、既知の弱点パターンに当てはまるかどうかから、
+    抽出結果の信頼度を「高」「中」「低」で判定する。
+
+    戻り値: {"level": "高"|"中"|"低", "score": 数値, "reasons": [検出理由, ...]}
+    """
+    reasons = []
+    score = 0
+
+    length = len(text)
+    if length > 400:
+        reasons.append(f"文字数が非常に多い長文です（{length}文字）")
+        score += 2
+    elif length > 250:
+        reasons.append(f"文字数がやや多いです（{length}文字）")
+        score += 1
+
+    # 深い所有格の連鎖（「Ａの…Ｂの…Ｃの」のように「の」が何度も連なる）
+    deep_no = len(_re_dep.findall(r"の(?:前記)?[^、。]{1,15}の(?:前記)?[^、。]{1,15}の", text))
+    if deep_no >= 1:
+        reasons.append("深い所有格の連鎖（AのBのCの…）が含まれています")
+        score += 2
+
+    # 3つ以上の並列列挙
+    enum_count = len(_re_dep.findall(r"及び|および|又は|または", text))
+    if enum_count >= 2:
+        reasons.append(f"並列列挙（及び／又は等）が複数箇所あります（{enum_count}箇所）")
+        score += 1
+
+    # 「〜に対して〜される」という特殊な受身構文
+    if _re_dep.search(r"に対し(?:て)?[^。]{0,20}(?:さ|られ)れ", text):
+        reasons.append("「〜に対して〜される」という特殊な受身構文が含まれています")
+        score += 1
+
+    # 条件節・空間配置の表現
+    if "場合" in text or "平面視" in text:
+        reasons.append("条件節や空間配置の表現（「〜場合」「平面視において」等）が含まれています")
+        score += 1
+
+    # 「含む」「有する」の入れ子が深い
+    nest_count = len(_re_dep.findall(r"含み|含む|有し|有する|備え|備える", text))
+    if nest_count >= 5:
+        reasons.append(f"「含む」「有する」「備える」の入れ子が多いです（{nest_count}箇所）")
+        score += 1
+
+    # 修飾語を伴わないと意味が定まりにくい一般的な語
+    generic_terms = ["一方", "他方", "ゲート", "ソース", "ドレイン"]
+    found_generic = [t for t in generic_terms if t in text]
+    if found_generic:
+        reasons.append(f"単体では意味が定まりにくい語（{'、'.join(found_generic)}）が含まれています")
+        score += 1
+
+    if score >= 5:
+        level = "低"
+    elif score >= 2:
+        level = "中"
+    else:
+        level = "高"
+
+    return {"level": level, "score": score, "reasons": reasons}
+
+
+# ============================================================
+# ㊷ 記載チェック：「前記」の整合性確認、明確性要件のリスク検出
+# ============================================================
+# SAO抽出の精度とは別に、知財実務で実際にチェックされている観点
+# （「前記」参照の整合性、明確性要件違反になりやすい表現）を、
+# 請求項のテキストから自動で検出する。読む速度を上げるための、
+# 実務直結の機能。
+
+def check_zenki_consistency(claim_number, claim_texts, prefer_parent=None):
+    """
+    請求項Ｎで使われている「前記Ｘ」「該Ｘ」が、その従属先
+    （さらにその従属先を含む）より前に一度も登場していない場合、
+    記載不備（明確性要件違反）の疑いがあるとして検出する。
+
+    claim_texts: {番号: 本文} の辞書（parse_claims_block()の戻り値）
+
+    戻り値: [{"claim_number": 検出元の請求項番号, "term": "Ｘ"}, ...]
+    """
+    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
+    warnings = []
+    accumulated_text = ""
+    seen_terms = set()
+
+    for num, fragment_text in chain:
+        if not fragment_text:
+            continue
+        cleaned = _clean_claim_text(fragment_text)
+        doc = nlp(cleaned)
+        for i, tok in enumerate(doc):
+            if tok.text not in ("前記", "該"):
+                continue
+            words = []
+            j = i + 1
+            while j < len(doc) and doc[j].pos_ in ("NOUN", "PROPN"):
+                if doc[j].text in ("前記", "該") or not doc[j].text.strip():
+                    break
+                words.append(doc[j].text)
+                j += 1
+            if not words:
+                continue
+            term = _normalize_component_text("".join(words))
+            if not term or term in seen_terms:
+                continue
+            if term not in accumulated_text:
+                warnings.append({"claim_number": num, "term": term})
+                seen_terms.add(term)
+        accumulated_text += cleaned
+
+    return warnings
+
+
+# 明確性要件（特許法36条6項2号）違反を指摘されやすい表現パターン。
+# 判例（知財高裁 平17(行ケ)10015号、平21(行ケ)10395号 等）を根拠とする。
+CLARITY_RISK_PATTERNS = [
+    ("所定の", "明細書等で具体的に特定されていないと不明確と指摘される可能性があります（知財高裁 平21(行ケ)10395号）"),
+    ("一定の", "具体的な基準が明細書で示されていないと不明確と指摘される可能性があります"),
+    ("適切な", "主観的な表現であり、判断基準が明確でないと指摘される可能性があります"),
+    ("必要に応じて", "条件が明確に特定されていないと指摘される可能性があります"),
+    ("好ましくは", "任意的な限定であることが明確でも、権利範囲の外延が曖昧になりやすい表現です"),
+]
+
+# 抽象的で、具体的な裏付けがないと不明確と指摘されやすい語（単独使用時に注意）
+CLARITY_RISK_ABSTRACT_NOUNS = ["構造", "手段", "機構"]
+
+
+def check_clarity_risks(text):
+    """
+    明確性要件違反（特許法36条6項2号）を指摘されやすい表現パターンを
+    テキストから検出する。
+
+    戻り値: [{"phrase": 検出された表現, "reason": 根拠・説明}, ...]
+    """
+    findings = []
+    for phrase, reason in CLARITY_RISK_PATTERNS:
+        if phrase in text:
+            findings.append({"phrase": phrase, "reason": reason})
+
+    for noun in CLARITY_RISK_ABSTRACT_NOUNS:
+        if noun in text:
+            findings.append({
+                "phrase": noun,
+                "reason": f"「{noun}」は、具体的な構成（ハードウェア・処理内容等）と結びついた記載でないと、明確性要件違反（知財高裁 平17(行ケ)10015号）を指摘される可能性があります",
+            })
+
+    return findings
