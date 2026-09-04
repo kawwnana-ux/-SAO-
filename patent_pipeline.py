@@ -3938,23 +3938,55 @@ def plot_wordcloud(freq_counter, title="キーワード頻度", font_path=None):
 # PCAで2次元に落とし込み、意味的に近い特許同士が近くに配置される
 # 「地図」を作る。
 
-def build_semantic_map(database, n_components=2):
+def build_semantic_map(database, n_components=2, method="pca",
+                        n_neighbors=15, min_dist=0.1, random_state=42):
     """
     database（build_patent_database()の戻り値、doc_embeddingを含む）から、
     2次元（または指定した次元数）の座標を計算する。
 
-    戻り値: [{"id":.., "text":.., "x":.., "y":..}, ...]
+    method: "pca"（主成分分析。計算が速く、軸に「寄与率」という意味を
+                    持たせられる。ただし複雑なクラスタ構造は潰れて見えがち）
+            "umap"（UMAP。似た特許同士の近さ・クラスタ構造をより保った
+                    非線形な配置になりやすい。軸自体には「寄与率」に相当
+                    する意味はない）
+    n_neighbors, min_dist: method="umap"のときのみ有効なパラメータ。
+            n_neighborsは近傍点の数（小さいほど局所的、大きいほど大域的な
+            構造を重視）、min_distは点同士に許容する最小距離（小さいほど
+            密集したクラスタになる）。
+
+    戻り値: (points, explained_variance)
+        points: [{"id":.., "text":.., "x":.., "y":..}, ...]
+        explained_variance: PCAの場合は寄与率の配列。UMAPの場合は
+                             軸に寄与率の意味がないためNone。
     """
     import numpy as np
-    from sklearn.decomposition import PCA
 
     if len(database) < 2:
         raise ValueError("2件以上のデータが必要です")
 
     embeddings = np.array([e["doc_embedding"] for e in database])
-    n_comp = min(n_components, len(database) - 1, embeddings.shape[1])
-    pca = PCA(n_components=n_comp)
-    coords = pca.fit_transform(embeddings)
+
+    if method == "umap":
+        import umap
+
+        n_comp = min(n_components, len(database) - 1)
+        n_neighbors_eff = max(2, min(n_neighbors, len(database) - 1))
+        reducer = umap.UMAP(
+            n_components=n_comp,
+            n_neighbors=n_neighbors_eff,
+            min_dist=min_dist,
+            metric="cosine",
+            random_state=random_state,
+        )
+        coords = reducer.fit_transform(embeddings)
+        explained_variance = None
+    else:
+        from sklearn.decomposition import PCA
+
+        n_comp = min(n_components, len(database) - 1, embeddings.shape[1])
+        pca = PCA(n_components=n_comp)
+        coords = pca.fit_transform(embeddings)
+        explained_variance = pca.explained_variance_ratio_
 
     points = []
     for entry, xy in zip(database, coords):
@@ -3964,11 +3996,11 @@ def build_semantic_map(database, n_components=2):
             "x": float(xy[0]),
             "y": float(xy[1]) if n_comp > 1 else 0.0,
         })
-    return points, pca.explained_variance_ratio_
+    return points, explained_variance
 
 
 def plot_semantic_map(points, explained_variance=None, groups=None, title="意味的俯瞰マップ",
-                       theme="deepsea", max_labels=40):
+                       theme="deepsea", max_labels=40, method="pca"):
     """
     build_semantic_map() の結果を、散布図として描画する。
 
@@ -4016,7 +4048,10 @@ def plot_semantic_map(points, explained_variance=None, groups=None, title="意�
                     color=fg, xytext=(4, 4), textcoords="offset points")
 
     ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
-    if explained_variance is not None and len(explained_variance) >= 2:
+    if method == "umap":
+        ax.set_xlabel("UMAP次元1", fontproperties=FONT_PROP, color=fg)
+        ax.set_ylabel("UMAP次元2", fontproperties=FONT_PROP, color=fg)
+    elif explained_variance is not None and len(explained_variance) >= 2:
         ax.set_xlabel(f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
         ax.set_ylabel(f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
     ax.tick_params(colors=fg)
@@ -4028,7 +4063,7 @@ def plot_semantic_map(points, explained_variance=None, groups=None, title="意�
 
 
 def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
-                                   title="意味的俯瞰マップ", theme="deepsea"):
+                                   title="意味的俯瞰マップ", theme="deepsea", method="pca"):
     """
     plot_semantic_map() のインタラクティブ版（Plotly）。
     普段は丸だけを表示し、カーソルを合わせた点だけ文献番号（id）を
@@ -4067,11 +4102,14 @@ def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
             hovertemplate="%{text}<extra></extra>",
         ))
 
-    xlabel = "第1主成分"
-    ylabel = "第2主成分"
-    if explained_variance is not None and len(explained_variance) >= 2:
-        xlabel = f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）"
-        ylabel = f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）"
+    if method == "umap":
+        xlabel, ylabel = "UMAP次元1", "UMAP次元2"
+    else:
+        xlabel = "第1主成分"
+        ylabel = "第2主成分"
+        if explained_variance is not None and len(explained_variance) >= 2:
+            xlabel = f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）"
+            ylabel = f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）"
 
     fig.update_layout(
         title=title,
@@ -4080,6 +4118,136 @@ def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
         font=dict(color=fg),
         xaxis=dict(gridcolor=grid, zerolinecolor=grid),
         yaxis=dict(gridcolor=grid, zerolinecolor=grid, scaleanchor="x", scaleratio=1),
+        legend=dict(bgcolor=bg, bordercolor=grid),
+        width=700, height=700,
+    )
+    return fig
+
+
+# ============================================================
+# ㉒-2 類似度ネットワーク図（NetworkX）
+# ============================================================
+# doc_embedding同士のコサイン類似度が閾値を超えたペアをエッジで結び、
+# 特許同士の「似ている／似ていない」の関係をネットワーク図として可視化する。
+# Saturn V（PCA／UMAPマップ）が「全体としての配置・クラスタ傾向」を見るのに
+# 向いているのに対し、こちらは「どの特許とどの特許が具体的に似ているか」を
+# 直接確認するのに向いている。
+
+def build_similarity_network(database, threshold=0.75, max_neighbors=5):
+    """
+    database（doc_embeddingを含む）から、コサイン類似度に基づく
+    networkx.Graph を作る（doc_embeddingは正規化済みのため、
+    内積がそのままコサイン類似度になる）。
+
+    threshold: この類似度以上のペアだけをエッジにする
+    max_neighbors: 1ノードあたり、類似度が高い順に最大何件まで
+                   エッジを残すか（図が線だらけになるのを防ぐ）
+
+    戻り値: networkx.Graph（各エッジは weight=類似度 属性を持つ。
+             閾値を超えるペアが1件もないノードは含まれない）
+    """
+    import numpy as np
+
+    if len(database) < 2:
+        raise ValueError("2件以上のデータが必要です")
+
+    ids = [e["id"] for e in database]
+    embeddings = np.array([e["doc_embedding"] for e in database])
+    sim_matrix = embeddings @ embeddings.T
+
+    G = nx.Graph()
+    G.add_nodes_from(ids)
+
+    n = len(ids)
+    for i in range(n):
+        neighbors = [
+            (j, sim_matrix[i, j]) for j in range(n)
+            if j != i and sim_matrix[i, j] >= threshold
+        ]
+        neighbors.sort(key=lambda x: -x[1])
+        for j, sim in neighbors[:max_neighbors]:
+            if not G.has_edge(ids[i], ids[j]):
+                G.add_edge(ids[i], ids[j], weight=float(sim))
+
+    G.remove_nodes_from(list(nx.isolates(G)))
+    return G
+
+
+def plot_similarity_network_interactive(G, groups=None, title="特許類似度ネットワーク図", theme="deepsea"):
+    """
+    build_similarity_network() の結果を、Plotlyのインタラクティブな
+    ネットワーク図として描画する。ノードにカーソルを合わせると文献番号が
+    表示される。ノードの大きさは、そのノードに繋がっているエッジの数
+    （＝似ている特許の多さ）に応じて大きくなる。
+    """
+    import plotly.graph_objects as go
+
+    if G.number_of_nodes() == 0:
+        raise ValueError("エッジが1件もありません。類似度の閾値を下げてください。")
+
+    if theme == "deepsea":
+        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
+        palette = [s["border"] for s in _DEEPSEA_PALETTE]
+    else:
+        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
+        palette = [s["edge"] for s in _BRANCH_PALETTE]
+
+    pos = nx.spring_layout(G, seed=42, weight="weight")
+
+    edge_x, edge_y = [], []
+    for u, v in G.edges():
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        edge_x += [x0, x1, None]
+        edge_y += [y0, y1, None]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=edge_x, y=edge_y, mode="lines",
+        line=dict(width=1, color=grid), hoverinfo="none", showlegend=False,
+    ))
+
+    node_ids = list(G.nodes())
+    degrees = dict(G.degree())
+
+    if groups:
+        group_names = sorted(set(groups.get(i, "その他") for i in node_ids))
+        color_of = {g: palette[k % len(palette)] for k, g in enumerate(group_names)}
+        for g in group_names:
+            ids_in_group = [i for i in node_ids if groups.get(i, "その他") == g]
+            if not ids_in_group:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[pos[i][0] for i in ids_in_group],
+                y=[pos[i][1] for i in ids_in_group],
+                mode="markers", name=g,
+                marker=dict(
+                    size=[10 + degrees[i] * 3 for i in ids_in_group],
+                    color=color_of[g], line=dict(width=1, color=fg),
+                ),
+                text=[i for i in ids_in_group],
+                hovertemplate="%{text}<extra>" + g + "</extra>",
+            ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=[pos[i][0] for i in node_ids],
+            y=[pos[i][1] for i in node_ids],
+            mode="markers", showlegend=False,
+            marker=dict(
+                size=[10 + degrees[i] * 3 for i in node_ids],
+                color=palette[0], line=dict(width=1, color=fg),
+            ),
+            text=[i for i in node_ids],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=title,
+        showlegend=bool(groups),
+        plot_bgcolor=bg, paper_bgcolor=bg,
+        font=dict(color=fg),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
         legend=dict(bgcolor=bg, bordercolor=grid),
         width=700, height=700,
     )

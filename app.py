@@ -693,9 +693,35 @@ with tab4:
         # --- Saturn V ---
         with sub_tab_saturn:
             st.caption("特許同士の意味的な近さに基づいて地図上に配置します。似た内容の発明ほど近くに配置されます。")
+
+            saturn_method_choice = st.radio(
+                "次元圧縮の方法",
+                ["PCA（軸に寄与率という意味を持たせられる）", "UMAP（クラスタ構造をよりはっきり分離しやすい）"],
+                horizontal=True, key="saturn_method_choice",
+            )
+            saturn_method = "umap" if saturn_method_choice.startswith("UMAP") else "pca"
+
+            if saturn_method == "umap":
+                umap_col1, umap_col2 = st.columns(2)
+                with umap_col1:
+                    saturn_n_neighbors = st.slider(
+                        "n_neighbors（近傍点の数。小さいほど局所的、大きいほど大域的な構造を重視）",
+                        min_value=2, max_value=50, value=15, key="saturn_n_neighbors",
+                    )
+                with umap_col2:
+                    saturn_min_dist = st.slider(
+                        "min_dist（点同士に許容する最小距離。小さいほど密集したクラスタになる）",
+                        min_value=0.0, max_value=0.99, value=0.1, step=0.01, key="saturn_min_dist",
+                    )
+            else:
+                saturn_n_neighbors, saturn_min_dist = 15, 0.1
+
             if st.button("🐋 マップを作成する", key="saturn_run"):
                 try:
-                    points, var = pp.build_semantic_map(db)
+                    points, var = pp.build_semantic_map(
+                        db, method=saturn_method,
+                        n_neighbors=saturn_n_neighbors, min_dist=saturn_min_dist,
+                    )
                     applicant_groups = pp.get_applicant_groups(db, top_n=6)
                     groups = None
                     if applicant_groups:
@@ -703,15 +729,62 @@ with tab4:
                         for name, ids in applicant_groups.items():
                             for i in ids:
                                 groups[i] = name
-                    st.session_state.saturn_result = (points, var, groups)
+                    st.session_state.saturn_result = (points, var, groups, saturn_method)
                 except Exception as e:
                     st.error(f"マップ作成中にエラーが発生しました: {e}")
 
             if st.session_state.get("saturn_result") is not None:
-                points, var, groups = st.session_state.saturn_result
-                fig = pp.plot_semantic_map_interactive(points, var, groups=groups, title="意味的俯瞰マップ")
+                points, var, groups, used_method = st.session_state.saturn_result
+                map_title = "意味的俯瞰マップ（UMAP）" if used_method == "umap" else "意味的俯瞰マップ（PCA）"
+                fig = pp.plot_semantic_map_interactive(points, var, groups=groups, title=map_title, method=used_method)
                 st.plotly_chart(fig, width='content')
                 st.caption("意味的に近い特許同士が近くに配置されます。点にカーソルを合わせると文献番号が表示されます。")
+
+            st.divider()
+            st.markdown("#### 🕸️ 類似度ネットワーク図")
+            st.caption(
+                "特許同士のコサイン類似度が閾値を超えたペアを線で結びます。"
+                "上のマップが「全体としての配置・クラスタ傾向」を見るのに向いているのに対し、"
+                "こちらは「どの特許とどの特許が具体的に似ているか」を直接確認するのに向いています。"
+            )
+            net_col1, net_col2 = st.columns(2)
+            with net_col1:
+                network_threshold = st.slider(
+                    "類似度の閾値（これ以上似ていたら線を引く）",
+                    min_value=0.50, max_value=0.99, value=0.75, step=0.01, key="network_threshold",
+                )
+            with net_col2:
+                network_max_neighbors = st.slider(
+                    "1件あたりの最大エッジ数",
+                    min_value=1, max_value=20, value=5, key="network_max_neighbors",
+                )
+            if st.button("🕸️ ネットワーク図を作る", key="network_run"):
+                try:
+                    G = pp.build_similarity_network(
+                        db, threshold=network_threshold, max_neighbors=network_max_neighbors,
+                    )
+                    applicant_groups = pp.get_applicant_groups(db, top_n=6)
+                    groups = None
+                    if applicant_groups:
+                        groups = {}
+                        for name, ids in applicant_groups.items():
+                            for i in ids:
+                                groups[i] = name
+                    st.session_state.network_result = (G, groups)
+                except Exception as e:
+                    st.error(f"ネットワーク図作成中にエラーが発生しました: {e}")
+
+            if st.session_state.get("network_result") is not None:
+                G, groups = st.session_state.network_result
+                if G.number_of_nodes() == 0:
+                    st.warning("閾値を超えるペアが見つかりませんでした。閾値を下げてみてください。")
+                else:
+                    fig = pp.plot_similarity_network_interactive(G, groups=groups, title="特許類似度ネットワーク図")
+                    st.plotly_chart(fig, width='content')
+                    st.caption(
+                        f"ノード数: {G.number_of_nodes()} / エッジ数: {G.number_of_edges()}"
+                        "　※ ノードが大きいほど、似ている特許が多く繋がっています。"
+                    )
 
         # --- CORE ---
         with sub_tab_core:
