@@ -6315,7 +6315,14 @@ def check_zenki_consistency(claim_number, claim_texts, prefer_parent=None):
             term = _normalize_component_text("".join(words))
             if not term or term in seen_terms:
                 continue
-            if term not in accumulated_text:
+            # 「前記」「該」より前に登場していればOK。判定対象は
+            # 「これまでの請求項（従属先）の蓄積テキスト」＋「同じ請求項内で
+            # この語より前の部分」。後者を含めないと、同一請求項内で先に
+            # 定義した構成要素を後段で「前記」で受けているだけの、ごく普通の
+            # 記載まで誤検出してしまう（例：独立請求項である請求項1は
+            # 従属先を持たないため、accumulated_textが常に空になる）。
+            text_before_here = accumulated_text + cleaned[:tok.idx]
+            if term not in text_before_here:
                 warnings.append({"claim_number": num, "term": term})
                 seen_terms.add(term)
         accumulated_text += cleaned
@@ -6357,3 +6364,302 @@ def check_clarity_risks(text):
             })
 
     return findings
+
+
+# ============================================================
+# ㉔ 構成要素の未接続チェック
+# ============================================================
+# analyze_claim() が抽出した構成要素のうち、SAO関係（has・直接関係・
+# 位置関係を問わず）を一度も持たない、つまりグラフ上で孤立している
+# ものを検出する。既存のSAO抽出結果をそのまま利用できる。
+
+def check_disconnected_components(components, relations):
+    """
+    components, relations: analyze_claim() / analyze_dependent_claim() の
+    戻り値（構成要素リスト・関係リスト）。
+
+    戻り値: [{"term": 構成要素名}, ...]（他の構成要素と一切関係を
+             持たなかったものの一覧。抽出漏れの兆候である可能性がある）
+    """
+    connected = set()
+    for r in relations:
+        connected.add(_normalize_component_text(r["source"]))
+        connected.add(_normalize_component_text(r["target"]))
+
+    warnings = []
+    seen = set()
+    for c in components:
+        term = _normalize_component_text(c["text"])
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        if term not in connected:
+            warnings.append({"term": term})
+    return warnings
+
+
+# ============================================================
+# ㉕ 用語の表記ゆれ・不一致チェック
+# ============================================================
+# 「第１端子」と「第1端子」のように、全角/半角の違いなど見た目だけが
+# 違う表記ゆれ（check_notation_variants）と、「第１端子」で定義したのに
+# 後段で「前記第１電極」のように番号は同じでも名詞が食い違っている
+# ケース（check_ordinal_term_consistency）、「制御部」と「制御装置」の
+# ように、表記としては別物だが意味的に近い用語のペア
+# （check_similar_terms。sentence-transformersの埋め込みを利用）を検出する。
+
+_ZENKAKU_DIGITS_TO_HANKAKU = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _canonicalize_for_variant_check(term):
+    """
+    表記ゆれ判定用に、全角数字→半角、スペース除去などの正規化を行う
+    （意味は変えず、見た目の表記だけを揃える）。
+    """
+    t = term.translate(_ZENKAKU_DIGITS_TO_HANKAKU)
+    t = t.replace(" ", "").replace("　", "")
+    return t
+
+
+def check_notation_variants(components):
+    """
+    構成要素名のうち、正規化（全角/半角数字の統一等）すると同じに
+    なるのに、異なる表記のまま複数種類登場しているものを検出する。
+
+    戻り値: [{"canonical": 正規化後の形, "variants": [表記1, 表記2, ...]}, ...]
+    """
+    groups = {}
+    for c in components:
+        term = _normalize_component_text(c["text"])
+        if not term:
+            continue
+        canon = _canonicalize_for_variant_check(term)
+        groups.setdefault(canon, set()).add(term)
+
+    warnings = []
+    for canon, variants in groups.items():
+        if len(variants) > 1:
+            warnings.append({"canonical": canon, "variants": sorted(variants)})
+    return warnings
+
+
+_ORDINAL_TERM_PATTERN = re.compile(r"^第(?P<num>[0-9]+)の?(?P<rest>.+)$")
+
+
+def check_ordinal_term_consistency(components):
+    """
+    「第１端子」のように序数＋名詞で定義された構成要素について、
+    同じ序数番号なのに末尾の名詞（端子／電極 等）が請求項内で
+    食い違っていないかを検出する（例：「第１端子」と定義したのに、
+    後段で「前記第１電極」と記載されている）。
+
+    戻り値: [{"num": 序数（文字列）, "terms": [用語1, 用語2, ...]}, ...]
+    """
+    groups = {}
+    seen = set()
+    for c in components:
+        term = _normalize_component_text(c["text"])
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        m = _ORDINAL_TERM_PATTERN.match(term.translate(_ZENKAKU_DIGITS_TO_HANKAKU))
+        if not m:
+            continue
+        groups.setdefault(m.group("num"), set()).add(term)
+
+    warnings = []
+    for num, terms in groups.items():
+        if len(terms) > 1:
+            warnings.append({"num": num, "terms": sorted(terms)})
+    return warnings
+
+
+def check_similar_terms(components, threshold=0.75):
+    """
+    構成要素名のうち、正規化しても一致しないが、埋め込みベクトルでの
+    意味的な類似度が高い語のペアを検出する（例：「制御部」と「制御装置」）。
+    check_notation_variants()で検出できる、正規化すれば一致する表記ゆれは
+    除く（そちらの方が確度が高い別種の指摘のため）。
+
+    埋め込みモデルの読み込みに、初回は1分程度かかることがある。
+
+    戻り値: [{"term_a":.., "term_b":.., "similarity":..}, ...]
+             （類似度が高い順）
+    """
+    import numpy as np
+
+    terms = sorted({_normalize_component_text(c["text"]) for c in components if c["text"].strip()})
+    terms = [t for t in terms if t]
+    if len(terms) < 2:
+        return []
+
+    model = _get_embed_model()
+    embeddings = model.encode(terms, normalize_embeddings=True)
+
+    pairs = []
+    for i in range(len(terms)):
+        for j in range(i + 1, len(terms)):
+            if _canonicalize_for_variant_check(terms[i]) == _canonicalize_for_variant_check(terms[j]):
+                continue
+            sim = float(np.dot(embeddings[i], embeddings[j]))
+            if sim >= threshold:
+                pairs.append({"term_a": terms[i], "term_b": terms[j], "similarity": sim})
+
+    pairs.sort(key=lambda x: -x["similarity"])
+    return pairs
+
+
+# ============================================================
+# ㉖ 数値・単位チェック
+# ============================================================
+# 請求項に含まれる「数値＋単位」の組を抽出して一覧化し、同じ単位が
+# 複数の表記（"mm"と"ｍｍ"、"um"と"μm"等）で混在していないかを検出する。
+
+_UNIT_ALIASES = {
+    "mm": "mm", "ｍｍ": "mm",
+    "cm": "cm", "ｃｍ": "cm",
+    "nm": "nm", "ｎｍ": "nm",
+    "um": "μm", "μm": "μm",
+    "℃": "℃", "度c": "℃", "度C": "℃",
+    "mpa": "MPa", "MPa": "MPa", "Mpa": "MPa",
+    "kpa": "kPa", "kPa": "kPa",
+    "gpa": "GPa", "GPa": "GPa",
+    "pa": "Pa", "Pa": "Pa",
+    "%": "%", "％": "%", "パーセント": "%",
+    "kg": "kg", "ｋｇ": "kg",
+    "mg": "mg", "ｍｇ": "mg",
+    "g": "g", "ｇ": "g",
+    "kv": "kV", "kV": "kV",
+    "mv": "mV", "mV": "mV",
+    "v": "V", "V": "V", "ｖ": "V",
+    "ma": "mA", "mA": "mA",
+    "a": "A", "A": "A", "ａ": "A",
+    "khz": "kHz", "kHz": "kHz",
+    "mhz": "MHz", "MHz": "MHz",
+    "ghz": "GHz", "GHz": "GHz",
+    "hz": "Hz", "Hz": "Hz",
+    "Ω": "Ω", "ω": "Ω", "オーム": "Ω",
+    "ms": "ms", "秒": "s", "s": "s",
+}
+
+_NUMERIC_SPEC_PATTERN = re.compile(
+    r"(?P<value>[0-9０-９]+(?:[.．][0-9０-９]+)?)"
+    r"\s*"
+    r"(?P<unit>mm|ｍｍ|cm|ｃｍ|nm|ｎｍ|μm|um|℃|度[Cc]|"
+    r"MPa|Mpa|mpa|kPa|kpa|GPa|gpa|Pa|pa|%|％|パーセント|"
+    r"kg|ｋｇ|mg|ｍｇ|g|ｇ|kV|kv|mV|mv|V|ｖ|mA|ma|A|ａ|"
+    r"kHz|khz|MHz|mhz|GHz|ghz|Hz|hz|Ω|ω|オーム|ms|秒|s)"
+)
+
+
+def extract_numeric_specs(text):
+    """
+    請求項テキストから「数値＋単位」の組を抽出する
+    （例：「10mm」「10 mm」「０．１ｍｍ」等）。
+
+    戻り値: [{"raw": 元の表記, "value": 数値(float), "unit": 元の単位表記,
+              "unit_normalized": 正規化後の単位, "position": 出現位置(文字index)}, ...]
+    """
+    results = []
+    for m in _NUMERIC_SPEC_PATTERN.finditer(text):
+        raw_value = m.group("value").translate(_ZENKAKU_DIGITS_TO_HANKAKU).replace("．", ".")
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        unit_raw = m.group("unit")
+        unit_normalized = _UNIT_ALIASES.get(unit_raw, unit_raw)
+        results.append({
+            "raw": m.group(0),
+            "value": value,
+            "unit": unit_raw,
+            "unit_normalized": unit_normalized,
+            "position": m.start(),
+        })
+    return results
+
+
+def check_unit_notation_consistency(text):
+    """
+    extract_numeric_specs()の結果から、同じ単位（正規化後）が複数の
+    異なる表記で書かれていないか（例："mm"と"ｍｍ"、"um"と"μm"）を検出する。
+
+    戻り値: [{"unit_normalized": .., "raw_variants": [表記1, 表記2, ...]}, ...]
+    """
+    specs = extract_numeric_specs(text)
+    groups = {}
+    for s in specs:
+        groups.setdefault(s["unit_normalized"], set()).add(s["unit"])
+
+    warnings = []
+    for unit_normalized, raws in groups.items():
+        if len(raws) > 1:
+            warnings.append({"unit_normalized": unit_normalized, "raw_variants": sorted(raws)})
+    return warnings
+
+
+# ============================================================
+# ㉗ 請求項の引用関係
+# ============================================================
+# parse_claims_block() で分割した請求項群から、各請求項がどの請求項を
+# 引用（従属）しているかを取り出し、引用関係図として可視化する。
+# 「請求項◯に記載の」等の参照表現の解析には、_build_claim_chain()等が
+# 既に使っている _parse_claim_ref() をそのまま利用する。
+
+def build_claim_dependency_graph(claim_texts):
+    """
+    claim_texts: {番号: 本文} の辞書（parse_claims_block()の戻り値）
+
+    戻り値: {請求項番号: [引用している親請求項番号, ...]}
+            （独立請求項は空リスト。「請求項１又は２に記載の」のように
+            複数を引用している場合は複数の番号が入る）
+    """
+    dependency = {}
+    for num, text in claim_texts.items():
+        ref = _parse_claim_ref(text)
+        dependency[num] = ref["numbers"] if ref else []
+    return dependency
+
+
+def plot_claim_dependency_graphviz(dependency_graph, theme="deepsea"):
+    """
+    build_claim_dependency_graph()の結果を、請求項の引用関係図として
+    Graphvizで描画する（例：請求項3 → 請求項1, 請求項2）。
+
+    戻り値は graphviz.Digraph オブジェクト。Streamlitでは
+    st.graphviz_chart(戻り値) でそのまま描画できる。
+    """
+    import graphviz
+
+    g = graphviz.Digraph(engine="dot")
+    g.attr(rankdir="LR", splines="spline", nodesep="0.3", ranksep="0.7", bgcolor="transparent")
+
+    if theme == "deepsea":
+        dep_fill, dep_border, dep_font = "#0E3A52", "#5FD4E0", "#E8FBFF"
+        indep_fill, indep_border, indep_font = "#04121C", "#8FE0F0", "#FFFFFF"
+        edge_color = "#5FD4E0"
+    else:
+        dep_fill, dep_border, dep_font = "#EAF2FF", "#5B8DEF", "#233044"
+        indep_fill, indep_border, indep_font = "#3B4252", "#B0B7C6", "#FFFFFF"
+        edge_color = "#5B8DEF"
+
+    g.attr("node", shape="box", style="rounded,filled", fontname="IPAexGothic",
+           fontsize="13", margin="0.2,0.12", penwidth="1.8")
+    g.attr("edge", color=edge_color, penwidth="1.6", arrowsize="0.8")
+
+    for num, parents in dependency_graph.items():
+        is_independent = not parents
+        g.node(
+            str(num),
+            label=f"請求項{num}" + ("\n（独立項）" if is_independent else ""),
+            fillcolor=indep_fill if is_independent else dep_fill,
+            color=indep_border if is_independent else dep_border,
+            fontcolor=indep_font if is_independent else dep_font,
+        )
+
+    for num, parents in dependency_graph.items():
+        for p in parents:
+            if p in dependency_graph:
+                g.edge(str(num), str(p))
+
+    return g

@@ -993,11 +993,23 @@ with tab4:
 with tab5:
     st.subheader("📋 記載チェック")
     st.caption(
-        "SAO抽出の精度とは別に、実際の知財実務でチェックされている観点（「前記」参照の整合性、"
-        "明確性要件違反になりやすい表現）を自動で検出します。"
+        "SAO抽出の精度とは別に、実際の知財実務でチェックされている観点を自動で検出します。"
+        "あくまで「確認すべき箇所の候補」を示すものであり、最終的な判断は本文と照らし合わせて行ってください。"
     )
 
-    check_mode = st.radio("チェックの種類", ["「前記」整合性チェック", "明確性リスクチェック"], horizontal=True, key="check_mode")
+    check_mode = st.radio(
+        "チェックの種類",
+        [
+            "「前記」整合性チェック",
+            "構成要素の未接続チェック",
+            "用語の表記ゆれチェック",
+            "用語の不一致チェック",
+            "明確性リスクチェック",
+            "数値・単位チェック",
+            "請求項の引用関係",
+        ],
+        key="check_mode",
+    )
 
     if check_mode == "「前記」整合性チェック":
         st.markdown("#### 「前記Ｘ」「該Ｘ」が、従属先に一度も登場していないかを確認します")
@@ -1035,7 +1047,118 @@ with tab5:
                     st.write(f"- 請求項{w['claim_number']}で「前記{w['term']}」（または「該{w['term']}」）と記載されていますが、"
                              f"「{w['term']}」がそれより前（従属先を含む）に登場していません。")
 
-    else:
+    elif check_mode == "構成要素の未接続チェック":
+        st.markdown("#### 抽出した構成要素のうち、他の構成要素と関係を持たないものを検出します")
+        st.caption(
+            "SAO抽出（構成要素間の関係）の結果を利用します。抽出漏れがあると誤検出することがあるため、"
+            "実際に「🪸 1つの請求項を解析」タブの図と照らし合わせて確認してください。"
+        )
+        disc_text = st.text_area(
+            "請求項テキスト",
+            height=200,
+            placeholder="例：半導体チップと、前記半導体チップを収容するケースと、第1端子と、第2端子と、を備える半導体装置。",
+            key="disc_text",
+        )
+        if st.button("📋 チェックする", key="disc_check_run"):
+            if not disc_text.strip():
+                st.warning("請求項テキストを入力してください。")
+            else:
+                try:
+                    components, relations = pp.analyze_claim(disc_text)
+                    st.session_state.disc_result = pp.check_disconnected_components(components, relations)
+                except Exception as e:
+                    st.error(f"チェック中にエラーが発生しました: {e}")
+        if st.session_state.get("disc_result") is not None:
+            warnings = st.session_state.disc_result
+            if not warnings:
+                st.success("✅ すべての構成要素が、他の構成要素と何らかの関係を持っています。")
+            else:
+                st.warning(f"⚠️ {len(warnings)} 件の構成要素が、他の構成要素との関係を持っていません。")
+                for w in warnings:
+                    st.write(f"- **{w['term']}** の技術的関係が確認できません")
+
+    elif check_mode == "用語の表記ゆれチェック":
+        st.markdown("#### 表記だけが違う構成要素名を検出します")
+        st.caption("例：「第１端子」と「第1端子」のように、全角/半角数字などの違いだけで、別の構成要素として扱われてしまっているケースを検出します。")
+        variant_text = st.text_area(
+            "請求項テキスト",
+            height=200,
+            placeholder="例：第１端子と、第1端子に接続された配線と、を備える半導体装置。",
+            key="variant_text",
+        )
+        if st.button("📋 チェックする", key="variant_check_run"):
+            if not variant_text.strip():
+                st.warning("請求項テキストを入力してください。")
+            else:
+                try:
+                    components, _ = pp.analyze_claim(variant_text)
+                    st.session_state.variant_result = pp.check_notation_variants(components)
+                except Exception as e:
+                    st.error(f"チェック中にエラーが発生しました: {e}")
+        if st.session_state.get("variant_result") is not None:
+            warnings = st.session_state.variant_result
+            if not warnings:
+                st.success("✅ 表記ゆれは見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(warnings)} 件の表記ゆれの疑いが見つかりました。")
+                for w in warnings:
+                    st.write(f"- {' / '.join(w['variants'])}　→　同じもの（{w['canonical']}）を指している可能性があります")
+
+    elif check_mode == "用語の不一致チェック":
+        st.markdown("#### 似ているのに表記が違う構成要素名を検出します")
+        st.caption(
+            "①序数付きの構成要素（「第１端子」等）について、同じ番号なのに末尾の名詞が食い違っているケース、"
+            "②意味的に近い構成要素名のペア（例：「制御部」と「制御装置」）を検出します。"
+            "②は初回、埋め込みモデルの読み込みに1分程度かかります。"
+        )
+        mismatch_text = st.text_area(
+            "請求項テキスト",
+            height=200,
+            placeholder="例：第１端子と、前記第１電極に接続された配線と、を備える半導体装置。",
+            key="mismatch_text",
+        )
+        mismatch_threshold = st.slider(
+            "②の類似度の閾値（これ以上似ていたら警告）",
+            min_value=0.5, max_value=0.95, value=0.75, step=0.01, key="mismatch_threshold",
+        )
+        if st.button("📋 チェックする", key="mismatch_check_run"):
+            if not mismatch_text.strip():
+                st.warning("請求項テキストを入力してください。")
+            else:
+                with st.spinner("解析中..."):
+                    try:
+                        components, _ = pp.analyze_claim(mismatch_text)
+                        ordinal_warnings = pp.check_ordinal_term_consistency(components)
+                        similar_pairs = pp.check_similar_terms(components, threshold=mismatch_threshold)
+                        st.session_state.mismatch_result = (ordinal_warnings, similar_pairs)
+                    except Exception as e:
+                        st.error(f"チェック中にエラーが発生しました: {e}")
+                        st.session_state.mismatch_result = None
+        if st.session_state.get("mismatch_result") is not None:
+            ordinal_warnings, similar_pairs = st.session_state.mismatch_result
+
+            st.markdown("##### ① 序数の不一致")
+            if not ordinal_warnings:
+                st.success("✅ 序数の不一致は見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(ordinal_warnings)} 件の序数の不一致が見つかりました。")
+                for w in ordinal_warnings:
+                    st.write(f"- 第{w['num']}：{' / '.join(w['terms'])}　→　同じ番号なのに名称が食い違っています")
+
+            st.markdown("##### ② 意味的に近い用語のペア")
+            if not similar_pairs:
+                st.success("✅ 意味的に近い用語のペアは見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(similar_pairs)} 件の類似する用語のペアが見つかりました。")
+                st.dataframe(
+                    [
+                        {"用語A": p["term_a"], "用語B": p["term_b"], "類似度": round(p["similarity"], 2)}
+                        for p in similar_pairs
+                    ],
+                    hide_index=True, width='stretch',
+                )
+
+    elif check_mode == "明確性リスクチェック":
         st.markdown("#### 明確性要件違反になりやすい表現を検出します")
         clarity_text = st.text_area(
             "請求項テキスト",
@@ -1056,3 +1179,75 @@ with tab5:
                 st.warning(f"⚠️ {len(findings)} 件の注意点が見つかりました。")
                 for f in findings:
                     st.write(f"- **「{f['phrase']}」**：{f['reason']}")
+
+    elif check_mode == "数値・単位チェック":
+        st.markdown("#### 請求項に含まれる数値条件を一覧表示し、単位の表記ゆれを検出します")
+        st.caption("例：「10mm」と「10 mm」、「10um」と「10μm」のように、同じ単位が違う表記で混在していないかを確認します。")
+        numeric_text = st.text_area(
+            "請求項テキスト",
+            height=200,
+            placeholder="例：膜厚が0.1mm以上10 mmであり、温度100℃、圧力10MPaで形成された絶縁層を備える半導体装置。",
+            key="numeric_text",
+        )
+        if st.button("📋 チェックする", key="numeric_check_run"):
+            if not numeric_text.strip():
+                st.warning("請求項テキストを入力してください。")
+            else:
+                specs = pp.extract_numeric_specs(numeric_text)
+                unit_warnings = pp.check_unit_notation_consistency(numeric_text)
+                st.session_state.numeric_result = (specs, unit_warnings)
+        if st.session_state.get("numeric_result") is not None:
+            specs, unit_warnings = st.session_state.numeric_result
+
+            st.markdown("##### 抽出された数値条件")
+            if not specs:
+                st.info("数値＋単位の組み合わせは見つかりませんでした。")
+            else:
+                st.dataframe(
+                    [{"表記": s["raw"], "数値": s["value"], "単位": s["unit_normalized"]} for s in specs],
+                    hide_index=True, width='stretch',
+                )
+
+            st.markdown("##### 単位の表記ゆれ")
+            if not unit_warnings:
+                st.success("✅ 単位の表記ゆれは見つかりませんでした。")
+            else:
+                st.warning(f"⚠️ {len(unit_warnings)} 件の単位の表記ゆれが見つかりました。")
+                for w in unit_warnings:
+                    st.write(f"- {w['unit_normalized']}：{' / '.join(w['raw_variants'])}")
+
+    else:
+        st.markdown("#### 請求項同士の引用（従属）関係を図にします")
+        st.caption(
+            "実際の公報の書き方（【請求項１】【請求項２】…）のまま、コピペで貼り付けてください。"
+        )
+        dep_text = st.text_area(
+            "請求項群",
+            height=260,
+            placeholder="【請求項１】\n（請求項1の全文）\n【請求項２】\n（請求項1に記載の…を含む）\n【請求項３】\n（請求項1又は2に記載の…を含む）",
+            key="dep_text",
+        )
+        if st.button("📋 図にする", key="dep_check_run"):
+            if not dep_text.strip():
+                st.warning("請求項群を入力してください。")
+            else:
+                try:
+                    claims_dict = pp.parse_claims_block(dep_text)
+                    if not claims_dict:
+                        st.warning("請求項を認識できませんでした。テキストを確認してください。")
+                        st.session_state.dep_result = None
+                    else:
+                        st.session_state.dep_result = pp.build_claim_dependency_graph(claims_dict)
+                except Exception as e:
+                    st.error(f"解析中にエラーが発生しました: {e}")
+                    st.session_state.dep_result = None
+        if st.session_state.get("dep_result") is not None:
+            dep_graph = st.session_state.dep_result
+            fig = pp.plot_claim_dependency_graphviz(dep_graph, theme="deepsea")
+            st.graphviz_chart(fig, width='stretch')
+            for num in sorted(dep_graph.keys()):
+                parents = dep_graph[num]
+                if parents:
+                    st.write("- 請求項" + str(num) + " → " + "、".join(f"請求項{p}" for p in parents))
+                else:
+                    st.write(f"- 請求項{num}：独立請求項")
