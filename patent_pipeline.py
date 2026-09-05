@@ -3756,6 +3756,61 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
     return (None, final_relations), full_text
 
 
+def analyze_dependent_claim_with_components(claim_number, claim_texts, prefer_parent=None):
+    """
+    analyze_dependent_claim()と同じ要領で従属請求項を親請求項の内容も
+    含めて解析するが、記載チェック（構成要素の未接続・表記ゆれ・用語の
+    不一致チェック）で使うために、各請求項の追加限定文から抽出した生の
+    構成要素リストも合わせて返す。
+
+    「請求項１に記載の」等の引用表現そのものは _build_claim_chain() の
+    段階で本文から取り除かれているため、この構成要素リストに
+    「請求項」「記載」等の語が紛れ込むことはない
+    （単に全文をanalyze_claim()に丸ごと渡した場合と違う点）。
+
+    戻り値: (components, final_relations, full_text)
+    """
+    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
+
+    all_components = []
+    all_relations = []
+    seen_component_texts = set()
+    for i, (num, fragment_text) in enumerate(chain):
+        if not fragment_text:
+            continue
+        if i == 0:
+            # 一番根本の独立請求項は、通常通りフルに解析する
+            fragment_components, raw_relations, doc = _extract_raw_relations(fragment_text)
+            relations = _simplify_hierarchy(raw_relations, doc, fragment_components)
+        else:
+            # 追加の限定文はそれ単体では不完全な断片なので、
+            # 孤立ノードを無理に根へ繋げる処理はまだかけない
+            fragment_components, relations, _ = _extract_raw_relations(fragment_text)
+
+        for c in fragment_components:
+            term = _normalize_component_text(c["text"])
+            if term and term not in seen_component_texts:
+                seen_component_texts.add(term)
+                all_components.append(c)
+        for r in relations:
+            r = dict(r)
+            r["claim_number"] = num
+            all_relations.append(r)
+
+    seen_keys = set()
+    unique_relations = []
+    for r in all_relations:
+        key = (r["source"], r["relation"], r["target"], r["type"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_relations.append(r)
+
+    final_relations = _simplify_hierarchy(unique_relations)
+    full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
+    return all_components, final_relations, full_text
+
+
 def parse_claims_block(text):
     """
     「【請求項１】（本文）【請求項２】（本文）…」という、
@@ -6405,8 +6460,8 @@ def check_disconnected_components(components, relations):
 # 違う表記ゆれ（check_notation_variants）と、「第１端子」で定義したのに
 # 後段で「前記第１電極」のように番号は同じでも名詞が食い違っている
 # ケース（check_ordinal_term_consistency）、「制御部」と「制御装置」の
-# ように、表記としては別物だが意味的に近い用語のペア
-# （check_similar_terms。sentence-transformersの埋め込みを利用）を検出する。
+# ように、幹は同じで末尾の役割語（装置／部／手段等）だけが違う用語の
+# ペア（check_similar_terms）を検出する。
 
 _ZENKAKU_DIGITS_TO_HANKAKU = str.maketrans("０１２３４５６７８９", "0123456789")
 
@@ -6474,38 +6529,64 @@ def check_ordinal_term_consistency(components):
     return warnings
 
 
-def check_similar_terms(components, threshold=0.75):
+
+# 「制御部」「制御装置」のように、末尾に付く「役割語」（同じ機能を指すのに
+# 名詞の言い換えとしてよく使われる語）の一覧。ここに挙がっている語で終わる
+# 構成要素名は、それより前の部分（＝幹）と役割語に分けて扱う。
+# 長い候補から先にマッチさせるため長さ降順に並べる。
+_ROLE_SUFFIXES = sorted(
+    ["装置", "デバイス", "部品", "ユニット", "モジュール", "手段", "機構",
+     "回路", "素子", "ブロック", "セクション", "システム", "部", "器", "機"],
+    key=len, reverse=True,
+)
+
+
+def _split_stem_and_role_suffix(term):
     """
-    構成要素名のうち、正規化しても一致しないが、埋め込みベクトルでの
-    意味的な類似度が高い語のペアを検出する（例：「制御部」と「制御装置」）。
+    「制御装置」→ ("制御", "装置") のように、末尾の役割語（装置・部・
+    手段等）を切り出す。該当する役割語で終わっていなければ (term, None)。
+    """
+    for suf in _ROLE_SUFFIXES:
+        if term.endswith(suf) and len(term) > len(suf):
+            return term[: -len(suf)], suf
+    return term, None
+
+
+def check_similar_terms(components):
+    """
+    構成要素名のうち、中心となる語（幹）は同じなのに、末尾の役割語
+    （装置／部／手段／ユニット等）だけが違う組み合わせを検出する
+    （例：「制御部」と「制御装置」、「半導体素子」と「半導体デバイス」）。
     check_notation_variants()で検出できる、正規化すれば一致する表記ゆれは
-    除く（そちらの方が確度が高い別種の指摘のため）。
+    対象外（そちらの方が確度が高い別種の指摘のため）。
 
-    埋め込みモデルの読み込みに、初回は1分程度かかることがある。
+    以前は埋め込みベクトルによる意味的類似度で判定していたが、「表示部」と
+    「通信部」のように役割語が同じだけで中身は無関係な語同士まで高い類似度
+    が出てしまい、実用に耐えなかったため、幹の完全一致で判定する方式に
+    変更した。その分、幹の表記まで違う言い換え（例：「制御部」と
+    「コントローラ」）は検出できない。
 
-    戻り値: [{"term_a":.., "term_b":.., "similarity":..}, ...]
-             （類似度が高い順）
+    戻り値: [{"term_a":.., "term_b":.., "stem":..}, ...]
     """
-    import numpy as np
-
     terms = sorted({_normalize_component_text(c["text"]) for c in components if c["text"].strip()})
     terms = [t for t in terms if t]
-    if len(terms) < 2:
-        return []
 
-    model = _get_embed_model()
-    embeddings = model.encode(terms, normalize_embeddings=True)
+    by_stem = {}
+    for t in terms:
+        stem, suf = _split_stem_and_role_suffix(t)
+        if suf is None or not stem:
+            continue
+        by_stem.setdefault(stem, set()).add(t)
 
     pairs = []
-    for i in range(len(terms)):
-        for j in range(i + 1, len(terms)):
-            if _canonicalize_for_variant_check(terms[i]) == _canonicalize_for_variant_check(terms[j]):
-                continue
-            sim = float(np.dot(embeddings[i], embeddings[j]))
-            if sim >= threshold:
-                pairs.append({"term_a": terms[i], "term_b": terms[j], "similarity": sim})
+    for stem, terms_with_suffix in by_stem.items():
+        if len(terms_with_suffix) < 2:
+            continue
+        terms_sorted = sorted(terms_with_suffix)
+        for i in range(len(terms_sorted)):
+            for j in range(i + 1, len(terms_sorted)):
+                pairs.append({"term_a": terms_sorted[i], "term_b": terms_sorted[j], "stem": stem})
 
-    pairs.sort(key=lambda x: -x["similarity"])
     return pairs
 
 

@@ -137,6 +137,49 @@ st.markdown(
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("GiNZAで日本語特許請求項を「主語・動詞・目的語」に分解して、構成要素の関係を可視化します")
 
+
+def get_components_relations_input(key_prefix, placeholder_single="", placeholder_block=""):
+    """
+    記載チェック（構成要素の未接続・表記ゆれ・用語の不一致）用の入力UI。
+
+    「単独の請求項（本文のみ）」と「複数請求項（【請求項１】〜の形式）」を
+    選べるようにする。後者では、実際の公報のように「請求項１に記載の」
+    という引用表現ごと請求項群を貼り付けても、その引用表現自体は解析対象
+    から正しく除外される（analyze_dependent_claim_with_components()が
+    _build_claim_chain()を使って引用部分を切り分けるため）。
+    これを単独入力用の解析にそのまま流し込むと、「請求項」「記載」等の
+    語がそのまま構成要素として誤抽出されてしまうので注意。
+
+    戻り値: (components, relations) のタプル、またはまだ入力が
+             確定していない・エラーの場合は None
+    """
+    input_mode = st.radio(
+        "入力形式",
+        ["単独の請求項（本文のみ）", "複数請求項（【請求項１】〜の形式、従属関係を展開）"],
+        horizontal=True, key=f"{key_prefix}_input_mode",
+    )
+    if input_mode.startswith("単独"):
+        text = st.text_area("請求項テキスト", height=200, placeholder=placeholder_single, key=f"{key_prefix}_single_text")
+        if not text.strip():
+            return None
+        components, relations = pp.analyze_claim(text)
+        return components, relations
+    else:
+        st.caption("「請求項１に記載の」のような引用表現ごと、そのまま貼り付けて構いません。")
+        block_text = st.text_area(
+            "請求項群", height=240, placeholder=placeholder_block, key=f"{key_prefix}_block_text",
+        )
+        if not block_text.strip():
+            return None
+        parsed = pp.parse_claims_block(block_text)
+        if not parsed:
+            st.warning("請求項を認識できませんでした。テキストを確認してください。")
+            return None
+        target_num = st.selectbox("対象にする請求項番号", sorted(parsed.keys()), key=f"{key_prefix}_target_num")
+        components, relations, _full_text = pp.analyze_dependent_claim_with_components(target_num, parsed)
+        return components, relations
+
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🪸 1つの請求項を解析", "🐚 2つの請求項を比較",
     "🪼 従属請求項を展開", "🔭 ポートフォリオ分析", "📋 記載チェック",
@@ -1053,18 +1096,17 @@ with tab5:
             "SAO抽出（構成要素間の関係）の結果を利用します。抽出漏れがあると誤検出することがあるため、"
             "実際に「🪸 1つの請求項を解析」タブの図と照らし合わせて確認してください。"
         )
-        disc_text = st.text_area(
-            "請求項テキスト",
-            height=200,
-            placeholder="例：半導体チップと、前記半導体チップを収容するケースと、第1端子と、第2端子と、を備える半導体装置。",
-            key="disc_text",
+        disc_input = get_components_relations_input(
+            "disc",
+            placeholder_single="例：半導体チップと、前記半導体チップを収容するケースと、第1端子と、第2端子と、を備える半導体装置。",
+            placeholder_block="【請求項１】\n（請求項1の全文）\n【請求項２】\n（請求項1に記載の…を含む）",
         )
         if st.button("📋 チェックする", key="disc_check_run"):
-            if not disc_text.strip():
+            if disc_input is None:
                 st.warning("請求項テキストを入力してください。")
             else:
                 try:
-                    components, relations = pp.analyze_claim(disc_text)
+                    components, relations = disc_input
                     st.session_state.disc_result = pp.check_disconnected_components(components, relations)
                 except Exception as e:
                     st.error(f"チェック中にエラーが発生しました: {e}")
@@ -1080,18 +1122,17 @@ with tab5:
     elif check_mode == "用語の表記ゆれチェック":
         st.markdown("#### 表記だけが違う構成要素名を検出します")
         st.caption("例：「第１端子」と「第1端子」のように、全角/半角数字などの違いだけで、別の構成要素として扱われてしまっているケースを検出します。")
-        variant_text = st.text_area(
-            "請求項テキスト",
-            height=200,
-            placeholder="例：第１端子と、第1端子に接続された配線と、を備える半導体装置。",
-            key="variant_text",
+        variant_input = get_components_relations_input(
+            "variant",
+            placeholder_single="例：第１端子と、第1端子に接続された配線と、を備える半導体装置。",
+            placeholder_block="【請求項１】\n（請求項1の全文）\n【請求項２】\n（請求項1に記載の…を含む）",
         )
         if st.button("📋 チェックする", key="variant_check_run"):
-            if not variant_text.strip():
+            if variant_input is None:
                 st.warning("請求項テキストを入力してください。")
             else:
                 try:
-                    components, _ = pp.analyze_claim(variant_text)
+                    components, _ = variant_input
                     st.session_state.variant_result = pp.check_notation_variants(components)
                 except Exception as e:
                     st.error(f"チェック中にエラーが発生しました: {e}")
@@ -1108,32 +1149,26 @@ with tab5:
         st.markdown("#### 似ているのに表記が違う構成要素名を検出します")
         st.caption(
             "①序数付きの構成要素（「第１端子」等）について、同じ番号なのに末尾の名詞が食い違っているケース、"
-            "②意味的に近い構成要素名のペア（例：「制御部」と「制御装置」）を検出します。"
-            "②は初回、埋め込みモデルの読み込みに1分程度かかります。"
+            "②中心となる語（幹）は同じなのに、末尾の役割語（装置／部／手段／ユニット等）だけが違う組み合わせ"
+            "（例：「制御部」と「制御装置」）を検出します。"
         )
-        mismatch_text = st.text_area(
-            "請求項テキスト",
-            height=200,
-            placeholder="例：第１端子と、前記第１電極に接続された配線と、を備える半導体装置。",
-            key="mismatch_text",
-        )
-        mismatch_threshold = st.slider(
-            "②の類似度の閾値（これ以上似ていたら警告）",
-            min_value=0.5, max_value=0.95, value=0.75, step=0.01, key="mismatch_threshold",
+        mismatch_input = get_components_relations_input(
+            "mismatch",
+            placeholder_single="例：第１端子と、前記第１電極に接続された配線と、を備える半導体装置。",
+            placeholder_block="【請求項１】\n（請求項1の全文）\n【請求項２】\n（請求項1に記載の…を含む）",
         )
         if st.button("📋 チェックする", key="mismatch_check_run"):
-            if not mismatch_text.strip():
+            if mismatch_input is None:
                 st.warning("請求項テキストを入力してください。")
             else:
-                with st.spinner("解析中..."):
-                    try:
-                        components, _ = pp.analyze_claim(mismatch_text)
-                        ordinal_warnings = pp.check_ordinal_term_consistency(components)
-                        similar_pairs = pp.check_similar_terms(components, threshold=mismatch_threshold)
-                        st.session_state.mismatch_result = (ordinal_warnings, similar_pairs)
-                    except Exception as e:
-                        st.error(f"チェック中にエラーが発生しました: {e}")
-                        st.session_state.mismatch_result = None
+                try:
+                    components, _ = mismatch_input
+                    ordinal_warnings = pp.check_ordinal_term_consistency(components)
+                    similar_pairs = pp.check_similar_terms(components)
+                    st.session_state.mismatch_result = (ordinal_warnings, similar_pairs)
+                except Exception as e:
+                    st.error(f"チェック中にエラーが発生しました: {e}")
+                    st.session_state.mismatch_result = None
         if st.session_state.get("mismatch_result") is not None:
             ordinal_warnings, similar_pairs = st.session_state.mismatch_result
 
@@ -1145,14 +1180,14 @@ with tab5:
                 for w in ordinal_warnings:
                     st.write(f"- 第{w['num']}：{' / '.join(w['terms'])}　→　同じ番号なのに名称が食い違っています")
 
-            st.markdown("##### ② 意味的に近い用語のペア")
+            st.markdown("##### ② 役割語だけが違う用語のペア")
             if not similar_pairs:
-                st.success("✅ 意味的に近い用語のペアは見つかりませんでした。")
+                st.success("✅ 役割語だけが違う用語のペアは見つかりませんでした。")
             else:
                 st.warning(f"⚠️ {len(similar_pairs)} 件の類似する用語のペアが見つかりました。")
                 st.dataframe(
                     [
-                        {"用語A": p["term_a"], "用語B": p["term_b"], "類似度": round(p["similarity"], 2)}
+                        {"用語A": p["term_a"], "用語B": p["term_b"], "共通する幹": p["stem"]}
                         for p in similar_pairs
                     ],
                     hide_index=True, width='stretch',
