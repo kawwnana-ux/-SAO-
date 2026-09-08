@@ -4,10 +4,4 @@ ginza
 ja-ginza
 networkx
 matplotlib
-sentence-transformers
-scipy
-numpy
-graphviz
-wordcloud
-scikit-learn
-plotly
+japanize-matplotlib
