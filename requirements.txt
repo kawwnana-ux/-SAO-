@@ -5,3 +5,4 @@ ja-ginza
 networkx
 matplotlib
 japanize-matplotlib
+graphviz
