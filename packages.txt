@@ -1,2 +1,1 @@
 --allow-insecure-repositories
-graphviz
