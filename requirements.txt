@@ -10,3 +10,4 @@ scipy
 sentence_transformers
 seaborn
 wordcloud
+doc_embedding
