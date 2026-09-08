@@ -1286,3 +1286,65 @@ with tab5:
                     st.write("- 請求項" + str(num) + " → " + "、".join(f"請求項{p}" for p in parents))
                 else:
                     st.write(f"- 請求項{num}：独立請求項")
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.feature_extraction.text import TfidfVectorizer
+import matplotlib.font_manager as fm
+import os
+
+# 日本語フォントの設定（既存のパッチに合わせて NotoSansJP を使用）
+FONT_PATH = "/tmp/NotoSansJP-Regular.ttf"
+if os.path.exists(FONT_PATH):
+    fp = fm.FontProperties(fname=FONT_PATH)
+    plt.rc('font', family=fp.get_name())
+
+def analyze_applicant_keywords(df, text_col="claim_text", applicant_col="applicant", top_n=10):
+    """
+    出願人ごとのテキストマイニング（TF-IDF / 頻出キーワード抽出）
+    """
+    # 出願人ごとにテキストを結合
+    grouped = df.groupby(applicant_col)[text_col].apply(lambda texts: " ".join(texts.dropna())).reset_index()
+    
+    # GiNZA 等で抽出した名詞を使うか、簡易的に TF-IDF でキーワード抽出
+    vectorizer = TfidfVectorizer(max_features=500, stop_words=["前記", "特徴", "発明", "装置", "こと", "もの"])
+    tfidf_matrix = vectorizer.fit_transform(grouped[text_col])
+    feature_names = vectorizer.get_feature_names_out()
+    
+    keywords_by_applicant = {}
+    for i, row in grouped.iterrows():
+        applicant = row[applicant_col]
+        scores = tfidf_matrix[i].toarray().flatten()
+        top_indices = scores.argsort()[-top_n:][::-1]
+        top_keywords = [(feature_names[idx], round(scores[idx], 4)) for idx in top_indices if scores[idx] > 0]
+        keywords_by_applicant[applicant] = top_keywords
+        
+    return keywords_by_applicant
+
+def draw_heatmap_applicant_keywords(df, text_col="claim_text", applicant_col="applicant", top_n_keywords=15):
+    """
+    出願人×主要キーワードのサーモグラフィ（ヒートマップ）の描画
+    """
+    # 1. 全体で高頻度/高TF-IDFなキーワードを取得
+    vectorizer = TfidfVectorizer(max_features=top_n_keywords, stop_words=["前記", "特徴", "発明", "装置", "こと", "もの"])
+    tfidf_matrix = vectorizer.fit_transform(df[text_col].fillna(""))
+    feature_names = vectorizer.get_feature_names_out()
+    
+    # 2. 出願人ごとの出現頻度/スコアのマトリックスを作成
+    tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=feature_names)
+    tfidf_df[applicant_col] = df[applicant_col].values
+    
+    matrix = tfidf_df.groupby(applicant_col).mean()
+    
+    # 3. サーモグラフィ（ヒートマップ）の描画
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.heatmap(matrix, cmap="YlOrRd", annot=True, fmt=".2f", ax=ax, cbar_kws={'label': 'TF-IDF Score'})
+    
+    ax.set_title("出願人別 主要キーワード・サーモグラフィ")
+    ax.set_xlabel("キーワード")
+    ax.set_ylabel("出願人")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    
+    return fig
