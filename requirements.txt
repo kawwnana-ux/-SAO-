@@ -9,3 +9,4 @@ graphviz
 scipy
 sentence_transformers
 seaborn
+wordcloud
