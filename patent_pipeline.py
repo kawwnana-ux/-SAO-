@@ -153,6 +153,58 @@ def _normalize_component_text(phrase):
 # ① 構成要素抽出
 # ============================================================
 
+def _is_nominalized_adjective_start(doc, i):
+    """形容詞語幹＋「さ」「み」による名詞化パターンを検出する（例: 厚さ、大きさ、重み）。
+    GiNZA はこれを ADJ + PART(mark) として解析するため、通常の NOUN/PROPN 連結では
+    「第１の厚さ」の「厚さ」部分が欠落してしまう。これを名詞句の一部として認識する。
+    """
+    if i + 1 >= len(doc):
+        return False
+    t, nxt = doc[i], doc[i + 1]
+    return t.pos_ == "ADJ" and nxt.text in ("さ", "み") and nxt.dep_ == "mark"
+
+
+def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=False):
+    """i位置から名詞句トークン列を貪欲に消費し、(words, next_i) を返す共通ロジック。
+
+    fresh_start=True のときは、先頭トークンを（品詞や関係語チェックに関わらず）
+    無条件に採用する（＝呼び出し元で既に NOUN/PROPN・NUM+名詞・名詞化形容詞などの
+    条件を確認済みで、新規にフレーズを開始する場合の従来挙動）。それ以外
+    （fresh_start=False。「第１の」等の既存プレフィックスへの継続）では、
+    先頭トークンも関係語チェックの対象にする（従来の while ループと同じ挙動を
+    維持し、意図せず「端部」等の関係語をコンポーネント名に取り込んでしまう
+    回帰を防ぐ）。
+    """
+    if first_is_nominalized_adj:
+        return [doc[i].text, doc[i + 1].text], i + 2
+    words = []
+    first = True
+    while i < len(doc):
+        if first and fresh_start:
+            words.append(doc[i].text)
+            i += 1
+            first = False
+            continue
+        if doc[i].pos_ in {"NOUN", "PROPN"}:
+            if (
+                _is_generic_relation_word(doc[i])
+                or doc[i].text in ("前記", "該", "うち", "乃至")
+                or not doc[i].text.strip()
+            ):
+                break
+            words.append(doc[i].text)
+            i += 1
+            first = False
+        elif _is_nominalized_adjective_start(doc, i):
+            words.append(doc[i].text)
+            words.append(doc[i + 1].text)
+            i += 2
+            break
+        else:
+            break
+    return words, i
+
+
 def extract_patent_components_general(doc):
     components = []
     i = 0
@@ -176,11 +228,11 @@ def extract_patent_components_general(doc):
             if i < len(doc) and doc[i].text == "の":
                 words.append(doc[i].text)
                 i += 1
-            while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち", "乃至") or not doc[i].text.strip():
-                    break
-                words.append(doc[i].text)
-                i += 1
+            if i < len(doc) and (doc[i].pos_ in {"NOUN", "PROPN"} or _is_nominalized_adjective_start(doc, i)):
+                more_words, i = _consume_noun_phrase(
+                    doc, i, first_is_nominalized_adj=_is_nominalized_adjective_start(doc, i)
+                )
+                words.extend(more_words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
             if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
@@ -192,7 +244,7 @@ def extract_patent_components_general(doc):
             and i + 1 < len(doc)
             and doc[i + 1].pos_ in {"NOUN", "PROPN"}
             and not _is_counter_word(doc[i + 1])
-        ):
+        ) or _is_nominalized_adjective_start(doc, i):
             # 「三次元」のように、数詞がそのまま名詞の一部になっている
             # 複合語（"第１の基板"のように間に"の"を挟まないもの）にも対応する。
             # ただし「２枚」「１種」のような「数字＋助数詞」（この後に
@@ -202,13 +254,9 @@ def extract_patent_components_general(doc):
                 i += 1
                 continue
             start = i
-            words = [token.text]
-            i += 1
-            while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
-                if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち", "乃至") or not doc[i].text.strip():
-                    break
-                words.append(doc[i].text)
-                i += 1
+            words, i = _consume_noun_phrase(
+                doc, i, first_is_nominalized_adj=_is_nominalized_adjective_start(doc, i), fresh_start=True
+            )
             end = i - 1
             phrase = _normalize_component_text("".join(words))
             if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
@@ -481,10 +529,22 @@ def _merged_modifier_name(token, components):
         if not has_no:
             continue
         child_comp = find_component_by_token(components, child.i)
+        if child_comp is not None and comp is not None and (child_comp["start"], child_comp["end"]) == (comp["start"], comp["end"]):
+            # child が既に base と同じ結合済みコンポーネント内（例:「第１の厚さ」）の場合は
+            # 自己参照になってしまうため、所有格プレフィックスとして採用しない。
+            continue
         prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
         break
 
     return prefix + base
+
+
+def _name_for_component(doc, comp, components):
+    """コンポーネント辞書から、所有格プレフィックス（nmod「の」）を含めた表示名を作る。"""
+    if comp is None:
+        return None
+    anchor = doc[comp["end"]]
+    return _merged_modifier_name(anchor, components)
 
 
 def _find_owner_via_acl(token, components):
@@ -1002,6 +1062,10 @@ def extract_comparison_relations(doc, components):
         target_comp = find_component_by_token(components, yori_child.i) or find_referenced_component(components, yori_child)
         if target_comp is None:
             continue
+        # 所有格プレフィックス込みの名前を使う（「熱膨張係数」等、持ち主違いの
+        # 同名属性が多いため、bareな名前のままだと下のsource=target判定で
+        # 別々の実体が誤って同一視され、関係が抽出されなくなってしまう）。
+        target_name = _merged_modifier_name(yori_child, components)
 
         # 比較の対象（Ａ）は、このadj自身のnsubj、またはこのadjの
         # 係り先（複合語の頭、さらにその先の動詞や文全体の主語など）を
@@ -1028,13 +1092,16 @@ def extract_comparison_relations(doc, components):
         if subj_token is None:
             continue
         source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
-        if source_comp is None or source_comp["text"] == target_comp["text"]:
+        if source_comp is None:
+            continue
+        source_name = _merged_modifier_name(subj_token, components)
+        if source_name == target_name:
             continue
 
         relations.append({
-            "source": source_comp["text"],
+            "source": source_name,
             "relation": f"より{adj.text}",
-            "target": target_comp["text"],
+            "target": target_name,
             "type": "direct",
         })
 
@@ -1059,6 +1126,7 @@ def extract_comparison_relations(doc, components):
         target_comp = find_component_by_token(components, obj_token.i) or find_referenced_component(components, obj_token)
         if target_comp is None:
             continue
+        target_name = _merged_modifier_name(obj_token, components)
 
         subj_token = None
         for c in verb.children:
@@ -1082,13 +1150,16 @@ def extract_comparison_relations(doc, components):
         if subj_token is None:
             continue
         source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
-        if source_comp is None or source_comp["text"] == target_comp["text"]:
+        if source_comp is None:
+            continue
+        source_name = _merged_modifier_name(subj_token, components)
+        if source_name == target_name:
             continue
 
         relations.append({
-            "source": source_comp["text"],
+            "source": source_name,
             "relation": verb.text,
-            "target": target_comp["text"],
+            "target": target_name,
             "type": "direct",
         })
 
@@ -1347,6 +1418,59 @@ def extract_capability_relations(doc, components):
     return relations
 
 
+_QUANTIFIER_ONLY_WORDS = {
+    "複数", "一部", "全部", "一つ", "ひとつ", "いくつか", "一種", "全て", "すべて",
+    "少なくとも一部", "少なくとも一つ", "各々", "それぞれ",
+}
+
+# head 自体が「Xの◯◯」という属性・数値的な名詞（熱膨張係数、寸法、厚さ等）で
+# 終わる場合に限り、acl の意味上の対象を「Xの」側へ差し替える。
+# 「第１封止部分」のような、それ自体で完結した部材名（属性名詞で終わらない）を
+# 誤って所有格側に差し替えてしまう事故を防ぐための一般的なガード。
+_ATTRIBUTE_HEAD_SUFFIXES = (
+    "係数", "値", "率", "量", "数", "径", "幅", "厚さ", "高さ", "寸法", "面積", "体積",
+    "温度", "圧力", "速度", "強度", "硬度", "密度", "濃度", "長さ", "大きさ", "重さ",
+    "深さ", "広さ", "距離", "角度", "比率", "割合",
+)
+
+
+def _acl_semantic_target(verb, components):
+    """連体修飾節(acl)が構文上かかる名詞(head)ではなく、意味上その節が説明している
+    名詞を求める。例:「(基板に)含まれる銅の熱膨張係数」では、GiNZA上は head が
+    「熱膨張係数」になるが、「含まれる」が実際に説明しているのは「銅」である。
+    head の子に「Xの」という nmod（所有格）があれば、そちらを意味上の対象として
+    優先する。特定の請求項に依存しない一般的な構文パターン。
+
+    ただし「複数の」「少なくとも一部の」のような数量詞は実体を指す名詞ではないため
+    候補から除外する（例:「半導体層に形成された複数のトランジスタセル」では、
+    head の「トランジスタセル」を意味上の対象のままにし、数量詞「複数」に
+    差し替えてはならない）。
+
+    さらに、head 自体が「熱膨張係数」のような属性・数値的な名詞で終わる場合に限り
+    差し替えを行う。「第１封止部分」のようにそれ自体で完結した部材名の場合は、
+    たまたま近くにある別の名詞句（無関係な並列句の一部等）を意味上の対象と
+    誤認しないよう、差し替えを行わない。
+    """
+    if verb.dep_ != "acl":
+        return None
+    head = verb.head
+    if not head.text.endswith(_ATTRIBUTE_HEAD_SUFFIXES):
+        return None
+    candidates = []
+    for child in head.children:
+        if child.i == verb.i or child.dep_ != "nmod":
+            continue
+        if any(c.dep_ == "case" and c.text == "の" for c in child.children):
+            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
+            if comp is not None and comp["text"] not in _QUANTIFIER_ONLY_WORDS:
+                candidates.append(child)
+    if not candidates:
+        return None
+    # head直前（＝最も直接的な所有格）を優先する。
+    nearest = max(candidates, key=lambda c: c.i)
+    return find_component_by_token(components, nearest.i) or find_referenced_component(components, nearest)
+
+
 def extract_direct_relations(doc, components):
     """
     「Ａに接続されたＢ」（受身）と「Ｂを破砕するＡ」（能動）の
@@ -1451,6 +1575,14 @@ def extract_direct_relations(doc, components):
                 )
         if head_component is None:
             continue
+
+        # 「(基板に)含まれる銅の熱膨張係数」のように、連体修飾節(acl)が
+        # 構文上かかる名詞(head)が「Xの◯◯」という属性・数値的な名詞
+        # （熱膨張係数、寸法、厚さ等）である場合、節が実際に説明しているのは
+        # head自身ではなく所有格側（銅）であることが多い。これを優先する。
+        acl_target = _acl_semantic_target(verb, components)
+        if acl_target is not None and acl_target["text"] != head_component["text"]:
+            head_component = acl_target
 
         if _is_passive(verb):
             # 受身：通常はhead（動詞の係り先）が受け手（target）だが、
@@ -2044,18 +2176,34 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     all_targets = set(r["target"] for r in relations)
     roots = [o for o in owners if o not in all_targets]
 
-    if len(roots) > 1 and doc is not None and components is not None:
-        # 根の候補が複数ある場合、文末の語（＝発明の名称）に一致する
-        # ものを優先する（例：「基板」と「ロードポート」の両方が候補に
-        # なってしまっても、実際の根は文末の「ロードポート」であるため）。
+    # 根の候補が「複数」または「０個」の場合に、文末の語（＝発明の名称）に
+    # 一致するものを優先する（例：「基板」と「ロードポート」の両方が候補に
+    # なってしまっても、実際の根は文末の「ロードポート」であるため）。
+    # ０個になるのは、他の関係抽出の誤りで「有する」の所有者自身が
+    # どこかのtargetにもなってしまっている場合で、まれに起こりうる。
+    claim_title = None
+    if len(roots) != 1 and doc is not None and components is not None:
         last_i = len(doc) - 1
         while last_i > 0 and doc[last_i].pos_ == "PUNCT":
             last_i -= 1
         claim_title = find_component_by_token(components, last_i)
+
+    if len(roots) > 1:
         if claim_title is not None and claim_title["text"] in roots:
             roots = [claim_title["text"]]
+        else:
+            # setの反復順（ハッシュ値に依存し実行のたびに変わりうる）に
+            # 頼ると、同じ入力でも実行ごとに異なる根が選ばれてしまうため、
+            # 文字列として決定的な順序（sorted）にする。
+            roots = sorted(roots)
+    elif not roots:
+        if claim_title is not None and claim_title["text"] in owners:
+            roots = [claim_title["text"]]
+        elif owners:
+            # 同上の理由で、setの反復順ではなくsorted順で決定的に選ぶ。
+            roots = [sorted(owners)[0]]
 
-    root = roots[0] if roots else next(iter(owners))
+    root = roots[0] if roots else sorted(owners)[0]
 
     incoming = {}
     for r in relations:
