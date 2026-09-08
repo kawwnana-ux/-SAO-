@@ -6,3 +6,4 @@ networkx
 matplotlib
 japanize-matplotlib
 graphviz
+scipy
