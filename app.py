@@ -863,9 +863,12 @@ with tab4:
                         st.error(f"マップ作成中にエラーが発生しました: {e}")
                 if st.session_state.get("kwfi_result") is not None:
                     matrix_kw, kw_list, fi_list = st.session_state.kwfi_result
-                    fig = pp.plot_keyword_fi_heatmap(matrix_kw, kw_list, fi_list, title=f"{kwfi_source}×FI ホワイトスペースマップ")
-                    st.pyplot(fig)
-                    st.caption("色が濃いマスほど出願件数が多く、白いマスがホワイトスペース候補です。")
+                    try:
+                        fig = pp.plot_keyword_fi_heatmap(matrix_kw, kw_list, fi_list, title=f"{kwfi_source}×FI ホワイトスペースマップ")
+                        st.pyplot(fig)
+                        st.caption("色が濃いマスほど出願件数が多く、白いマスがホワイトスペース候補です。")
+                    except Exception as e:
+                        st.error(f"マップ作成中にエラーが発生しました: {e}")
 
             st.divider()
             st.markdown("#### 🔮 キーワード→FI推薦（母集団作成支援）")

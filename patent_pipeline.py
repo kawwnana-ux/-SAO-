@@ -236,6 +236,10 @@ def _relation_word_is_real_argument(doc, start, end):
     return token.dep_ in ("nsubj", "obj") and token.head.pos_ == "VERB"
 
 
+import re as _re_symbolic_label
+_SYMBOLIC_LATIN_LABEL_RE = _re_symbolic_label.compile(r"^[A-Za-zＡ-Ｚａ-ｚ]{1,4}$")
+
+
 def extract_patent_components_general(doc):
     components = []
     i = 0
@@ -248,6 +252,42 @@ def extract_patent_components_general(doc):
 
         if _is_generic_relation_word_bigram(doc, i):
             i += 2
+            continue
+
+        if (
+            _SYMBOLIC_LATIN_LABEL_RE.match(token.text)
+            and i + 1 < len(doc)
+            and doc[i + 1].pos_ == "NUM"
+        ):
+            # 「Ｌ１」「Ｖ２」のような、アルファベット＋数字の記号的な名称
+            # （寸法・電圧等を表す変数名）や、「ＳｉＣ」「ＣＯ２」のような
+            # 化学式は、GiNZAのトークナイザで「Ｌ」（NOUN）と「１」（NUM）の
+            # ように分割されてしまい、そのままでは正しい構成要素として
+            # 認識されない。「第」＋数字のケースと同様に、直後がNUMなら
+            # まとめて1つの構成要素にする。
+            start = i
+            words = [doc[i].text]
+            i += 1
+            while i < len(doc) and doc[i].pos_ == "NUM":
+                words.append(doc[i].text)
+                i += 1
+            # 「Ａｌ２Ｏ３」「Ｓｉ３Ｎ４」のような複数元素の化学式は、
+            # 「アルファベット＋数字」の組が読点等を挟まず連続して続く。
+            # その場合は同じ構成要素として繋げて取り込む。
+            while (
+                i + 1 < len(doc)
+                and _SYMBOLIC_LATIN_LABEL_RE.match(doc[i].text)
+                and doc[i + 1].pos_ == "NUM"
+            ):
+                words.append(doc[i].text)
+                i += 1
+                while i < len(doc) and doc[i].pos_ == "NUM":
+                    words.append(doc[i].text)
+                    i += 1
+            end = i - 1
+            phrase = _normalize_component_text("".join(words))
+            if phrase not in GENERIC_NOUNS:
+                components.append({"text": phrase, "start": start, "end": end})
             continue
 
         if token.text == "第" and i + 1 < len(doc) and doc[i + 1].pos_ == "NUM":
@@ -811,6 +851,43 @@ def extract_boundary_relations(doc, components):
     return relations
 
 
+def _find_nsubj_target_for_verb(doc, components, verb):
+    """
+    「前記取り付けフレームの一部は、Ａと、Ｂとの間に位置する」のように、
+    位置関係の動詞（位置する等）が名詞を修飾する連体修飾節（acl）として
+    使われている場合、GiNZAの長文解析でこの動詞自身の主語（「一部」）が、
+    動詞にではなく、その動詞が係る先のさらに遠い名詞（節全体が最終的に
+    かかる請求項全体の名前など）に直接の子（nsubj）として誤って
+    結びついてしまうことがある（extract_has_relationsのsubj_token選択で
+    対応した問題と同じ系統のバグ）。
+
+    obj（目的語）が見つからない場合のフォールバックとして、まず動詞自身、
+    次に動詞の係り先（head）の直接の子からnsubjを探し、動詞に一番近い
+    ものを主語として採用する。所有格プレフィックス（「取り付けフレームの」
+    等）も含めた名前を使う。
+    """
+    candidates = []
+    seen_idx = set()
+    for child in verb.children:
+        if child.dep_ == "nsubj" and child.i not in seen_idx:
+            candidates.append(child)
+            seen_idx.add(child.i)
+    if verb.head is not None and verb.head.i != verb.i:
+        for child in verb.head.children:
+            if child.dep_ == "nsubj" and child.i not in seen_idx:
+                candidates.append(child)
+                seen_idx.add(child.i)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: abs(c.i - verb.i))
+    chosen = candidates[0]
+    comp = find_component_by_token(components, chosen.i) or find_referenced_component(components, chosen)
+    if comp is None:
+        return None
+    merged_text = _merged_modifier_name(chosen, components)
+    return {"text": merged_text}
+
+
 def extract_positional_relations(doc, components, relation_words):
     relations = []
     for relation in relation_words:
@@ -825,6 +902,32 @@ def extract_positional_relations(doc, components, relation_words):
         verb = relation_token.head
         if verb.pos_ != "VERB":
             continue
+
+        # 「ＡとＢとの間に」のように、「間」の基準となる複数の対象のうち
+        # 一方（Ａ）が「間」自身の子（nmod）ではなく、動詞の別のobl引数
+        # として並列に現れることがある（「Ａと、Ｂとの間に」で、Ａ側が
+        # 動詞に直接係り、Ｂ側だけが「間」に係る場合）。そのような「と」
+        # 付きの並列obl引数も基準側（source）として拾う。また、
+        # 「Ａ、ＢおよびＣと」のように列挙されている場合は、nmodで
+        # 連なる連鎖（Ｃ→Ｂ→Ａ）を辿って全項目を拾う。
+        for sibling in verb.children:
+            if sibling.i == relation_token.i or sibling.dep_ != "obl":
+                continue
+            if not any(gc.dep_ == "case" and gc.text == "と" for gc in sibling.children):
+                continue
+            chain_token = sibling
+            visited_chain = set()
+            while chain_token is not None and chain_token.i not in visited_chain:
+                visited_chain.add(chain_token.i)
+                c = find_referenced_component(components, chain_token)
+                if c is not None and c not in source_components:
+                    source_components.append(c)
+                next_token = None
+                for gc in chain_token.children:
+                    if gc.dep_ == "nmod":
+                        next_token = gc
+                        break
+                chain_token = next_token
 
         is_has_branch = verb.lemma_ in HAS_LEMMAS
         if is_has_branch:
@@ -848,9 +951,14 @@ def extract_positional_relations(doc, components, relation_words):
                         target_components.append(t)
                     break
             if not target_components:
-                # 動詞自身に直接の目的語(obj)がない場合（受身形など）だけ、
-                # 従来通り動詞連鎖を遡って構成要素を探す
-                target_components = find_target_component_from_verb(components, verb)
+                # 動詞自身に直接の目的語(obj)がない場合、まず動詞（またはその
+                # 係り先）のnsubjを探す。見つからない場合だけ、従来通り
+                # 動詞連鎖を遡って構成要素を探す。
+                nsubj_target = _find_nsubj_target_for_verb(doc, components, verb)
+                if nsubj_target is not None:
+                    target_components = [nsubj_target]
+                else:
+                    target_components = find_target_component_from_verb(components, verb)
             aux_texts = "".join(
                 c.text for c in sorted(verb.children, key=lambda c: c.i)
                 if c.pos_ == "AUX" and c.i > verb.i
@@ -1207,9 +1315,18 @@ def extract_comparison_relations(doc, components):
     # 「ＡはＢより小さい（大きい／高い／低い／長い／短い等）」のような
     # 比較表現。「より」で係る語（Ｂ）と、比較の対象（Ａ、通常は
     # nsubj）を抽出する。
-    COMPARISON_ADJ = {"小さい", "大きい", "高い", "低い", "長い", "短い", "多い", "少ない", "広い", "狭い"}
+    COMPARISON_ADJ = {
+        "小さい", "大きい", "高い", "低い", "長い", "短い", "多い", "少ない", "広い", "狭い",
+        "薄い", "厚い", "深い", "浅い", "硬い", "柔らかい", "重い", "軽い", "太い", "細い",
+        "強い", "弱い", "遠い", "近い", "粗い", "濃い",
+    }
     for adj in doc:
-        if adj.pos_ != "ADJ" or adj.lemma_ not in COMPARISON_ADJ:
+        # 「薄くて」「硬くて」のようなテ形（連用中止形）は、GiNZAでpos_が
+        # ADJではなくVERBとして解析されることがある。lemma自体は元の
+        # 形容詞（薄い／硬い等）のまま保たれるので、pos_をADJに限定せず
+        # VERBも許容する（対象のlemma集合を絞っているため誤検出のリスクは
+        # 低い）。
+        if adj.pos_ not in ("ADJ", "VERB") or adj.lemma_ not in COMPARISON_ADJ:
             continue
 
         yori_child = None
@@ -2520,6 +2637,28 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     for r in simplified:
         outgoing.setdefault(r["source"], []).append(r)
 
+    # 「Ｘの一部」のように、ある構成要素Ｘの一部分を表す名前は、Ｘ自体が
+    # 既に根や他の関係と繋がっている（＝孤立していない）なら、この時点では
+    # まだ Ｘ→の→Ｘの一部 という関係が無くても、後段の
+    # `_add_genitive_provenance_relations` で必ず繋がる。そのため、
+    # ここで「誰からも指されていない孤立ノード」と誤判定して
+    # 根から直接「有する」を張ってしまう（＝Ｘの一部があたかも根の
+    # 直接の構成要素であるかのような、二重・不正確な関係になる）のを防ぐ。
+    known_nodes = set()
+    for r in simplified:
+        known_nodes.add(r["source"])
+        known_nodes.add(r["target"])
+
+    def _has_connected_genitive_owner(node_text):
+        idx = node_text.find("の")
+        while idx != -1:
+            owner_candidate = node_text[:idx]
+            if owner_candidate and owner_candidate != node_text and owner_candidate in known_nodes:
+                if owner_candidate == root or owner_candidate in incoming2:
+                    return True
+            idx = node_text.find("の", idx + 1)
+        return False
+
     extra = []
     added = set()
     for r in simplified:
@@ -2532,6 +2671,8 @@ def _simplify_hierarchy(relations, doc=None, components=None):
             continue
         own_relations = outgoing.get(s, [])
         if own_relations and all("設け" in x["relation"] for x in own_relations):
+            continue
+        if _has_connected_genitive_owner(s):
             continue
         extra.append({"source": root, "relation": "有する", "target": s, "type": "has", "claim_number": r.get("claim_number")})
         added.add(s)
@@ -2566,6 +2707,81 @@ def _clean_claim_text(text):
     return text
 
 
+_NUMERIC_THRESHOLD_WORDS = {"以上", "以下", "未満", "超", "以内", "程度"}
+
+
+def extract_numeric_threshold_relations(doc, components):
+    """
+    「銅板の硬度が４５Ｈｖ以上であり」「反り量が２μｍ／ｍｍ以下である」の
+    ように、名詞化された比較語（以上/以下/未満/超/以内/程度）がnsubjで
+    属性名（硬度、反り量等）を取り、その直接の子として数値・単位を
+    持つ構文を扱う。
+
+    正解データでは、この種の文を
+        (「所有者の属性名」, "以上である"/"以下である"等, 数値＋単位)
+    という形（属性名の複合語自体を1つのsourceにし、比較語をrelationに、
+    数値だけをtargetにする）で表現していることが多い。
+    extract_attribute_relations は同じ構文から別の分解
+    （所有者だけをsourceにし、属性名をrelationに、数値＋比較語をまとめて
+    targetにする）で関係を作るため、そちらを変更せず、正解データの
+    慣習に合わせた形を新たに追加する（既存の抽出結果への影響を避ける）。
+    """
+    relations = []
+    for token in doc:
+        if token.text not in _NUMERIC_THRESHOLD_WORDS or token.pos_ != "NOUN":
+            continue
+
+        nsubj_token = None
+        for child in token.children:
+            if child.dep_ == "nsubj":
+                nsubj_token = child
+                break
+        if nsubj_token is None:
+            continue
+
+        # 数値＋単位（「４５Ｈｖ」「２μｍ／ｍｍ」等）は、GiNZAの解析上
+        # nsubj（属性名）と比較語（以上/以下等）の間に、compound一段だけ
+        # とは限らない構造（nummod→nmodの入れ子等）で挟まっていることが
+        # あるため、依存木を辿るのではなく、「が/は」の直後から比較語の
+        # 直前までのテキスト範囲をそのまま数値として扱う（位置ベース）。
+        case_child = None
+        for c in nsubj_token.children:
+            if c.dep_ == "case":
+                case_child = c
+        if case_child is None:
+            continue
+        value_start = case_child.i + 1
+        value_end = token.i
+        if value_start >= value_end:
+            continue
+        value_text = "".join(doc[i].text for i in range(value_start, value_end))
+        if not value_text or not (
+            value_text[0].isdigit() or value_text[0] in "．.０１２３４５６７８９"
+        ):
+            continue
+
+        attr_words = [
+            c.text for c in sorted(nsubj_token.children, key=lambda c: c.i)
+            if c.dep_ in ("compound", "amod")
+        ]
+        attr_words.append(nsubj_token.text)
+        attribute_name = "".join(attr_words)
+
+        owner = _genitive_owner_candidate(doc, nsubj_token, components)
+        if owner is None:
+            continue
+
+        full_name = _normalize_component_text(owner["text"] + "の" + attribute_name)
+
+        relations.append({
+            "source": full_name,
+            "relation": token.text + "である",
+            "target": value_text,
+            "type": "attribute",
+        })
+    return relations
+
+
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
@@ -2586,6 +2802,7 @@ def _extract_raw_relations(text):
     capability = extract_capability_relations(doc, components)
     composition = extract_composition_relations(doc, components)
     attribute = extract_attribute_relations(doc, components)
+    numeric_threshold = extract_numeric_threshold_relations(doc, components)
     copula = extract_copula_relations(doc, components)
     comparison = extract_comparison_relations(doc, components)
     direct = extract_direct_relations(doc, components)
@@ -2593,7 +2810,7 @@ def _extract_raw_relations(text):
 
     final_relations = combine_all_relations(
         positional + location + installation + boundary,
-        direct + contact + capability + composition + attribute + copula + comparison,
+        direct + contact + capability + composition + attribute + numeric_threshold + copula + comparison,
         has,
     )
     return components, final_relations, doc
@@ -5764,6 +5981,13 @@ def plot_keyword_fi_heatmap(matrix, keyword_list, fi_list, title="キーワー�
     """build_keyword_fi_matrix() の結果をヒートマップにする"""
     import numpy as np
 
+    if not keyword_list or not fi_list:
+        # 出願人フィルタ等の条件によって、キーワード・FIのどちらかが
+        # 0件になることがある。この場合 arr が空配列（size=0）になり、
+        # 後段の arr.max() が「zero-size array」のValueErrorで落ちてしまう
+        # ため、先にわかりやすいエラーメッセージで弾く。
+        raise ValueError("キーワードまたはFIが0件のため、マップを作成できません。絞り込み条件を緩めてください。")
+
     arr = np.zeros((len(keyword_list), len(fi_list)), dtype=int)
     for i, kw in enumerate(keyword_list):
         for j, fi in enumerate(fi_list):
@@ -6417,7 +6641,15 @@ def build_claims_metadata_database(records, show_progress=True):
     """
     load_claims_with_metadata_csv() の結果から、各行の請求項本文を
     SAO解析し、メタデータ（出願人・FI等）と合わせたデータベースを作る。
+
+    build_patent_database()/build_abstract_database()等と同様に、
+    文書全体の平均埋め込みベクトル（doc_embedding）も合わせて計算する
+    （類似度ネットワーク図・意味的俯瞰マップ等、doc_embeddingを前提とする
+    機能をこのデータベースでも使えるようにするため）。
     """
+    import numpy as np
+
+    model = _get_embed_model()
     database = []
     total = len(records)
     for i, r in enumerate(records):
@@ -6432,6 +6664,22 @@ def build_claims_metadata_database(records, show_progress=True):
         entry = dict(r)
         entry["relations"] = relations
         entry["text"] = r["請求項本文"]
+
+        triples = sorted(relations_to_triple_set(relations, normalize_numbers=True)) if relations else []
+        if triples:
+            texts = [_triple_to_text(t) for t in triples]
+            embeddings = model.encode(texts, normalize_embeddings=True)
+            doc_embedding = np.mean(embeddings, axis=0)
+            doc_embedding = doc_embedding / (np.linalg.norm(doc_embedding) + 1e-8)
+        else:
+            # SAOが1件も抽出できなかった請求項は、代わりに請求項本文
+            # そのものを埋め込む（他の関数のように行ごと捨ててしまうと、
+            # メタデータ一覧・出願人フィルタ等、他の機能で件数が
+            # 合わなくなってしまうため、このデータベースでは行を残す）。
+            embedding = model.encode([r["請求項本文"]], normalize_embeddings=True)[0]
+            doc_embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+        entry["doc_embedding"] = doc_embedding
+
         database.append(entry)
     return database
 
