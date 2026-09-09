@@ -96,7 +96,7 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向"}
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向", "単数"}
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -205,6 +205,37 @@ def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=Fal
     return words, i
 
 
+
+# 「一端」「他端」は、他のRELATION_WORDS（「間」「上面」「表面」等）とは違い、
+# 「Ａの一端」のように所有者に係った上で、それ自体が動詞の主語・目的語になる
+# （＝実体として指し示される）用法が非常に多い（「整流素子の陽極側の一端が、
+# 〜に接続され」等）。他のRELATION_WORDSの語は、既存の owner 解決ロジック
+# （_merged_modifier_name等）が「その語を除外して、係り先の名詞に辿り着く」
+# 前提で正しく動いているため、同じ例外を広げるとかえって壊れる
+# （試したところ「間」「上面」「表面」等では明確に悪化した）。そのため、
+# この例外は実際にバグの原因だった「一端」「他端」の2語だけに絞る。
+_RELATION_WORDS_ALLOWED_AS_ARGUMENT = {"一端", "他端"}
+
+
+def _relation_word_is_real_argument(doc, start, end):
+    """
+    「一端」「他端」が、単なる位置関係の修飾語（「Ａの上に配置される」の
+    「上」のような）ではなく、その動詞の主語・目的語として使われている
+    （＝「整流素子の陽極側の一端が、…に接続され」のように、それ自体が
+    実体として指されている）場合を判定する。
+
+    この場合、その語を丸ごとRELATION_WORDSとして除外してしまうと、
+    「一端」に係る「整流素子の」「陽極側の」という所有者情報も含めて
+    構成要素が完全に失われてしまう（＝関係抽出全体が破綻する）。
+    """
+    if start != end:
+        return False
+    token = doc[start]
+    if token.text not in _RELATION_WORDS_ALLOWED_AS_ARGUMENT:
+        return False
+    return token.dep_ in ("nsubj", "obj") and token.head.pos_ == "VERB"
+
+
 def extract_patent_components_general(doc):
     components = []
     i = 0
@@ -235,7 +266,9 @@ def extract_patent_components_general(doc):
                 words.extend(more_words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
+            if (
+                phrase not in RELATION_WORDS or _relation_word_is_real_argument(doc, start, end)
+            ) and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -259,7 +292,9 @@ def extract_patent_components_general(doc):
             )
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
+            if (
+                phrase not in RELATION_WORDS or _relation_word_is_real_argument(doc, start, end)
+            ) and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -273,7 +308,100 @@ def extract_patent_components_general(doc):
             continue
         seen.add(key)
         unique_components.append(c)
-    return unique_components
+    return _disambiguate_components_by_name(doc, unique_components)
+
+
+# 「複数の」「いくつかの」のような数量詞は、実体を区別する情報ではない
+# （正解データでも名前に含めない傾向がある）ため、所有格プレフィックスの
+# 候補からは除外する。
+_QUANTIFIER_WORDS = {
+    "複数", "いくつか", "各", "全て", "すべて", "一部", "少なくとも",
+    "双方", "多く", "任意", "それぞれ", "幾つか",
+}
+
+
+def _has_zenki_prefix(doc, comp):
+    """
+    コンポーネントの直前トークンが「前記」「該」かどうかを見る。
+    「前記」「該」が付いている場合、それは新規の導入ではなく、既に
+    出てきた構成要素への後方参照である可能性が高い、という手がかりに使う。
+    """
+    idx = comp["start"] - 1
+    while idx >= 0 and not doc[idx].text.strip():
+        idx -= 1
+    return idx >= 0 and doc[idx].text in ("前記", "該")
+
+
+def _genitive_owner_candidate(doc, token, components):
+    """
+    tokenのnmod（「の」格）子から、所有格修飾語の候補を1つ探す
+    （数量詞は候補から除外する）。
+    """
+    for child in token.children:
+        if child.dep_ != "nmod":
+            continue
+        has_no = any(c.dep_ == "case" and c.text == "の" for c in child.children)
+        if not has_no:
+            continue
+        if child.text in _QUANTIFIER_WORDS:
+            continue
+        child_comp = find_component_by_token(components, child.i)
+        if child_comp is None:
+            continue
+        return child_comp
+    return None
+
+
+def _disambiguate_components_by_name(doc, components):
+    """
+    「スイッチング素子」のような同じ短い名前を持つ構成要素が請求項内に
+    複数現れる場合、それらが本当に同じ実体（「前記」「該」による後方参照）
+    なのか、たまたま同名なだけの別々の実体（例：「正極側のスイッチング素子」
+    と「負極側のスイッチング素子」）なのかを判定し、後者の場合だけ、
+    区別に必要な最小限の所有格修飾語を名前の先頭に付け足す。
+
+    以前は所有格の連鎖を無条件・再帰的にすべて結合していたが、実データで
+    検証したところ、(1) 数量詞（「複数の」等）まで巻き込んでしまう、
+    (2) 正解データは関係の種類に応じて名前の粒度を変えており、一律結合とは
+    噛み合わない、という2つの理由でかえってF1が悪化した。この反省を踏まえ、
+    「本当に曖昧さがある場合だけ」最小限の修飾を加える、より保守的な
+    アプローチに変更したもの。
+    """
+    groups = {}
+    for idx, c in enumerate(components):
+        groups.setdefault(c["text"], []).append(idx)
+
+    new_components = [dict(c) for c in components]
+
+    for name, idxs in groups.items():
+        # 「一端」「他端」のように、それ単独では何を指すか分からない
+        # 一般的すぎる語（_RELATION_WORDS_ALLOWED_AS_ARGUMENTで例外的に
+        # 実体として認めている語）は、たとえ請求項内で重複していなくても、
+        # 所有格修飾語があるなら常にそれを名前に含める
+        # （正解データでも「整流素子の陽極側の一端」のように、常に
+        #  所有格チェーンごと1つの構成要素名として扱われているため）。
+        always_disambiguate = name in _RELATION_WORDS_ALLOWED_AS_ARGUMENT
+        if always_disambiguate:
+            fresh_idxs = [i for i in idxs if not _has_zenki_prefix(doc, components[i])]
+        elif len(idxs) < 2:
+            continue
+        else:
+            # 後方参照（前記/該）は「新規導入」ではないので、曖昧さ解消の対象から除く
+            fresh_idxs = [i for i in idxs if not _has_zenki_prefix(doc, components[i])]
+            if len(fresh_idxs) < 2:
+                continue
+        for i in fresh_idxs:
+            comp = components[i]
+            anchor = doc[comp["end"]]
+            owner = _genitive_owner_candidate(doc, anchor, components)
+            if owner is None:
+                continue
+            if (owner["start"], owner["end"]) == (comp["start"], comp["end"]):
+                continue
+            prefix = owner["text"] + "の"
+            new_components[i]["text"] = _normalize_component_text(prefix + comp["text"])
+
+    return new_components
 
 
 # ============================================================
@@ -517,6 +645,13 @@ def _merged_modifier_name(token, components):
     """
     「外側の面」のように、「の」で係る nmod の修飾語を語自体の前に
     くっつけた、より具体的な名前を作る。
+
+    構成要素抽出の時点（_disambiguate_components_by_name）で、既に
+    同じ所有格修飾語がbaseの先頭に組み込まれていることがある
+    （「一端」→「陽極側の一端」等）。その場合にここでもう一度同じ
+    修飾語を付けてしまうと「陽極側の陽極側の一端」のような二重付与に
+    なってしまうため、baseが既にその修飾語で始まっている場合は
+    スキップする。
     """
     comp = find_component_by_token(components, token.i)
     base = comp["text"] if comp is not None else token.text
@@ -533,7 +668,11 @@ def _merged_modifier_name(token, components):
             # child が既に base と同じ結合済みコンポーネント内（例:「第１の厚さ」）の場合は
             # 自己参照になってしまうため、所有格プレフィックスとして採用しない。
             continue
-        prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
+        candidate_prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
+        if base.startswith(candidate_prefix):
+            # 既に構成要素名の先頭にこの修飾語が組み込まれている（二重付与防止）
+            continue
+        prefix = candidate_prefix
         break
 
     return prefix + base
@@ -687,7 +826,8 @@ def extract_positional_relations(doc, components, relation_words):
         if verb.pos_ != "VERB":
             continue
 
-        if verb.lemma_ in HAS_LEMMAS:
+        is_has_branch = verb.lemma_ in HAS_LEMMAS
+        if is_has_branch:
             # 「Ａ間に、Ｂを有し」のように「有する」が使われている場合は、
             # 文全体の主語（根っこ）ではなく、「有する」の直接の目的語
             # （＝実際にそこに存在するもの）を関係先にする。
@@ -721,12 +861,32 @@ def extract_positional_relations(doc, components, relation_words):
             for source in source_components:
                 if source["text"] == target["text"]:
                     continue
-                relations.append({
-                    "source": source["text"],
-                    "relation": label,
-                    "target": target["text"],
-                    "type": "positional",
-                })
+                if is_has_branch:
+                    # 「Ａの間に、Ｂを有し」は「Ａには有する」と同じ
+                    # 「場所（Ａ）→ そこにあるもの（Ｂ）」という向きなので、
+                    # そのまま source=場所, target=中身 でよい。
+                    relations.append({
+                        "source": source["text"],
+                        "relation": label,
+                        "target": target["text"],
+                        "type": "positional",
+                    })
+                else:
+                    # 「ＡとＢとの間にＣが設けられる／位置する」等は、
+                    # 意味的には「Ｃ（配置される主体）が、Ａ・Ｂ（基準・
+                    # 境界となる相手）に対して間に位置する」であり、
+                    # ＳＡＯとして素直に読めば source=Ｃ（配置される側）、
+                    # target=Ａ・Ｂ（基準側）である。以前はここが逆
+                    # （source=Ａ・Ｂ、target=Ｃ）になっており、正解データ
+                    # （人手で作成したゴールドSAO）と方向が系統的に逆転して
+                    # いた（直接関係の「に接続される」等で見つかった
+                    # 系統的な向きの逆転と同じ性質の問題）。
+                    relations.append({
+                        "source": target["text"],
+                        "relation": label,
+                        "target": source["text"],
+                        "type": "positional",
+                    })
     return relations
 
 
@@ -1663,6 +1823,26 @@ def extract_direct_relations(doc, components):
             if taishite_target is not None:
                 passive_target = taishite_target
 
+            # 動詞に「本物のnsubj」（真の文法上の主語）が直接の子として
+            # あるかどうかで、source/targetの向きを決める。
+            #   ・nsubjが無い場合（連体修飾節：「Ａに接続されるＢ」のＢの
+            #     ように、head_component（またはtopic_obl）が動作の
+            #     受け手＝真の主語の代役になっているケース）は、
+            #     source=passive_target（主語役）、target=source候補
+            #     （に格の相手）が正しい向き。
+            #   ・nsubjが直接ある場合（「Ｂは…Ａに配置され」のような
+            #     通常の主語付き文）は、そのnsubj自身がsource_candidates
+            #     に入ってきており、既にsource=nsubj、target=passive_target
+            #     （head_componentのフォールバックで見つかる、位置・相手側の
+            #     語）という正しい向きになっている。
+            # 以前はnsubjの有無に関わらず常にsource=obl候補
+            # （またはnsubj候補）／target=passive_targetという1通りの
+            # 向きで固定していたため、nsubjが無いケース（連体修飾節）で
+            # 正解データ（人手で作成したゴールドSAO）と方向が系統的に
+            # 逆転していた。gold標準との比較でこれが確認されたため、
+            # nsubjの有無で場合分けするよう修正する。
+            has_real_nsubj_child = any(c.dep_ == "nsubj" for c in verb.children)
+
             source_candidates = []
             for child in verb.children:
                 if topic_obl is not None and child.i == topic_obl.i:
@@ -1692,12 +1872,20 @@ def extract_direct_relations(doc, components):
                 )
                 if source is None or source["text"] == passive_target["text"]:
                     continue
-                relations.append({
-                    "source": source["text"],
-                    "relation": verb.text,
-                    "target": passive_target["text"],
-                    "type": "direct",
-                })
+                if has_real_nsubj_child:
+                    relations.append({
+                        "source": source["text"],
+                        "relation": verb.text,
+                        "target": passive_target["text"],
+                        "type": "direct",
+                    })
+                else:
+                    relations.append({
+                        "source": passive_target["text"],
+                        "relation": verb.text,
+                        "target": source["text"],
+                        "type": "direct",
+                    })
         else:
             # 能動：headが直接の係り先として構成要素そのものであれば、それを
             # 主語(source)として使う（例：「Ｘを表すＹ」のＹ＝head）。
@@ -1934,6 +2122,31 @@ def _is_list_item_component(doc, comp):
     return False
 
 
+def _enumeration_scope_start(doc, components, owner):
+    """
+    「Ａと、Ｂと、Ｃと、…を有する」の兄弟項目Ｃ自身が、さらにその内部で
+    「（Ｃの一部である）ｘと、ｙを有するＣ」のように別の列挙を持つ場合
+    （入れ子の列挙）、Ｃの内部列挙の対象を集めるときに、Ｃより前にある
+    兄弟項目（ＡやＢ）まで「直前の列挙」として誤って拾ってしまうことが
+    ある（ＡやＢもそれぞれ「〜と、」で終わる、独立したリスト項目に
+    見えてしまうため）。
+
+    ownerが列挙項目そのもの（is_list_item_component）である場合は、
+    ownerより前にある「ownerの直前の兄弟列挙項目」の終わりの位置を
+    返し、それ以前のリスト項目は対象候補から除外できるようにする。
+    ownerが列挙項目でない場合（根や、列挙と無関係な語）は、制限
+    なし（-1）を返す。
+    """
+    if owner is None or not _is_list_item_component(doc, owner):
+        return -1
+    best = -1
+    for c in components:
+        if c["end"] < owner["start"] and _is_list_item_component(doc, c):
+            if c["end"] > best:
+                best = c["end"]
+    return best
+
+
 def extract_has_relations(doc, components):
     """
     「Ａを有する」「Ａは〜を有し」のような文から (所有者, 有する, 対象) を抽出する。
@@ -1963,8 +2176,17 @@ def extract_has_relations(doc, components):
         subj_token = None
         obj_token = None
         for child in verb.children:
-            if child.dep_ == "nsubj" and subj_token is None:
-                subj_token = child
+            if child.dep_ == "nsubj":
+                # 「Ｘは、Ａを含み、Ｙは、Ｂを有し、Ｚは、…」のように「は」で
+                # 区切られた節が連なる長文では、GiNZAが各節自身の主語を
+                # その節の動詞ではなく、鎖の先にあるもっと後方の動詞に
+                # 誤って直接の子（nsubj）として付けてしまうことがある。
+                # その結果、1つの動詞に複数のnsubj候補（本来は別の節の主語）が
+                # 付くことがあるが、その動詞に一番近い（＝直前の）ものが、
+                # その動詞自身の節の主語である可能性が最も高いため、
+                # 最初に見つかったものではなく、動詞に最も近いものを採用する。
+                if subj_token is None or child.i > subj_token.i:
+                    subj_token = child
             if child.dep_ == "obj" and obj_token is None:
                 obj_token = child
 
@@ -1972,6 +2194,11 @@ def extract_has_relations(doc, components):
 
         targets = []
         owner = None
+        # 「Ａと、Ｂと、Ｃと、…を有する（備える）」の並列列挙から得られた
+        # ターゲットは、請求項がその動詞で明示的に列挙した最も信頼度の高い
+        # 構成要素なので、(start end)を記録しておき、後段（_simplify_hierarchy）
+        # で「より具体的な鎖がある」という理由だけで安易に消されないようにする。
+        enum_target_keys = set()
 
         # 「Ａと、Ｂと、Ｃと、…を有する（備える）」のような並列列挙が
         # 2件以上見つかる場合は、それを最優先で使う（「は」探しに
@@ -1995,7 +2222,37 @@ def extract_has_relations(doc, components):
             if verb.i - nearest_end > 15:
                 early_list_targets = []
 
-        if subj_token is not None:
+        acl_owner = None
+        acl_target = None
+        if verb.dep_ == "acl" and subj_token is None and obj_token is not None and head_component is not None:
+            # 連体修飾節（acl）として名詞にかかる「Ｘを有する／備える／含むＹ」は、
+            # 構文上Ｙ（修飾される名詞）がＸを持つ、という意味が一意に決まる
+            # （例：「スイッチング機能を有するパワー半導体モジュール」→
+            #  パワー半導体モジュールがスイッチング機能を有する）。
+            # このパターンは節の主語を持たないため、後段の「周囲の並列列挙を
+            # 拾う」ヒューリスティック（②③④）にそのまま処理させると、
+            # たまたま近くにある無関係な列挙項目（「Ａと、Ｂと、…を備え」等）を
+            # 対象として誤って拾ってしまうことがある。obj自体が明確に対象を
+            # 示しているので、その誤りを避けるために最優先で処理する。
+            cand = (
+                find_component_by_token(components, obj_token.i)
+                or find_referenced_component(components, obj_token)
+            )
+            # ただし、「Ａと、Ｂと、Ｃと、…を備える、Ｘ。」のように、この動詞自体が
+            # 列挙を締めくくる（＝Ｘという名詞にかかる）トップレベルのacl節で、
+            # かつobj自身も「Ｃと、」の形で他の兄弟項目と並列列挙されている場合は、
+            # 話が別である。この場合はobjだけでなく列挙全体（Ａ、Ｂ、Ｃ）がＸの
+            # 対象になるべきなので、ここでは処理せず後段の列挙ヒューリスティックに
+            # 任せる（objがそれ自体「列挙項目」であるかどうかで判定する）。
+            if cand is not None and not _is_list_item_component(doc, cand):
+                if cand["text"] != head_component["text"]:
+                    acl_owner = head_component
+                    acl_target = cand
+
+        if acl_owner is not None:
+            owner = acl_owner
+            targets = [acl_target]
+        elif subj_token is not None:
             owner = (
                 find_component_by_token(components, subj_token.i)
                 or find_referenced_component(components, subj_token)
@@ -2036,6 +2293,7 @@ def extract_has_relations(doc, components):
             else:
                 owner = root_component
             targets = [c for c in early_list_targets if c["text"] != owner["text"]]
+            enum_target_keys.update((c["start"], c["end"]) for c in targets)
         elif _find_nearest_topic_before_text(doc, components, verb) is not None:
             # 明示的なnsubjが見つからなくても、テキスト上に「Ｘは、」という
             # 主題が近くにあれば、そちらを所有者として優先する
@@ -2047,6 +2305,7 @@ def extract_has_relations(doc, components):
                 if c["end"] < verb.i and _is_list_item_component(doc, c) and c["text"] != owner["text"]
             ]
             targets = list_targets
+            enum_target_keys.update((c["start"], c["end"]) for c in targets)
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2063,8 +2322,11 @@ def extract_has_relations(doc, components):
             # 目的語だけの場合）は、動詞自身の目的語（obj）だけを使う
             # （以前は「それより前の構成要素を全部」という広すぎる
             #  フォールバックになっており、無関係な語まで拾っていた）。
-            if all_list_targets:
-                targets = all_list_targets
+            scope_start = _enumeration_scope_start(doc, components, owner)
+            scoped_list_targets = [c for c in all_list_targets if c["start"] > scope_start]
+            if scoped_list_targets:
+                targets = scoped_list_targets
+                enum_target_keys.update((c["start"], c["end"]) for c in targets)
             else:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2078,7 +2340,12 @@ def extract_has_relations(doc, components):
                 # 並列列挙のパターンに対応する（「…ことを特徴とする」のように
                 # 係り先が「こと」等でhead_componentが見つからない場合に
                 # 特によく起きる）。
-                targets = [c for c in all_list_targets if c["text"] != owner["text"]]
+                scope_start = _enumeration_scope_start(doc, components, owner)
+                targets = [
+                    c for c in all_list_targets
+                    if c["text"] != owner["text"] and c["start"] > scope_start
+                ]
+                enum_target_keys.update((c["start"], c["end"]) for c in targets)
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2098,6 +2365,7 @@ def extract_has_relations(doc, components):
                 "relation": "有する",
                 "target": target["text"],
                 "type": "has",
+                "from_enumeration": (target["start"], target["end"]) in enum_target_keys,
             })
 
     unique = []
@@ -2217,6 +2485,15 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     for r in has_edges:
         if r["source"] != root:
             continue
+        if r.get("from_enumeration"):
+            # 根が「Ａと、Ｂと、Ｃと、…を備える」のように明示的に列挙した
+            # 構成要素は、請求項本文で最も明確に述べられている関係なので、
+            # 他の節でたまたま「含む」等の語で触れられているというだけの
+            # 理由で消してはいけない（例：「…を備え」で全体の部品として
+            # 列挙されているのに、別の文で「Ａ、Ｂを含む被封止部材」のように
+            # 副次的に言及されているせいで、備える側の関係が消えてしまう
+            # 問題への対応）。
+            continue
         n = r["target"]
         more_specific = [
             x for x in incoming.get(n, [])
@@ -2322,10 +2599,66 @@ def _extract_raw_relations(text):
     return components, final_relations, doc
 
 
+_GENITIVE_LINK_EXCLUDE_HEADS = (
+    "一方", "他方", "双方", "反対側", "反対面", "反対", "両側", "一端", "他端",
+    "一部", "各々", "それぞれ", "夫々", "全て", "全部", "一つ", "1つ", "１つ",
+)
+
+
+def _add_genitive_provenance_relations(relations):
+    """
+    「Ｘの深さ」「Ｘの側面」「Ｘのゲート」のように、構成要素名Ｘに「の」を
+    介して付いた複合語（＝Ｘの属性・部位・値を表す名詞句）が、他の関係の
+    source/targetとして単独のエンティティのように使われている場合、
+    正解データでは、その複合語自体に加えて「Ｘは、（複合語）を持つ」という
+    出自を示す (Ｘ, "の", Ｘの◯◯) という関係が別途、明示的に付与されている
+    ことが非常に多い（例：「凹部の深さ」→(凹部, の, 凹部の深さ)）。
+
+    これは特定のクレームに依存しない一般的なパターンなので、最終的な関係
+    リストに登場する全エンティティ名を走査し、「Ｘの◯◯」の形をしていて、
+    かつＸ自身も同じクレーム内で独立したエンティティとして使われている
+    場合に、この出自関係を機械的に補完する。
+
+    ただし「Ｘの一方」「Ｘの他端」のように、「の」の直後が相対的・指示的な
+    語（一方/他方/反対側など）の場合は、それ自体が独立した属性値ではなく
+    単なる位置的な言い回しであることが多く、正解データでもこの関係が
+    付与されていないことが多いため、除外する。
+    """
+    entity_texts = set()
+    for r in relations:
+        entity_texts.add(r["source"])
+        entity_texts.add(r["target"])
+
+    new_relations = []
+    seen = {(r["source"], r["relation"], r["target"]) for r in relations}
+    for e in entity_texts:
+        idx = e.find("の")
+        if idx <= 0:
+            continue
+        owner = e[:idx]
+        rest = e[idx + 1:]
+        if not rest or owner == e:
+            continue
+        if owner not in entity_texts:
+            continue
+        if rest.startswith(_GENITIVE_LINK_EXCLUDE_HEADS):
+            continue
+        if owner.endswith(("正極側", "負極側", "一方側", "他方側", "表側", "裏側")):
+            continue
+        key = (owner, "の", e)
+        if key in seen:
+            continue
+        seen.add(key)
+        new_relations.append({"source": owner, "relation": "の", "target": e, "type": "attribute"})
+
+    return relations + new_relations
+
+
 def analyze_claim(text):
     """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
     components, final_relations, doc = _extract_raw_relations(text)
     final_relations = _simplify_hierarchy(final_relations, doc, components)
+    final_relations = _add_genitive_provenance_relations(final_relations)
     return components, final_relations
 
 
@@ -6227,6 +6560,34 @@ def _normalize_relation_for_match(text):
     return "".join(_re_dep.findall(r"[一-龥]+", text)) or text
 
 
+# 請求項の中では「有する」「備える」「具備する」「含む」のように、
+# 漢字表記が全く異なるのに実質的に同じ意味（全体が部分を持つ、という
+# 関係）で使われる動詞群がある。_normalize_relation_for_match の
+# 「漢字部分の一致」だけではこれらは別の関係として扱われてしまい、
+# 正解データの語彙選択とシステムの語彙選択がたまたま違うだけで
+# 不一致（誤り）とカウントされてしまう。評価の趣旨は「意味として
+# 正しい関係を抽出できているか」なので、既知の同義語グループは
+# 同じ関係とみなして比較する。
+RELATION_SYNONYM_GROUPS = [
+    {"有する", "備える", "具備する", "含む", "含める"},
+    {"配置される", "配置", "設けられる", "設置される", "設置"},
+    {"接続される", "接続", "連結される", "連結"},
+    {"接触する", "接触", "当接する", "当接"},
+    {"形成される", "形成"},
+    {"固定される", "固定"},
+]
+
+
+def _relation_synonym_match(rel_a, rel_b):
+    """relation文字列が既知の同義語グループで一致するかを判定する"""
+    for group in RELATION_SYNONYM_GROUPS:
+        a_in = any(g in rel_a for g in group)
+        b_in = any(g in rel_b for g in group)
+        if a_in and b_in:
+            return True
+    return False
+
+
 def evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=True):
     """
     システムが抽出したSAOトリプル（predicted_relations）と、
@@ -6260,7 +6621,9 @@ def evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=T
         if lenient_relation_match:
             pn = _normalize_relation_for_match(p["relation"])
             gn = _normalize_relation_for_match(g["relation"])
-            return pn == gn or pn in gn or gn in pn
+            if pn == gn or pn in gn or gn in pn:
+                return True
+            return _relation_synonym_match(p["relation"], g["relation"])
         return False
 
     matched_gold_idx = set()
