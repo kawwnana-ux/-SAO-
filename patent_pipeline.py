@@ -1,3 +1,4 @@
+import re
 import spacy
 import ginza
 import ja_ginza
@@ -9,6 +10,19 @@ import matplotlib.font_manager as fm
 import matplotlib.patches as mpatches
 import os
 import glob
+
+# ============================================================
+# SudachiPy（前処理用）
+# ============================================================
+# GiNZA自体も内部でSudachiPyを使っているが、ここでは「表記ゆれの正規化」
+# という前処理専用の役割として、別途SudachiPyの辞書を読み込む。
+# LLMは一切使用しない（GiNZA + ルールベースの補正のみで解析する）。
+try:
+    from sudachipy import tokenizer as sudachi_tokenizer_module
+    from sudachipy import dictionary as sudachi_dictionary_module
+    _SUDACHI_IMPORT_OK = True
+except ImportError:
+    _SUDACHI_IMPORT_OK = False
 
 # ============================================================
 # GiNZAモデルの読み込み
@@ -68,6 +82,129 @@ if not os.path.exists(FONT_PATH):
 fm.fontManager.addfont(FONT_PATH)
 FONT_PROP = fm.FontProperties(fname=FONT_PATH)
 
+# ============================================================
+# SudachiPyによる前処理（表記ゆれの正規化）
+# ============================================================
+# 特許公報の請求項テキストは、全角英数字・半角英数字や、
+# 「～」「〜」「－」「ー」のような似た記号が混在しやすい。
+# GiNZAで係り受け解析にかける前に、SudachiPy（分割モードC＝
+# 最も長い単位での分割。GiNZAの実質的な語彙単位に近い）で
+# 形態素解析し、英数字・記号だけを normalized_form で正規化しておく。
+#
+# 漢字を含む語（技術用語・構成要素名）は normalized_form にせず、
+# 元の表記（surface）のまま残す。SudachiPyのnormalized_formは
+# 同義語的な言い換え（例：「ＰＣ」→「パーソナルコンピュータ」）まで
+# 行うことがあり、そのまま採用すると構成要素名が意味的に書き換わって
+# しまい、「前記」による同一構成要素の照応判定が崩れるおそれがあるため。
+_sudachi_tokenizer_obj = None
+if _SUDACHI_IMPORT_OK:
+    try:
+        _sudachi_tokenizer_obj = sudachi_dictionary_module.Dictionary().create()
+    except Exception:
+        # 辞書（sudachidict_core等）が見つからない環境向けの保険。
+        # この場合は前処理をスキップし、元のテキストをそのままGiNZAへ渡す。
+        _sudachi_tokenizer_obj = None
+
+# 正規化してよいのは英数字・ハイフン・波ダッシュ類のみ（技術用語の漢字・
+# カタカナ複合語は対象外にする）。
+_SUDACHI_NORMALIZABLE_RE = re.compile(r"^[A-Za-zＡ-Ｚａ-ｚ0-9０-９\-‐－ｰー～〜]+$")
+
+
+def sudachi_preprocess(text):
+    """
+    SudachiPy（モードC）で形態素解析し、全角／半角の英数字・記号の
+    表記ゆれだけを正規化した文字列を返す。SudachiPyが使えない環境では、
+    元のテキストをそのまま返す（GiNZA単体でも解析自体は継続できる）。
+    """
+    if _sudachi_tokenizer_obj is None or not text:
+        return text
+
+    mode = sudachi_tokenizer_module.Tokenizer.SplitMode.C
+    try:
+        morphemes = _sudachi_tokenizer_obj.tokenize(text, mode)
+    except Exception:
+        return text
+
+    pieces = []
+    for m in morphemes:
+        surface = m.surface()
+        try:
+            normalized = m.normalized_form()
+        except Exception:
+            normalized = surface
+        if (
+            surface != normalized
+            and _SUDACHI_NORMALIZABLE_RE.match(surface)
+            and _SUDACHI_NORMALIZABLE_RE.match(normalized)
+        ):
+            pieces.append(normalized)
+        else:
+            pieces.append(surface)
+    return "".join(pieces)
+
+
+# ============================================================
+# 特許独自表記の前処理（図面参照符号・数式プレースホルダーの除去）
+# ============================================================
+# 実際の特許請求項では、構成要素名の直後に図面参照符号
+# 「（Ａ１１０）」「（６Ａ、６Ｂ、６Ｃ、６Ｄ）」が付与されたり、
+# 化学式・数式が「【化１】」「【数１】」のようなプレースホルダーと
+# ともに挿入されたりする。これらはGiNZAの係り受け解析にとって
+# ノイズにしかならず、放置すると
+#   ・「ベースプレート（Ａ１１０）」のように括弧付きの表記と
+#     括弧なしの表記が別の構成要素として扱われてしまう
+#   ・記号や数式が名詞として誤認識され、無関係なノードや関係が
+#     大量に生成されてしまう
+# といった問題を引き起こすため、GiNZAへ渡す前に取り除く。
+
+# 「（Ａ１１０）」「（６Ａ、６Ｂ、６Ｃ、６Ｄ）」のように、英数字・
+# 読点・ハイフンだけで構成された短い全角/半角括弧書き。
+_REFERENCE_SIGN_RE = re.compile(
+    r"[（(]\s*[A-Za-zＡ-Ｚａ-ｚ0-9０-９\-‐－ｰー、,，\s]+\s*[）)]"
+)
+
+# 「【化１】」「【数１】」のような、化学式・数式が挿入される
+# 位置を示すプレースホルダー見出し。
+_FORMULA_PLACEHOLDER_RE = re.compile(r"【\s*(化|数)\s*[0-9０-９]+\s*】")
+
+
+def _looks_like_reference_sign(bracket_content):
+    """
+    括弧の中身が「図面参照符号」らしいかどうかを判定する。
+    数字を1つ以上含み、かつひらがなを含まない（＝「式中、Ｒは
+    ～である」のような説明文ではない）、短い文字列だけを
+    参照符号とみなす。これにより説明文の括弧を誤って消さない
+    ようにする。
+    """
+    if not re.search(r"[0-9０-９]", bracket_content):
+        return False
+    if re.search(r"[ぁ-んー]{2,}", bracket_content):
+        return False
+    return len(bracket_content) <= 20
+
+
+def _strip_patent_reference_signs(text):
+    """
+    「第１のベースプレート（Ａ１１０）」のように、構成要素名の
+    直後に付与された図面参照符号を取り除く。
+    「（式中、Ｒは...である）」のような説明文の括弧は対象外にする。
+    """
+    def _replace(m):
+        inner = m.group(0)[1:-1]
+        return "" if _looks_like_reference_sign(inner) else m.group(0)
+    return _REFERENCE_SIGN_RE.sub(_replace, text)
+
+
+def _strip_formula_placeholders(text):
+    """
+    「【化１】」「【数１】」のような化学式・数式プレースホルダーの
+    見出し自体を取り除く（見出しの直後に続く説明文
+    「Ｒは...である」等はそのまま残す＝構成要素の説明として
+    意味があるため）。
+    """
+    return _FORMULA_PLACEHOLDER_RE.sub("", text)
+
+
 RELATION_WORDS = {
     # 基本方向・位置
     "間", "側", "上", "下", "内部", "外部",
@@ -96,7 +233,72 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向", "単数"}
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため"}
+
+# ============================================================
+# 簡易格フレーム辞書（格フレーム法）
+# ============================================================
+# 橋本ら「特許文書の構文解析」（2008）で提案されている「格フレーム法」
+# （特許文書から自動構築した格フレーム辞書を使って、述語の各格要素
+# 　（ガ格・ヲ格・ニ格等）の意味役割を判定し、構文解析の曖昧性を
+# 　解消する）の考え方を参考にした簡易版。
+#
+# 本来は数百万文規模のコーパスから自動構築するが、ここではその代わりに、
+# 特許請求項に頻出する主要な述語について、典型的な格パターン
+# （どの格助詞がどんな意味役割になりやすいか）を手作業で登録した
+# 小さな辞書を用意する。GiNZAの係り受け結果だけでは曖昧な「に」等の
+# 格要素の意味役割（場所／動作主／対象など）を判定する補助として使う。
+#
+# 役割の意味:
+#   owner    : 所有者・全体（「Ａを有する」のＡ側）
+#   target   : 目的語・対象（動作が向かう先）
+#   location : 場所・位置（「Ａに設けられる」のＡ側）
+#   source   : 動作主・供給元（受身文の「〜によって」等、能動文の主体）
+#   content  : やり取りされる内容物
+#   container: 収容する側
+PATENT_CASE_FRAMES = {
+    "有する": {"が": "owner", "を": "target", "に": "location"},
+    "備える": {"が": "owner", "を": "target", "に": "location"},
+    "具備する": {"が": "owner", "を": "target", "に": "location"},
+    "含む": {"が": "owner", "を": "target"},
+    "設ける": {"が": "owner", "を": "target", "に": "location"},
+    "接続": {"が": "source", "を": "target", "に": "target", "と": "target"},
+    "検出": {"が": "source", "を": "target"},
+    "供給": {"が": "source", "から": "source", "に": "target", "を": "content"},
+    "出力": {"が": "source", "に": "target", "を": "content"},
+    "形成": {"が": "source", "を": "target", "に": "location"},
+    "生成": {"が": "source", "を": "content"},
+    "配置": {"が": "source", "を": "target", "に": "location"},
+    "固定": {"が": "source", "を": "target", "に": "location"},
+    "収容": {"が": "container", "を": "content", "に": "location"},
+    "支持": {"が": "source", "を": "target"},
+}
+
+
+def _case_particle_of(token):
+    """tokenに付いている格助詞（が／を／に／で／から／と 等）のテキストを返す。無ければNone。"""
+    for child in token.children:
+        if child.dep_ == "case":
+            return child.text
+    return None
+
+
+def case_frame_role(verb, token):
+    """
+    PATENT_CASE_FRAMES（簡易格フレーム辞書）を使って、verbに係る
+    tokenの格助詞から、その意味役割（owner/target/location/source等）
+    を引く。述語または格が辞書に登録されていない場合はNoneを返す
+    （＝この場合は従来通り、係り受け構造ベースのヒューリスティクスに
+    フォールバックする。この関数は既存の判定を置き換えるのではなく、
+    曖昧なケースを絞り込むための補助的なヒントとして使う）。
+    """
+    frame = PATENT_CASE_FRAMES.get(verb.lemma_)
+    if frame is None:
+        return None
+    particle = _case_particle_of(token)
+    if particle is None:
+        return None
+    return frame.get(particle)
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -142,10 +344,15 @@ def _normalize_component_text(phrase):
     「メタデータ生成部」（前記なし）の表記と食い違って、
     同じものが別ノードとして扱われてしまうのを防ぐため、
     先頭の「前記」「該」を取り除く。
+
+    また、「ベースプレート（Ａ１１０）」のように図面参照符号が
+    構成要素名の一部として残ってしまった場合の保険として、
+    末尾に残った参照符号の括弧も取り除く。
     """
     for prefix in ("前記", "該"):
         if phrase.startswith(prefix) and phrase != prefix:
             phrase = phrase[len(prefix):]
+    phrase = _strip_patent_reference_signs(phrase).strip()
     return phrase
 
 
@@ -153,91 +360,52 @@ def _normalize_component_text(phrase):
 # ① 構成要素抽出
 # ============================================================
 
-def _is_nominalized_adjective_start(doc, i):
-    """形容詞語幹＋「さ」「み」による名詞化パターンを検出する（例: 厚さ、大きさ、重み）。
-    GiNZA はこれを ADJ + PART(mark) として解析するため、通常の NOUN/PROPN 連結では
-    「第１の厚さ」の「厚さ」部分が欠落してしまう。これを名詞句の一部として認識する。
+def _consume_noun_run(doc, i):
     """
-    if i + 1 >= len(doc):
-        return False
-    t, nxt = doc[i], doc[i + 1]
-    return t.pos_ == "ADJ" and nxt.text in ("さ", "み") and nxt.dep_ == "mark"
-
-
-def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=False):
-    """i位置から名詞句トークン列を貪欲に消費し、(words, next_i) を返す共通ロジック。
-
-    fresh_start=True のときは、先頭トークンを（品詞や関係語チェックに関わらず）
-    無条件に採用する（＝呼び出し元で既に NOUN/PROPN・NUM+名詞・名詞化形容詞などの
-    条件を確認済みで、新規にフレーズを開始する場合の従来挙動）。それ以外
-    （fresh_start=False。「第１の」等の既存プレフィックスへの継続）では、
-    先頭トークンも関係語チェックの対象にする（従来の while ループと同じ挙動を
-    維持し、意図せず「端部」等の関係語をコンポーネント名に取り込んでしまう
-    回帰を防ぐ）。
+    iから始まるNOUN/PROPNの連続を集めて (words, 止まった位置i) を返す。
+    「前記」「該」「うち」や、動詞に係る一般的な位置関係語
+    （_is_generic_relation_word）に当たった時点で止める。
     """
-    if first_is_nominalized_adj:
-        return [doc[i].text, doc[i + 1].text], i + 2
     words = []
-    first = True
-    while i < len(doc):
-        if first and fresh_start:
-            words.append(doc[i].text)
-            i += 1
-            first = False
-            continue
-        if doc[i].pos_ in {"NOUN", "PROPN"}:
-            if (
-                _is_generic_relation_word(doc[i])
-                or doc[i].text in ("前記", "該", "うち", "乃至")
-                or not doc[i].text.strip()
-            ):
-                break
-            words.append(doc[i].text)
-            i += 1
-            first = False
-        elif _is_nominalized_adjective_start(doc, i):
-            words.append(doc[i].text)
-            words.append(doc[i + 1].text)
-            i += 2
+    while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
+        if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
             break
-        else:
-            break
+        words.append(doc[i].text)
+        i += 1
     return words, i
 
 
-
-# 「一端」「他端」は、他のRELATION_WORDS（「間」「上面」「表面」等）とは違い、
-# 「Ａの一端」のように所有者に係った上で、それ自体が動詞の主語・目的語になる
-# （＝実体として指し示される）用法が非常に多い（「整流素子の陽極側の一端が、
-# 〜に接続され」等）。他のRELATION_WORDSの語は、既存の owner 解決ロジック
-# （_merged_modifier_name等）が「その語を除外して、係り先の名詞に辿り着く」
-# 前提で正しく動いているため、同じ例外を広げるとかえって壊れる
-# （試したところ「間」「上面」「表面」等では明確に悪化した）。そのため、
-# この例外は実際にバグの原因だった「一端」「他端」の2語だけに絞る。
-_RELATION_WORDS_ALLOWED_AS_ARGUMENT = {"一端", "他端"}
-
-
-def _relation_word_is_real_argument(doc, start, end):
+def _maybe_extend_relation_suffix_phrase(doc, i, words):
     """
-    「一端」「他端」が、単なる位置関係の修飾語（「Ａの上に配置される」の
-    「上」のような）ではなく、その動詞の主語・目的語として使われている
-    （＝「整流素子の陽極側の一端が、…に接続され」のように、それ自体が
-    実体として指されている）場合を判定する。
+    「正極側のスイッチング素子」「第一検出部側の焦点位置」のように、
+    ここまで集めた語句(words)の末尾が部位・方向を表す語
+    （RELATION_WORDSに含まれる「側」「端」「面」等）で終わっていて、
+    その直後が「の」＋別のNOUN/PROPN列である場合、そこで構成要素名を
+    分断せず、1つの構成要素名として続けて取り込む。
 
-    この場合、その語を丸ごとRELATION_WORDSとして除外してしまうと、
-    「一端」に係る「整流素子の」「陽極側の」という所有者情報も含めて
-    構成要素が完全に失われてしまう（＝関係抽出全体が破綻する）。
+    これがないと、「正極側」と「スイッチング素子」が別々の構成要素として
+    抽出されてしまい、極性の異なる複数の「スイッチング素子」が
+    （「側」の部分が失われて）同じ1つのノードに潰れてしまう。
+
+    「Ａ側のＢ側のＣ」のような多重修飾にも対応できるよう、
+    延長できる限り繰り返す。
     """
-    if start != end:
-        return False
-    token = doc[start]
-    if token.text not in _RELATION_WORDS_ALLOWED_AS_ARGUMENT:
-        return False
-    return token.dep_ in ("nsubj", "obj") and token.head.pos_ == "VERB"
-
-
-import re as _re_symbolic_label
-_SYMBOLIC_LATIN_LABEL_RE = _re_symbolic_label.compile(r"^[A-Za-zＡ-Ｚａ-ｚ]{1,4}$")
+    while (
+        words
+        and words[-1] in RELATION_WORDS
+        and i + 1 < len(doc)
+        and doc[i].text == "の"
+        and doc[i].dep_ == "case"
+        and doc[i + 1].pos_ in {"NOUN", "PROPN"}
+        and doc[i + 1].text not in ("前記", "該", "うち")
+    ):
+        extra_words, next_i = _consume_noun_run(doc, i + 1)
+        if not extra_words:
+            break
+        words.append(doc[i].text)  # 「の」
+        words.extend(extra_words)
+        i = next_i
+    return words, i
 
 
 def extract_patent_components_general(doc):
@@ -246,48 +414,12 @@ def extract_patent_components_general(doc):
     while i < len(doc):
         token = doc[i]
 
-        if token.text in ("前記", "該", "うち", "乃至") or not token.text.strip():
+        if token.text in ("前記", "該", "うち") or not token.text.strip():
             i += 1
             continue
 
         if _is_generic_relation_word_bigram(doc, i):
             i += 2
-            continue
-
-        if (
-            _SYMBOLIC_LATIN_LABEL_RE.match(token.text)
-            and i + 1 < len(doc)
-            and doc[i + 1].pos_ == "NUM"
-        ):
-            # 「Ｌ１」「Ｖ２」のような、アルファベット＋数字の記号的な名称
-            # （寸法・電圧等を表す変数名）や、「ＳｉＣ」「ＣＯ２」のような
-            # 化学式は、GiNZAのトークナイザで「Ｌ」（NOUN）と「１」（NUM）の
-            # ように分割されてしまい、そのままでは正しい構成要素として
-            # 認識されない。「第」＋数字のケースと同様に、直後がNUMなら
-            # まとめて1つの構成要素にする。
-            start = i
-            words = [doc[i].text]
-            i += 1
-            while i < len(doc) and doc[i].pos_ == "NUM":
-                words.append(doc[i].text)
-                i += 1
-            # 「Ａｌ２Ｏ３」「Ｓｉ３Ｎ４」のような複数元素の化学式は、
-            # 「アルファベット＋数字」の組が読点等を挟まず連続して続く。
-            # その場合は同じ構成要素として繋げて取り込む。
-            while (
-                i + 1 < len(doc)
-                and _SYMBOLIC_LATIN_LABEL_RE.match(doc[i].text)
-                and doc[i + 1].pos_ == "NUM"
-            ):
-                words.append(doc[i].text)
-                i += 1
-                while i < len(doc) and doc[i].pos_ == "NUM":
-                    words.append(doc[i].text)
-                    i += 1
-            end = i - 1
-            phrase = _normalize_component_text("".join(words))
-            if phrase not in GENERIC_NOUNS:
-                components.append({"text": phrase, "start": start, "end": end})
             continue
 
         if token.text == "第" and i + 1 < len(doc) and doc[i + 1].pos_ == "NUM":
@@ -299,42 +431,25 @@ def extract_patent_components_general(doc):
             if i < len(doc) and doc[i].text == "の":
                 words.append(doc[i].text)
                 i += 1
-            if i < len(doc) and (doc[i].pos_ in {"NOUN", "PROPN"} or _is_nominalized_adjective_start(doc, i)):
-                more_words, i = _consume_noun_phrase(
-                    doc, i, first_is_nominalized_adj=_is_nominalized_adjective_start(doc, i)
-                )
-                words.extend(more_words)
+            extra_words, i = _consume_noun_run(doc, i)
+            words.extend(extra_words)
+            words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if (
-                phrase not in RELATION_WORDS or _relation_word_is_real_argument(doc, start, end)
-            ) and phrase not in GENERIC_NOUNS:
+            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
-        if token.pos_ in {"NOUN", "PROPN"} or (
-            token.pos_ == "NUM"
-            and i + 1 < len(doc)
-            and doc[i + 1].pos_ in {"NOUN", "PROPN"}
-            and not _is_counter_word(doc[i + 1])
-        ) or _is_nominalized_adjective_start(doc, i):
-            # 「三次元」のように、数詞がそのまま名詞の一部になっている
-            # 複合語（"第１の基板"のように間に"の"を挟まないもの）にも対応する。
-            # ただし「２枚」「１種」のような「数字＋助数詞」（この後に
-            # 「の」＋本当の名詞が続く）は、複合語の開始として扱わない
-            # （helper _is_counter_word で判定）。
-            if token.pos_ in {"NOUN", "PROPN"} and _is_counter_word(token):
+        if token.pos_ in {"NOUN", "PROPN"}:
+            if _is_counter_word(token):
                 i += 1
                 continue
             start = i
-            words, i = _consume_noun_phrase(
-                doc, i, first_is_nominalized_adj=_is_nominalized_adjective_start(doc, i), fresh_start=True
-            )
+            words, i = _consume_noun_run(doc, i)
+            words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if (
-                phrase not in RELATION_WORDS or _relation_word_is_real_argument(doc, start, end)
-            ) and phrase not in GENERIC_NOUNS:
+            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -348,100 +463,7 @@ def extract_patent_components_general(doc):
             continue
         seen.add(key)
         unique_components.append(c)
-    return _disambiguate_components_by_name(doc, unique_components)
-
-
-# 「複数の」「いくつかの」のような数量詞は、実体を区別する情報ではない
-# （正解データでも名前に含めない傾向がある）ため、所有格プレフィックスの
-# 候補からは除外する。
-_QUANTIFIER_WORDS = {
-    "複数", "いくつか", "各", "全て", "すべて", "一部", "少なくとも",
-    "双方", "多く", "任意", "それぞれ", "幾つか",
-}
-
-
-def _has_zenki_prefix(doc, comp):
-    """
-    コンポーネントの直前トークンが「前記」「該」かどうかを見る。
-    「前記」「該」が付いている場合、それは新規の導入ではなく、既に
-    出てきた構成要素への後方参照である可能性が高い、という手がかりに使う。
-    """
-    idx = comp["start"] - 1
-    while idx >= 0 and not doc[idx].text.strip():
-        idx -= 1
-    return idx >= 0 and doc[idx].text in ("前記", "該")
-
-
-def _genitive_owner_candidate(doc, token, components):
-    """
-    tokenのnmod（「の」格）子から、所有格修飾語の候補を1つ探す
-    （数量詞は候補から除外する）。
-    """
-    for child in token.children:
-        if child.dep_ != "nmod":
-            continue
-        has_no = any(c.dep_ == "case" and c.text == "の" for c in child.children)
-        if not has_no:
-            continue
-        if child.text in _QUANTIFIER_WORDS:
-            continue
-        child_comp = find_component_by_token(components, child.i)
-        if child_comp is None:
-            continue
-        return child_comp
-    return None
-
-
-def _disambiguate_components_by_name(doc, components):
-    """
-    「スイッチング素子」のような同じ短い名前を持つ構成要素が請求項内に
-    複数現れる場合、それらが本当に同じ実体（「前記」「該」による後方参照）
-    なのか、たまたま同名なだけの別々の実体（例：「正極側のスイッチング素子」
-    と「負極側のスイッチング素子」）なのかを判定し、後者の場合だけ、
-    区別に必要な最小限の所有格修飾語を名前の先頭に付け足す。
-
-    以前は所有格の連鎖を無条件・再帰的にすべて結合していたが、実データで
-    検証したところ、(1) 数量詞（「複数の」等）まで巻き込んでしまう、
-    (2) 正解データは関係の種類に応じて名前の粒度を変えており、一律結合とは
-    噛み合わない、という2つの理由でかえってF1が悪化した。この反省を踏まえ、
-    「本当に曖昧さがある場合だけ」最小限の修飾を加える、より保守的な
-    アプローチに変更したもの。
-    """
-    groups = {}
-    for idx, c in enumerate(components):
-        groups.setdefault(c["text"], []).append(idx)
-
-    new_components = [dict(c) for c in components]
-
-    for name, idxs in groups.items():
-        # 「一端」「他端」のように、それ単独では何を指すか分からない
-        # 一般的すぎる語（_RELATION_WORDS_ALLOWED_AS_ARGUMENTで例外的に
-        # 実体として認めている語）は、たとえ請求項内で重複していなくても、
-        # 所有格修飾語があるなら常にそれを名前に含める
-        # （正解データでも「整流素子の陽極側の一端」のように、常に
-        #  所有格チェーンごと1つの構成要素名として扱われているため）。
-        always_disambiguate = name in _RELATION_WORDS_ALLOWED_AS_ARGUMENT
-        if always_disambiguate:
-            fresh_idxs = [i for i in idxs if not _has_zenki_prefix(doc, components[i])]
-        elif len(idxs) < 2:
-            continue
-        else:
-            # 後方参照（前記/該）は「新規導入」ではないので、曖昧さ解消の対象から除く
-            fresh_idxs = [i for i in idxs if not _has_zenki_prefix(doc, components[i])]
-            if len(fresh_idxs) < 2:
-                continue
-        for i in fresh_idxs:
-            comp = components[i]
-            anchor = doc[comp["end"]]
-            owner = _genitive_owner_candidate(doc, anchor, components)
-            if owner is None:
-                continue
-            if (owner["start"], owner["end"]) == (comp["start"], comp["end"]):
-                continue
-            prefix = owner["text"] + "の"
-            new_components[i]["text"] = _normalize_component_text(prefix + comp["text"])
-
-    return new_components
+    return unique_components
 
 
 # ============================================================
@@ -523,6 +545,55 @@ def find_previous_component_by_word(components, token):
     return None
 
 
+_ENUM_MARKERS = ("と", "及び", "および", "並びに", "ならびに", "又は", "または", "かつ")
+
+
+def _has_enum_marker(token, markers=_ENUM_MARKERS):
+    """
+    tokenの直接の子（case＝格助詞・接続表現）に、列挙・並列を表す
+    語（と／及び／並びに／又は等）があるかどうかを判定する。
+    """
+    return any(c.dep_ == "case" and c.text in markers for c in token.children)
+
+
+def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
+    """
+    「ＡとＢとの間」「Ａ及びＢ及びＣ」「Ａ、Ｂ及びＣ」のように、
+    列挙の助詞・接続語（と／及び／並びに／又は等）でつながった
+    構成要素を、tokenを起点に再帰的にすべて集める。
+
+    GiNZAの係り受けでは、こうした列挙は「Ｃ ← （の間・とは等）」
+    「Ｂ ←（と）─ Ｃ」「Ａ ←（と）─ Ｂ」のように、nmodで一段ずつ
+    入れ子になって連なることが多い。従来のコードは直接の子1つしか
+    見ていなかったため、「ＡとＢとの間にＣ」のＡ（一番奥の項目）を
+    取りこぼしていた。この関数はnmodの連鎖を、列挙マーカーが
+    付いている限り奥まで辿ることでその問題に対応する。
+
+    戻り値はテキスト上の出現順（開始位置）に並べ替えて返す。
+    """
+    results = []
+    stack = [token]
+    seen = set()
+    while stack:
+        t = stack.pop()
+        if t.i in seen:
+            continue
+        seen.add(t.i)
+        comp = find_component_by_token(components, t.i) or find_referenced_component(components, t)
+        if comp is not None and comp not in results:
+            results.append(comp)
+        for child in t.children:
+            if child.dep_ != "nmod":
+                continue
+            # 列挙マーカーが付いている場合、または、まだこの経路で
+            # 構成要素が1つも見つかっていない場合（＝間に修飾語を
+            # 挟んでいるだけの可能性がある場合）はさらに奥まで辿る。
+            if _has_enum_marker(child, markers) or comp is None:
+                stack.append(child)
+    results.sort(key=lambda c: c["start"])
+    return results
+
+
 def find_target_component_from_verb(components, verb):
     targets = []
     current = verb
@@ -584,9 +655,24 @@ def _is_locative_obl(token):
     「により」「によって」のような手段を表す格、「において」のような
     前提・状況を表す格（"より"/"おい"がfixedでついている場合）は
     場所ではないので除外する。
+
+    PATENT_CASE_FRAMES（簡易格フレーム辞書）にこの述語の登録が
+    あれば、その格の意味役割を優先的に使う（格フレーム法）。
+    登録がない述語については、従来通りの判定にフォールバックする。
     """
     if token.dep_ != "obl":
         return False
+
+    verb = token.head
+    if verb.pos_ == "VERB":
+        role = case_frame_role(verb, token)
+        if role == "location":
+            return True
+        if role is not None:
+            # 格フレーム辞書がこの格を「場所」以外（対象・動作主等）だと
+            # 明示している場合は、場所としては扱わない。
+            return False
+
     for child in token.children:
         if child.dep_ == "case":
             for grandchild in child.children:
@@ -685,13 +771,6 @@ def _merged_modifier_name(token, components):
     """
     「外側の面」のように、「の」で係る nmod の修飾語を語自体の前に
     くっつけた、より具体的な名前を作る。
-
-    構成要素抽出の時点（_disambiguate_components_by_name）で、既に
-    同じ所有格修飾語がbaseの先頭に組み込まれていることがある
-    （「一端」→「陽極側の一端」等）。その場合にここでもう一度同じ
-    修飾語を付けてしまうと「陽極側の陽極側の一端」のような二重付与に
-    なってしまうため、baseが既にその修飾語で始まっている場合は
-    スキップする。
     """
     comp = find_component_by_token(components, token.i)
     base = comp["text"] if comp is not None else token.text
@@ -704,26 +783,10 @@ def _merged_modifier_name(token, components):
         if not has_no:
             continue
         child_comp = find_component_by_token(components, child.i)
-        if child_comp is not None and comp is not None and (child_comp["start"], child_comp["end"]) == (comp["start"], comp["end"]):
-            # child が既に base と同じ結合済みコンポーネント内（例:「第１の厚さ」）の場合は
-            # 自己参照になってしまうため、所有格プレフィックスとして採用しない。
-            continue
-        candidate_prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
-        if base.startswith(candidate_prefix):
-            # 既に構成要素名の先頭にこの修飾語が組み込まれている（二重付与防止）
-            continue
-        prefix = candidate_prefix
+        prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
         break
 
     return prefix + base
-
-
-def _name_for_component(doc, comp, components):
-    """コンポーネント辞書から、所有格プレフィックス（nmod「の」）を含めた表示名を作る。"""
-    if comp is None:
-        return None
-    anchor = doc[comp["end"]]
-    return _merged_modifier_name(anchor, components)
 
 
 def _find_owner_via_acl(token, components):
@@ -808,12 +871,12 @@ def extract_boundary_relations(doc, components):
     複数のものの間にある場合、nmodの係り受けを辿って
     「境界」とその両側（Ａ・Ｂ）との関係を抽出する。
 
-    「と」でつながっている語（＝対等に並んでいる境界の両側）だけを対象にし、
-    「の」でつながっている語（＝単なる修飾語。例：外側の／サイドプレートの）
-    は関係先にしない。
+    「と」「及び」「並びに」等でつながっている語（＝対等に並んでいる
+    境界の両側）だけを対象にし、「の」でつながっている語（＝単なる修飾語。
+    例：外側の／サイドプレートの）は関係先にしない。
     """
     def has_to_marker(token):
-        return any(c.dep_ == "case" and c.text == "と" for c in token.children)
+        return _has_enum_marker(token)
 
     relations = []
     for c in components:
@@ -851,43 +914,6 @@ def extract_boundary_relations(doc, components):
     return relations
 
 
-def _find_nsubj_target_for_verb(doc, components, verb):
-    """
-    「前記取り付けフレームの一部は、Ａと、Ｂとの間に位置する」のように、
-    位置関係の動詞（位置する等）が名詞を修飾する連体修飾節（acl）として
-    使われている場合、GiNZAの長文解析でこの動詞自身の主語（「一部」）が、
-    動詞にではなく、その動詞が係る先のさらに遠い名詞（節全体が最終的に
-    かかる請求項全体の名前など）に直接の子（nsubj）として誤って
-    結びついてしまうことがある（extract_has_relationsのsubj_token選択で
-    対応した問題と同じ系統のバグ）。
-
-    obj（目的語）が見つからない場合のフォールバックとして、まず動詞自身、
-    次に動詞の係り先（head）の直接の子からnsubjを探し、動詞に一番近い
-    ものを主語として採用する。所有格プレフィックス（「取り付けフレームの」
-    等）も含めた名前を使う。
-    """
-    candidates = []
-    seen_idx = set()
-    for child in verb.children:
-        if child.dep_ == "nsubj" and child.i not in seen_idx:
-            candidates.append(child)
-            seen_idx.add(child.i)
-    if verb.head is not None and verb.head.i != verb.i:
-        for child in verb.head.children:
-            if child.dep_ == "nsubj" and child.i not in seen_idx:
-                candidates.append(child)
-                seen_idx.add(child.i)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda c: abs(c.i - verb.i))
-    chosen = candidates[0]
-    comp = find_component_by_token(components, chosen.i) or find_referenced_component(components, chosen)
-    if comp is None:
-        return None
-    merged_text = _merged_modifier_name(chosen, components)
-    return {"text": merged_text}
-
-
 def extract_positional_relations(doc, components, relation_words):
     relations = []
     for relation in relation_words:
@@ -895,42 +921,24 @@ def extract_positional_relations(doc, components, relation_words):
 
         source_components = []
         for child in relation_token.children:
+            if child.dep_ == "nmod":
+                # 「ＡとＢとの間」のように、複数の構成要素が「と」等で
+                # 列挙されてrelation_word（例：「間」）に係っている場合、
+                # 一番手前の項目（Ｂ）だけでなく奥の項目（Ａ）も拾う。
+                for c in collect_enumerated_components(child, components):
+                    if c not in source_components:
+                        source_components.append(c)
+                continue
             c = find_referenced_component(components, child)
             if c is not None and c not in source_components:
                 source_components.append(c)
+        source_components.sort(key=lambda c: c["start"])
 
         verb = relation_token.head
         if verb.pos_ != "VERB":
             continue
 
-        # 「ＡとＢとの間に」のように、「間」の基準となる複数の対象のうち
-        # 一方（Ａ）が「間」自身の子（nmod）ではなく、動詞の別のobl引数
-        # として並列に現れることがある（「Ａと、Ｂとの間に」で、Ａ側が
-        # 動詞に直接係り、Ｂ側だけが「間」に係る場合）。そのような「と」
-        # 付きの並列obl引数も基準側（source）として拾う。また、
-        # 「Ａ、ＢおよびＣと」のように列挙されている場合は、nmodで
-        # 連なる連鎖（Ｃ→Ｂ→Ａ）を辿って全項目を拾う。
-        for sibling in verb.children:
-            if sibling.i == relation_token.i or sibling.dep_ != "obl":
-                continue
-            if not any(gc.dep_ == "case" and gc.text == "と" for gc in sibling.children):
-                continue
-            chain_token = sibling
-            visited_chain = set()
-            while chain_token is not None and chain_token.i not in visited_chain:
-                visited_chain.add(chain_token.i)
-                c = find_referenced_component(components, chain_token)
-                if c is not None and c not in source_components:
-                    source_components.append(c)
-                next_token = None
-                for gc in chain_token.children:
-                    if gc.dep_ == "nmod":
-                        next_token = gc
-                        break
-                chain_token = next_token
-
-        is_has_branch = verb.lemma_ in HAS_LEMMAS
-        if is_has_branch:
+        if verb.lemma_ in HAS_LEMMAS:
             # 「Ａ間に、Ｂを有し」のように「有する」が使われている場合は、
             # 文全体の主語（根っこ）ではなく、「有する」の直接の目的語
             # （＝実際にそこに存在するもの）を関係先にする。
@@ -951,14 +959,9 @@ def extract_positional_relations(doc, components, relation_words):
                         target_components.append(t)
                     break
             if not target_components:
-                # 動詞自身に直接の目的語(obj)がない場合、まず動詞（またはその
-                # 係り先）のnsubjを探す。見つからない場合だけ、従来通り
-                # 動詞連鎖を遡って構成要素を探す。
-                nsubj_target = _find_nsubj_target_for_verb(doc, components, verb)
-                if nsubj_target is not None:
-                    target_components = [nsubj_target]
-                else:
-                    target_components = find_target_component_from_verb(components, verb)
+                # 動詞自身に直接の目的語(obj)がない場合（受身形など）だけ、
+                # 従来通り動詞連鎖を遡って構成要素を探す
+                target_components = find_target_component_from_verb(components, verb)
             aux_texts = "".join(
                 c.text for c in sorted(verb.children, key=lambda c: c.i)
                 if c.pos_ == "AUX" and c.i > verb.i
@@ -969,32 +972,12 @@ def extract_positional_relations(doc, components, relation_words):
             for source in source_components:
                 if source["text"] == target["text"]:
                     continue
-                if is_has_branch:
-                    # 「Ａの間に、Ｂを有し」は「Ａには有する」と同じ
-                    # 「場所（Ａ）→ そこにあるもの（Ｂ）」という向きなので、
-                    # そのまま source=場所, target=中身 でよい。
-                    relations.append({
-                        "source": source["text"],
-                        "relation": label,
-                        "target": target["text"],
-                        "type": "positional",
-                    })
-                else:
-                    # 「ＡとＢとの間にＣが設けられる／位置する」等は、
-                    # 意味的には「Ｃ（配置される主体）が、Ａ・Ｂ（基準・
-                    # 境界となる相手）に対して間に位置する」であり、
-                    # ＳＡＯとして素直に読めば source=Ｃ（配置される側）、
-                    # target=Ａ・Ｂ（基準側）である。以前はここが逆
-                    # （source=Ａ・Ｂ、target=Ｃ）になっており、正解データ
-                    # （人手で作成したゴールドSAO）と方向が系統的に逆転して
-                    # いた（直接関係の「に接続される」等で見つかった
-                    # 系統的な向きの逆転と同じ性質の問題）。
-                    relations.append({
-                        "source": target["text"],
-                        "relation": label,
-                        "target": source["text"],
-                        "type": "positional",
-                    })
+                relations.append({
+                    "source": source["text"],
+                    "relation": label,
+                    "target": target["text"],
+                    "type": "positional",
+                })
     return relations
 
 
@@ -1006,18 +989,6 @@ def _is_passive(verb):
     """動詞が受身形（〜られた／〜れた）かどうかを判定する"""
     return any(
         child.pos_ == "AUX" and child.lemma_ in ("れる", "られる")
-        for child in verb.children
-    )
-
-
-def _is_negated(verb):
-    """
-    動詞が否定形（〜ない／〜ません等）かどうかを判定する。
-    「〜が行われない」のような否定文から、肯定の関係として
-    誤って抽出してしまうのを防ぐために使う。
-    """
-    return any(
-        child.lemma_ in ("ない", "ず", "ぬ") and child.pos_ in ("AUX", "SCONJ")
         for child in verb.children
     )
 
@@ -1142,29 +1113,6 @@ def _find_nearest_topic_before_text(doc, components, verb):
             )
             if has_boundary:
                 continue
-            # 候補（「は」の係り先の名詞）が、すでに明示的なnsubjとして
-            # 別の動詞に係っている場合、その係り先からverbまでの経路を
-            # 辿ってみて、途中で連体修飾（acl＝「〜する◯◯」のような、
-            # 別の名詞を説明する節）を挟んでいれば、その候補は
-            # 全く別の節（別の名詞句の説明）の主題とみなしてスキップする。
-            # 経路が連用修飾（advcl等）だけで動詞から動詞へ直接繋がって
-            # いる場合は、同じ節の一部とみなして使ってよい。
-            if t.head.dep_ == "nsubj" and t.head.head.i != verb.i:
-                cursor = t.head.head
-                crosses_acl = False
-                seen_path = set()
-                while cursor.i not in seen_path:
-                    seen_path.add(cursor.i)
-                    if cursor.i == verb.i:
-                        break
-                    if cursor.dep_ == "acl":
-                        crosses_acl = True
-                        break
-                    if cursor.head.i == cursor.i:
-                        break
-                    cursor = cursor.head
-                if crosses_acl:
-                    continue
             comp = find_component_by_token(components, t.head.i) or find_referenced_component(components, t.head)
             if comp is not None:
                 return comp
@@ -1311,135 +1259,6 @@ def extract_comparison_relations(doc, components):
                 "target": items[i + 1],
                 "type": "direct",
             })
-
-    # 「ＡはＢより小さい（大きい／高い／低い／長い／短い等）」のような
-    # 比較表現。「より」で係る語（Ｂ）と、比較の対象（Ａ、通常は
-    # nsubj）を抽出する。
-    COMPARISON_ADJ = {
-        "小さい", "大きい", "高い", "低い", "長い", "短い", "多い", "少ない", "広い", "狭い",
-        "薄い", "厚い", "深い", "浅い", "硬い", "柔らかい", "重い", "軽い", "太い", "細い",
-        "強い", "弱い", "遠い", "近い", "粗い", "濃い",
-    }
-    for adj in doc:
-        # 「薄くて」「硬くて」のようなテ形（連用中止形）は、GiNZAでpos_が
-        # ADJではなくVERBとして解析されることがある。lemma自体は元の
-        # 形容詞（薄い／硬い等）のまま保たれるので、pos_をADJに限定せず
-        # VERBも許容する（対象のlemma集合を絞っているため誤検出のリスクは
-        # 低い）。
-        if adj.pos_ not in ("ADJ", "VERB") or adj.lemma_ not in COMPARISON_ADJ:
-            continue
-
-        yori_child = None
-        for c in adj.children:
-            if c.dep_ == "obl" and any(cc.dep_ == "case" and cc.text == "より" for cc in c.children):
-                yori_child = c
-                break
-        if yori_child is None:
-            continue
-        target_comp = find_component_by_token(components, yori_child.i) or find_referenced_component(components, yori_child)
-        if target_comp is None:
-            continue
-        # 所有格プレフィックス込みの名前を使う（「熱膨張係数」等、持ち主違いの
-        # 同名属性が多いため、bareな名前のままだと下のsource=target判定で
-        # 別々の実体が誤って同一視され、関係が抽出されなくなってしまう）。
-        target_name = _merged_modifier_name(yori_child, components)
-
-        # 比較の対象（Ａ）は、このadj自身のnsubj、またはこのadjの
-        # 係り先（複合語の頭、さらにその先の動詞や文全体の主語など）を
-        # 辿った先にあるnsubjとして表れることが多い。
-        subj_token = None
-        for c in adj.children:
-            if c.dep_ == "nsubj":
-                subj_token = c
-                break
-        if subj_token is None:
-            cursor = adj
-            visited = set()
-            while cursor.i not in visited:
-                visited.add(cursor.i)
-                for c in cursor.children:
-                    if c.dep_ == "nsubj" and c.i < adj.i:
-                        subj_token = c
-                        break
-                if subj_token is not None:
-                    break
-                if cursor.head.i == cursor.i:
-                    break
-                cursor = cursor.head
-        if subj_token is None:
-            continue
-        source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
-        if source_comp is None:
-            continue
-        source_name = _merged_modifier_name(subj_token, components)
-        if source_name == target_name:
-            continue
-
-        relations.append({
-            "source": source_name,
-            "relation": f"より{adj.text}",
-            "target": target_name,
-            "type": "direct",
-        })
-
-    # 「ＡがＢを超える（上回る／下回る／満たす）」のような、
-    # 動詞による比較・条件表現。ADJの場合と同じく、この動詞自身に
-    # nsubjが付いていないことが多く（「〜を超えた場合に〜する」の
-    # ように連体修飾として使われるため）、離れた場所にある別の動詞に
-    # 主語が誤って直結してしまっていることがあるので、
-    # head連鎖を遡ってnsubjを探す。
-    COMPARISON_VERBS = {"超える", "上回る", "下回る", "満たす"}
-    for verb in doc:
-        if verb.pos_ != "VERB" or verb.lemma_ not in COMPARISON_VERBS:
-            continue
-
-        obj_token = None
-        for c in verb.children:
-            if c.dep_ == "obj":
-                obj_token = c
-                break
-        if obj_token is None:
-            continue
-        target_comp = find_component_by_token(components, obj_token.i) or find_referenced_component(components, obj_token)
-        if target_comp is None:
-            continue
-        target_name = _merged_modifier_name(obj_token, components)
-
-        subj_token = None
-        for c in verb.children:
-            if c.dep_ == "nsubj":
-                subj_token = c
-                break
-        if subj_token is None:
-            cursor = verb
-            visited = set()
-            while cursor.i not in visited:
-                visited.add(cursor.i)
-                for c in cursor.children:
-                    if c.dep_ == "nsubj" and c.i < verb.i:
-                        subj_token = c
-                        break
-                if subj_token is not None:
-                    break
-                if cursor.head.i == cursor.i:
-                    break
-                cursor = cursor.head
-        if subj_token is None:
-            continue
-        source_comp = find_component_by_token(components, subj_token.i) or find_referenced_component(components, subj_token)
-        if source_comp is None:
-            continue
-        source_name = _merged_modifier_name(subj_token, components)
-        if source_name == target_name:
-            continue
-
-        relations.append({
-            "source": source_name,
-            "relation": verb.text,
-            "target": target_name,
-            "type": "direct",
-        })
-
     return relations
 
 
@@ -1695,59 +1514,6 @@ def extract_capability_relations(doc, components):
     return relations
 
 
-_QUANTIFIER_ONLY_WORDS = {
-    "複数", "一部", "全部", "一つ", "ひとつ", "いくつか", "一種", "全て", "すべて",
-    "少なくとも一部", "少なくとも一つ", "各々", "それぞれ",
-}
-
-# head 自体が「Xの◯◯」という属性・数値的な名詞（熱膨張係数、寸法、厚さ等）で
-# 終わる場合に限り、acl の意味上の対象を「Xの」側へ差し替える。
-# 「第１封止部分」のような、それ自体で完結した部材名（属性名詞で終わらない）を
-# 誤って所有格側に差し替えてしまう事故を防ぐための一般的なガード。
-_ATTRIBUTE_HEAD_SUFFIXES = (
-    "係数", "値", "率", "量", "数", "径", "幅", "厚さ", "高さ", "寸法", "面積", "体積",
-    "温度", "圧力", "速度", "強度", "硬度", "密度", "濃度", "長さ", "大きさ", "重さ",
-    "深さ", "広さ", "距離", "角度", "比率", "割合",
-)
-
-
-def _acl_semantic_target(verb, components):
-    """連体修飾節(acl)が構文上かかる名詞(head)ではなく、意味上その節が説明している
-    名詞を求める。例:「(基板に)含まれる銅の熱膨張係数」では、GiNZA上は head が
-    「熱膨張係数」になるが、「含まれる」が実際に説明しているのは「銅」である。
-    head の子に「Xの」という nmod（所有格）があれば、そちらを意味上の対象として
-    優先する。特定の請求項に依存しない一般的な構文パターン。
-
-    ただし「複数の」「少なくとも一部の」のような数量詞は実体を指す名詞ではないため
-    候補から除外する（例:「半導体層に形成された複数のトランジスタセル」では、
-    head の「トランジスタセル」を意味上の対象のままにし、数量詞「複数」に
-    差し替えてはならない）。
-
-    さらに、head 自体が「熱膨張係数」のような属性・数値的な名詞で終わる場合に限り
-    差し替えを行う。「第１封止部分」のようにそれ自体で完結した部材名の場合は、
-    たまたま近くにある別の名詞句（無関係な並列句の一部等）を意味上の対象と
-    誤認しないよう、差し替えを行わない。
-    """
-    if verb.dep_ != "acl":
-        return None
-    head = verb.head
-    if not head.text.endswith(_ATTRIBUTE_HEAD_SUFFIXES):
-        return None
-    candidates = []
-    for child in head.children:
-        if child.i == verb.i or child.dep_ != "nmod":
-            continue
-        if any(c.dep_ == "case" and c.text == "の" for c in child.children):
-            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
-            if comp is not None and comp["text"] not in _QUANTIFIER_ONLY_WORDS:
-                candidates.append(child)
-    if not candidates:
-        return None
-    # head直前（＝最も直接的な所有格）を優先する。
-    nearest = max(candidates, key=lambda c: c.i)
-    return find_component_by_token(components, nearest.i) or find_referenced_component(components, nearest)
-
-
 def extract_direct_relations(doc, components):
     """
     「Ａに接続されたＢ」（受身）と「Ｂを破砕するＡ」（能動）の
@@ -1770,63 +1536,12 @@ def extract_direct_relations(doc, components):
             # extract_has_location_relations / extract_positional_relations の
             # 方で別途処理しているのでここでは扱わない
             continue
-        if verb.lemma_ in ("超える", "上回る", "下回る", "満たす"):
-            # extract_comparison_relations の方で、head連鎖を遡って
-            # 正しい主語を探す専用の処理をしているので、ここでは扱わない
-            # （そのまま扱うと、誤ったheadを拾って重複した関係になる）
-            continue
-        if _is_negated(verb):
-            # 「〜が行われない」のように否定されている場合、肯定の関係として
-            # 抽出してしまうと意味が逆になるため、この動詞からは抽出しない。
-            continue
         if verb.lemma_ == "接触" and any(
             child.dep_ == "advcl" and child.lemma_ == "接する" for child in verb.children
         ):
             # 「〜に接するように…接触させて」は extract_contact_relations の方で
             # 別途処理しているのでここでは扱わない（重複防止）
             continue
-
-        # 「ＡはＢに対して〜される」のような、動詞が「に対して」格を
-        # 持つ受身文は、その「に対して」格こそが本当のtarget（何に対して
-        # 行われるか）であり、nsubj（受け手として書かれている方）が
-        # sourceになる。これは通常の受身（head=target）とは逆のパターン
-        # なので、他の処理より先に、専用のロジックで処理する。
-        if _is_passive(verb):
-            taisite_obl = None
-            for child in verb.children:
-                if child.dep_ == "obl":
-                    for c2 in child.children:
-                        if c2.dep_ == "case" and any(
-                            gc.dep_ == "fixed" and gc.text in ("対し", "対して")
-                            for gc in c2.children
-                        ):
-                            taisite_obl = child
-                            break
-                if taisite_obl is not None:
-                    break
-            if taisite_obl is not None:
-                nsubj_tok = None
-                for child in verb.children:
-                    if child.dep_ == "nsubj":
-                        nsubj_tok = child
-                        break
-                if nsubj_tok is not None:
-                    source_c = (
-                        find_component_by_token(components, nsubj_tok.i)
-                        or find_referenced_component(components, nsubj_tok)
-                    )
-                    target_c = (
-                        find_component_by_token(components, taisite_obl.i)
-                        or find_referenced_component(components, taisite_obl)
-                    )
-                    if source_c is not None and target_c is not None and source_c["text"] != target_c["text"]:
-                        relations.append({
-                            "source": source_c["text"],
-                            "relation": verb.text,
-                            "target": target_c["text"],
-                            "type": "direct",
-                        })
-                        continue
 
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
@@ -1836,173 +1551,34 @@ def extract_direct_relations(doc, components):
             fallback = find_target_component_from_verb(components, verb)
             head_component = fallback[0] if fallback else None
         if head_component is None:
-            # それでも見つからない場合、「Ｘは、…を検出し、…を算出する」の
-            # ように、この動詞自体は次の動詞（算出）に連なっているだけで
-            # 直接の相手を持たないように見えても、動詞自身の目的語（obj）が
-            # あれば、それをtargetとして使う。
-            own_obj = None
-            for child in verb.children:
-                if child.dep_ == "obj":
-                    own_obj = child
-                    break
-            if own_obj is not None:
-                head_component = (
-                    find_component_by_token(components, own_obj.i)
-                    or find_referenced_component(components, own_obj)
-                )
-        if head_component is None:
             continue
 
-        # 「(基板に)含まれる銅の熱膨張係数」のように、連体修飾節(acl)が
-        # 構文上かかる名詞(head)が「Xの◯◯」という属性・数値的な名詞
-        # （熱膨張係数、寸法、厚さ等）である場合、節が実際に説明しているのは
-        # head自身ではなく所有格側（銅）であることが多い。これを優先する。
-        acl_target = _acl_semantic_target(verb, components)
-        if acl_target is not None and acl_target["text"] != head_component["text"]:
-            head_component = acl_target
-
         if _is_passive(verb):
-            # 受身：通常はhead（動詞の係り先）が受け手（target）だが、
-            # 「Ｘは、Ｙと〜接続され」のように、動詞のheadがGiNZAの
-            # 長文誤解析で見当違いの場所（請求項タイトル等）を指して
-            # しまっている場合（＝head_componentがフォールバックでしか
-            # 見つからなかった場合）、「は」で明示的にマークされたobl子
-            # （実質的な主語＝本当の受け手）の方が正しいtargetであることが
-            # 多いので、そちらを優先する。
-            passive_target = head_component
-            topic_obl = None
+            # 受身：headが受け手（target）。「に」で係る語などが動作主（source）。
             for child in verb.children:
-                if (
-                    child.dep_ == "obl"
-                    and child.text not in RELATION_WORDS
-                    and any(c.dep_ == "case" and c.text == "は" for c in child.children)
-                ):
-                    topic_obl = child
-                    break
-            if topic_obl is not None:
-                topic_comp = (
-                    find_component_by_token(components, topic_obl.i)
-                    or find_referenced_component(components, topic_obl)
-                )
-                if topic_comp is not None:
-                    passive_target = topic_comp
-            else:
-                # head_componentが「文書の最後の語＝請求項タイトル」の場合、
-                # それは動詞から見て本当に近い係り先ではなく、連体修飾の
-                # 連鎖を辿った結果たまたま行き着いただけの可能性が高い。
-                # 「Ｘは、Ｙに隣接して配置され」のように、本当のtarget（Ｙ）が
-                # 「隣接して」という連用修飾語（advcl）自身のobl子として、
-                # 動詞から見て1段階深いところに埋め込まれていることがあるので、
-                # そちらを優先する。
-                last_real_token_i = len(doc) - 1
-                while last_real_token_i > 0 and doc[last_real_token_i].pos_ == "PUNCT":
-                    last_real_token_i -= 1
-                head_is_claim_title = head_component["end"] == last_real_token_i
-                if head_is_claim_title:
-                    for child in verb.children:
-                        if child.dep_ != "advcl":
-                            continue
-                        for gc in child.children:
-                            if gc.dep_ == "obl":
-                                gc_comp = (
-                                    find_component_by_token(components, gc.i)
-                                    or find_referenced_component(components, gc)
-                                )
-                                if gc_comp is not None:
-                                    passive_target = gc_comp
-                                    break
-                        if passive_target is not head_component:
-                            break
-
-            # 「ＡはＢによりＣに対して位置決めされる」のような、手段格
-            # （により）と対象格（に対して）を同時に持つ受身文に対応する。
-            # 「により」は動作の手段であって、動作主でも受け手でもないので
-            # source/targetの候補から完全に除外する。
-            # 「に対して」は動作の対象（＝実質的な受け手）を表すので、
-            # 見つかった場合はそちらをtargetとして最優先で使う。
-            means_oblique_idx = set()
-            taishite_target = None
-            for child in verb.children:
-                if child.dep_ != "obl":
+                if child.dep_ not in ("obl", "nsubj"):
                     continue
-                fixed_texts = {gc.text for gc in child.children if gc.dep_ == "fixed"}
-                if "より" in fixed_texts:
-                    means_oblique_idx.add(child.i)
-                elif "対し" in fixed_texts:
-                    means_oblique_idx.add(child.i)
-                    if taishite_target is None:
-                        comp = (
-                            find_component_by_token(components, child.i)
-                            or find_referenced_component(components, child)
-                        )
-                        if comp is not None:
-                            taishite_target = comp
-            if taishite_target is not None:
-                passive_target = taishite_target
-
-            # 動詞に「本物のnsubj」（真の文法上の主語）が直接の子として
-            # あるかどうかで、source/targetの向きを決める。
-            #   ・nsubjが無い場合（連体修飾節：「Ａに接続されるＢ」のＢの
-            #     ように、head_component（またはtopic_obl）が動作の
-            #     受け手＝真の主語の代役になっているケース）は、
-            #     source=passive_target（主語役）、target=source候補
-            #     （に格の相手）が正しい向き。
-            #   ・nsubjが直接ある場合（「Ｂは…Ａに配置され」のような
-            #     通常の主語付き文）は、そのnsubj自身がsource_candidates
-            #     に入ってきており、既にsource=nsubj、target=passive_target
-            #     （head_componentのフォールバックで見つかる、位置・相手側の
-            #     語）という正しい向きになっている。
-            # 以前はnsubjの有無に関わらず常にsource=obl候補
-            # （またはnsubj候補）／target=passive_targetという1通りの
-            # 向きで固定していたため、nsubjが無いケース（連体修飾節）で
-            # 正解データ（人手で作成したゴールドSAO）と方向が系統的に
-            # 逆転していた。gold標準との比較でこれが確認されたため、
-            # nsubjの有無で場合分けするよう修正する。
-            has_real_nsubj_child = any(c.dep_ == "nsubj" for c in verb.children)
-
-            source_candidates = []
-            for child in verb.children:
-                if topic_obl is not None and child.i == topic_obl.i:
-                    # targetとして使った語は、sourceの候補には入れない
-                    continue
-                if child.i in means_oblique_idx:
-                    # 「により」「に対して」で係る語は、上ですでに処理済み
-                    # なので、通常のsource候補としては扱わない
-                    continue
-                if child.dep_ in ("obl", "nsubj"):
-                    source_candidates.append(child)
-                elif child.dep_ == "advcl":
-                    # 「〜と電気的に接続され」のように、本当の動作主（配線等）が
-                    # 「電気的に」という副詞句のnmod修飾語として、動詞から見て
-                    # 1段階深いところに埋め込まれていることがある。
-                    for gc in child.children:
-                        if gc.dep_ == "nmod":
-                            source_candidates.append(gc)
-            for child in source_candidates:
                 if child.text == "場合":
                     # 「場合」は条件節の目印であって、動作主ではないので除外する
                     # （GiNZAが超長文でここに主語を誤って結びつけることがある）
+                    continue
+                if case_frame_role(verb, child) == "location":
+                    # 簡易格フレーム辞書上、この格が「場所」だと分かっている
+                    # 場合は、受身の動作主（source）とは扱わない
+                    # （格フレーム法：「Ａには〜」のＡを動作主と誤認しない）。
                     continue
                 source = (
                     find_previous_component_by_word(components, child)
                     or find_referenced_component(components, child)
                 )
-                if source is None or source["text"] == passive_target["text"]:
+                if source is None or source["text"] == head_component["text"]:
                     continue
-                if has_real_nsubj_child:
-                    relations.append({
-                        "source": source["text"],
-                        "relation": verb.text,
-                        "target": passive_target["text"],
-                        "type": "direct",
-                    })
-                else:
-                    relations.append({
-                        "source": passive_target["text"],
-                        "relation": verb.text,
-                        "target": source["text"],
-                        "type": "direct",
-                    })
+                relations.append({
+                    "source": source["text"],
+                    "relation": verb.text,
+                    "target": head_component["text"],
+                    "type": "direct",
+                })
         else:
             # 能動：headが直接の係り先として構成要素そのものであれば、それを
             # 主語(source)として使う（例：「Ｘを表すＹ」のＹ＝head）。
@@ -2097,37 +1673,13 @@ def extract_direct_relations(doc, components):
             for child in verb.children:
                 if child.dep_ != "obj":
                     continue
-
-                # 「Ａ、Ｂ、Ｃ及びＤを含み」のように、objの前に「及び」等で
-                # 繋がれた項目が複数ある場合、それはGiNZAの解析上、
-                # 「及び」に近い項目からobjに向かって、nmod修飾語の連鎖
-                # として表れる（Ａ→Ｂ→Ｃ→Ｄのように、途中には「及び」が
-                # 付かないことが多い）。objの直接の子に「及び」「又は」
-                # 等のcc（等位接続）子が見つかったら、これは列挙だと
-                # 判断し、そこから続くnmodの連鎖を全部たどる。
-                obj_candidates = [child]
-                has_enum_cc = any(gc.dep_ == "cc" for gc in child.children)
-                if has_enum_cc:
-                    cursor = child
-                    seen_ids = {cursor.i}
-                    while True:
-                        nmod_child = None
-                        for nm in cursor.children:
-                            if nm.dep_ == "nmod" and nm.i < cursor.i and nm.i not in seen_ids:
-                                nmod_child = nm
-                                break
-                        if nmod_child is None:
-                            break
-                        obj_candidates.append(nmod_child)
-                        seen_ids.add(nmod_child.i)
-                        cursor = nmod_child
-
-                for obj_cand in obj_candidates:
-                    target = (
-                        find_component_by_token(components, obj_cand.i)
-                        or find_referenced_component(components, obj_cand)
-                    )
-                    if target is None or target["text"] == effective_source["text"]:
+                # 「Ａ及びＢを含む」のように、目的語自体が列挙になっている
+                # 場合に備えて、単一のobjトークンだけでなく、そこから
+                # 「と」「及び」等で連なる構成要素もすべて対象にする
+                # （動詞・目的語の関係補正：列挙の目的語補正）。
+                obj_targets = collect_enumerated_components(child, components)
+                for target in obj_targets:
+                    if target["text"] == effective_source["text"]:
                         continue
 
                     real_owner = effective_source
@@ -2135,7 +1687,7 @@ def extract_direct_relations(doc, components):
                     if verb.lemma_ == "含む":
                         # 「Ａを…受信可能な受信部」のように、目的語の直後に
                         # 「〜可能な部」が続く場合は、そちらを本当の持ち主にする
-                        cap_owner = _find_following_capability_owner(doc, components, obj_cand, verb.i)
+                        cap_owner = _find_following_capability_owner(doc, components, child, verb.i)
                         if cap_owner is not None and cap_owner["text"] != target["text"]:
                             real_owner = cap_owner
                     if real_owner["text"] == target["text"]:
@@ -2215,10 +1767,6 @@ def _is_list_item_component(doc, comp):
     その構成要素の直後に「と、」（区切りの格助詞＋読点）が来ているかどうかを
     判定する。「Ａと通信する」のような、単に「と」で係る場合（直後が
     読点でない）は対象外にする。
-
-    「第１のトランジスタから第６のトランジスタと、…を有し」のような、
-    範囲の始点側（「から」が直後に来る場合）も対象に含める
-    （「乃至」は解析前に「から」へ正規化されるため、同じ扱いになる）。
     """
     end = comp["end"]
     nxt = end + 1
@@ -2229,39 +1777,7 @@ def _is_list_item_component(doc, comp):
         and doc[nxt + 1].text in ("、", "を")
     ):
         return True
-    if (
-        nxt < len(doc)
-        and doc[nxt].text == "から"
-        and doc[nxt].dep_ == "case"
-        and comp["text"].startswith("第")
-    ):
-        return True
     return False
-
-
-def _enumeration_scope_start(doc, components, owner):
-    """
-    「Ａと、Ｂと、Ｃと、…を有する」の兄弟項目Ｃ自身が、さらにその内部で
-    「（Ｃの一部である）ｘと、ｙを有するＣ」のように別の列挙を持つ場合
-    （入れ子の列挙）、Ｃの内部列挙の対象を集めるときに、Ｃより前にある
-    兄弟項目（ＡやＢ）まで「直前の列挙」として誤って拾ってしまうことが
-    ある（ＡやＢもそれぞれ「〜と、」で終わる、独立したリスト項目に
-    見えてしまうため）。
-
-    ownerが列挙項目そのもの（is_list_item_component）である場合は、
-    ownerより前にある「ownerの直前の兄弟列挙項目」の終わりの位置を
-    返し、それ以前のリスト項目は対象候補から除外できるようにする。
-    ownerが列挙項目でない場合（根や、列挙と無関係な語）は、制限
-    なし（-1）を返す。
-    """
-    if owner is None or not _is_list_item_component(doc, owner):
-        return -1
-    best = -1
-    for c in components:
-        if c["end"] < owner["start"] and _is_list_item_component(doc, c):
-            if c["end"] > best:
-                best = c["end"]
-    return best
 
 
 def extract_has_relations(doc, components):
@@ -2293,17 +1809,8 @@ def extract_has_relations(doc, components):
         subj_token = None
         obj_token = None
         for child in verb.children:
-            if child.dep_ == "nsubj":
-                # 「Ｘは、Ａを含み、Ｙは、Ｂを有し、Ｚは、…」のように「は」で
-                # 区切られた節が連なる長文では、GiNZAが各節自身の主語を
-                # その節の動詞ではなく、鎖の先にあるもっと後方の動詞に
-                # 誤って直接の子（nsubj）として付けてしまうことがある。
-                # その結果、1つの動詞に複数のnsubj候補（本来は別の節の主語）が
-                # 付くことがあるが、その動詞に一番近い（＝直前の）ものが、
-                # その動詞自身の節の主語である可能性が最も高いため、
-                # 最初に見つかったものではなく、動詞に最も近いものを採用する。
-                if subj_token is None or child.i > subj_token.i:
-                    subj_token = child
+            if child.dep_ == "nsubj" and subj_token is None:
+                subj_token = child
             if child.dep_ == "obj" and obj_token is None:
                 obj_token = child
 
@@ -2311,11 +1818,6 @@ def extract_has_relations(doc, components):
 
         targets = []
         owner = None
-        # 「Ａと、Ｂと、Ｃと、…を有する（備える）」の並列列挙から得られた
-        # ターゲットは、請求項がその動詞で明示的に列挙した最も信頼度の高い
-        # 構成要素なので、(start end)を記録しておき、後段（_simplify_hierarchy）
-        # で「より具体的な鎖がある」という理由だけで安易に消されないようにする。
-        enum_target_keys = set()
 
         # 「Ａと、Ｂと、Ｃと、…を有する（備える）」のような並列列挙が
         # 2件以上見つかる場合は、それを最優先で使う（「は」探しに
@@ -2339,37 +1841,7 @@ def extract_has_relations(doc, components):
             if verb.i - nearest_end > 15:
                 early_list_targets = []
 
-        acl_owner = None
-        acl_target = None
-        if verb.dep_ == "acl" and subj_token is None and obj_token is not None and head_component is not None:
-            # 連体修飾節（acl）として名詞にかかる「Ｘを有する／備える／含むＹ」は、
-            # 構文上Ｙ（修飾される名詞）がＸを持つ、という意味が一意に決まる
-            # （例：「スイッチング機能を有するパワー半導体モジュール」→
-            #  パワー半導体モジュールがスイッチング機能を有する）。
-            # このパターンは節の主語を持たないため、後段の「周囲の並列列挙を
-            # 拾う」ヒューリスティック（②③④）にそのまま処理させると、
-            # たまたま近くにある無関係な列挙項目（「Ａと、Ｂと、…を備え」等）を
-            # 対象として誤って拾ってしまうことがある。obj自体が明確に対象を
-            # 示しているので、その誤りを避けるために最優先で処理する。
-            cand = (
-                find_component_by_token(components, obj_token.i)
-                or find_referenced_component(components, obj_token)
-            )
-            # ただし、「Ａと、Ｂと、Ｃと、…を備える、Ｘ。」のように、この動詞自体が
-            # 列挙を締めくくる（＝Ｘという名詞にかかる）トップレベルのacl節で、
-            # かつobj自身も「Ｃと、」の形で他の兄弟項目と並列列挙されている場合は、
-            # 話が別である。この場合はobjだけでなく列挙全体（Ａ、Ｂ、Ｃ）がＸの
-            # 対象になるべきなので、ここでは処理せず後段の列挙ヒューリスティックに
-            # 任せる（objがそれ自体「列挙項目」であるかどうかで判定する）。
-            if cand is not None and not _is_list_item_component(doc, cand):
-                if cand["text"] != head_component["text"]:
-                    acl_owner = head_component
-                    acl_target = cand
-
-        if acl_owner is not None:
-            owner = acl_owner
-            targets = [acl_target]
-        elif subj_token is not None:
+        if subj_token is not None:
             owner = (
                 find_component_by_token(components, subj_token.i)
                 or find_referenced_component(components, subj_token)
@@ -2382,35 +1854,8 @@ def extract_has_relations(doc, components):
                 if t is not None:
                     targets.append(t)
         elif len(early_list_targets) >= 2 and (head_component is not None or root_component is not None):
-            # head_component（動詞の係り先）がGiNZAの長文誤解析で
-            # 見当違いの場所（例：後続の別の節）を指してしまっている
-            # ことがあるため、その場合はテキスト上の直前の「Ｘは、」を
-            # 優先的に所有者として使う。ただし、head_componentが
-            # そもそも見つからず（＝「こと」等でroot_componentに
-            # フォールバックする場合）は、topicの方が誤検出のリスクが
-            # 高いため使わない。
-            if head_component is not None:
-                nearby_topic = _find_nearest_topic_before_text(doc, components, verb)
-                if nearby_topic is not None:
-                    owner = nearby_topic
-                elif (
-                    root_component is not None
-                    and len({c["text"] for c in early_list_targets}) < len(early_list_targets)
-                ):
-                    # 「〜する工程と、〜する工程と、…を備え」のように、
-                    # 列挙項目が同じ語（「工程」等）の繰り返しになっている
-                    # 場合、それは方法クレーム特有の並列列挙であり、
-                    # 所有者は請求項全体のタイトル（root_component）である
-                    # 可能性が高い。head_componentが列挙とは無関係な語を
-                    # 誤って指してしまっていることがあるため、
-                    # この場合はroot_componentを優先する。
-                    owner = root_component
-                else:
-                    owner = head_component
-            else:
-                owner = root_component
+            owner = head_component if head_component is not None else root_component
             targets = [c for c in early_list_targets if c["text"] != owner["text"]]
-            enum_target_keys.update((c["start"], c["end"]) for c in targets)
         elif _find_nearest_topic_before_text(doc, components, verb) is not None:
             # 明示的なnsubjが見つからなくても、テキスト上に「Ｘは、」という
             # 主題が近くにあれば、そちらを所有者として優先する
@@ -2422,7 +1867,6 @@ def extract_has_relations(doc, components):
                 if c["end"] < verb.i and _is_list_item_component(doc, c) and c["text"] != owner["text"]
             ]
             targets = list_targets
-            enum_target_keys.update((c["start"], c["end"]) for c in targets)
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2439,11 +1883,8 @@ def extract_has_relations(doc, components):
             # 目的語だけの場合）は、動詞自身の目的語（obj）だけを使う
             # （以前は「それより前の構成要素を全部」という広すぎる
             #  フォールバックになっており、無関係な語まで拾っていた）。
-            scope_start = _enumeration_scope_start(doc, components, owner)
-            scoped_list_targets = [c for c in all_list_targets if c["start"] > scope_start]
-            if scoped_list_targets:
-                targets = scoped_list_targets
-                enum_target_keys.update((c["start"], c["end"]) for c in targets)
+            if all_list_targets:
+                targets = all_list_targets
             else:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2457,12 +1898,7 @@ def extract_has_relations(doc, components):
                 # 並列列挙のパターンに対応する（「…ことを特徴とする」のように
                 # 係り先が「こと」等でhead_componentが見つからない場合に
                 # 特によく起きる）。
-                scope_start = _enumeration_scope_start(doc, components, owner)
-                targets = [
-                    c for c in all_list_targets
-                    if c["text"] != owner["text"] and c["start"] > scope_start
-                ]
-                enum_target_keys.update((c["start"], c["end"]) for c in targets)
+                targets = [c for c in all_list_targets if c["text"] != owner["text"]]
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
@@ -2482,7 +1918,6 @@ def extract_has_relations(doc, components):
                 "relation": "有する",
                 "target": target["text"],
                 "type": "has",
-                "from_enumeration": (target["start"], target["end"]) in enum_target_keys,
             })
 
     unique = []
@@ -2552,7 +1987,6 @@ def _simplify_hierarchy(relations, doc=None, components=None):
                 "relation": "有する",
                 "target": s,
                 "type": "has",
-                "claim_number": r.get("claim_number"),
             })
             added.add(s)
         return relations + extra
@@ -2561,34 +1995,18 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     all_targets = set(r["target"] for r in relations)
     roots = [o for o in owners if o not in all_targets]
 
-    # 根の候補が「複数」または「０個」の場合に、文末の語（＝発明の名称）に
-    # 一致するものを優先する（例：「基板」と「ロードポート」の両方が候補に
-    # なってしまっても、実際の根は文末の「ロードポート」であるため）。
-    # ０個になるのは、他の関係抽出の誤りで「有する」の所有者自身が
-    # どこかのtargetにもなってしまっている場合で、まれに起こりうる。
-    claim_title = None
-    if len(roots) != 1 and doc is not None and components is not None:
+    if len(roots) > 1 and doc is not None and components is not None:
+        # 根の候補が複数ある場合、文末の語（＝発明の名称）に一致する
+        # ものを優先する（例：「基板」と「ロードポート」の両方が候補に
+        # なってしまっても、実際の根は文末の「ロードポート」であるため）。
         last_i = len(doc) - 1
         while last_i > 0 and doc[last_i].pos_ == "PUNCT":
             last_i -= 1
         claim_title = find_component_by_token(components, last_i)
-
-    if len(roots) > 1:
         if claim_title is not None and claim_title["text"] in roots:
             roots = [claim_title["text"]]
-        else:
-            # setの反復順（ハッシュ値に依存し実行のたびに変わりうる）に
-            # 頼ると、同じ入力でも実行ごとに異なる根が選ばれてしまうため、
-            # 文字列として決定的な順序（sorted）にする。
-            roots = sorted(roots)
-    elif not roots:
-        if claim_title is not None and claim_title["text"] in owners:
-            roots = [claim_title["text"]]
-        elif owners:
-            # 同上の理由で、setの反復順ではなくsorted順で決定的に選ぶ。
-            roots = [sorted(owners)[0]]
 
-    root = roots[0] if roots else sorted(owners)[0]
+    root = roots[0] if roots else next(iter(owners))
 
     incoming = {}
     for r in relations:
@@ -2601,15 +2019,6 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     to_remove = []
     for r in has_edges:
         if r["source"] != root:
-            continue
-        if r.get("from_enumeration"):
-            # 根が「Ａと、Ｂと、Ｃと、…を備える」のように明示的に列挙した
-            # 構成要素は、請求項本文で最も明確に述べられている関係なので、
-            # 他の節でたまたま「含む」等の語で触れられているというだけの
-            # 理由で消してはいけない（例：「…を備え」で全体の部品として
-            # 列挙されているのに、別の文で「Ａ、Ｂを含む被封止部材」のように
-            # 副次的に言及されているせいで、備える側の関係が消えてしまう
-            # 問題への対応）。
             continue
         n = r["target"]
         more_specific = [
@@ -2625,39 +2034,10 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     simplified = [r for r in relations if r not in to_remove]
 
     # ② 位置関係・直接関係の起点になっているのに、誰からも指されていない
-    #    ノードは、根の直接の子として補って繋ぐ。
-    #    ただし「Ｘに設けられる（設置される）Ｙ」のような、ジェプソン形式の
-    #    前提装置（Ｘ）は、根の部品ではなく外側の文脈にすぎないので、
-    #    「設け」系の関係の中でしか登場しない語は補完の対象外にする。
+    #    ノードは、根の直接の子として補って繋ぐ
     incoming2 = {}
     for r in simplified:
         incoming2.setdefault(r["target"], []).append(r)
-
-    outgoing = {}
-    for r in simplified:
-        outgoing.setdefault(r["source"], []).append(r)
-
-    # 「Ｘの一部」のように、ある構成要素Ｘの一部分を表す名前は、Ｘ自体が
-    # 既に根や他の関係と繋がっている（＝孤立していない）なら、この時点では
-    # まだ Ｘ→の→Ｘの一部 という関係が無くても、後段の
-    # `_add_genitive_provenance_relations` で必ず繋がる。そのため、
-    # ここで「誰からも指されていない孤立ノード」と誤判定して
-    # 根から直接「有する」を張ってしまう（＝Ｘの一部があたかも根の
-    # 直接の構成要素であるかのような、二重・不正確な関係になる）のを防ぐ。
-    known_nodes = set()
-    for r in simplified:
-        known_nodes.add(r["source"])
-        known_nodes.add(r["target"])
-
-    def _has_connected_genitive_owner(node_text):
-        idx = node_text.find("の")
-        while idx != -1:
-            owner_candidate = node_text[:idx]
-            if owner_candidate and owner_candidate != node_text and owner_candidate in known_nodes:
-                if owner_candidate == root or owner_candidate in incoming2:
-                    return True
-            idx = node_text.find("の", idx + 1)
-        return False
 
     extra = []
     added = set()
@@ -2667,15 +2047,9 @@ def _simplify_hierarchy(relations, doc=None, components=None):
         s = r["source"]
         if s == root or s in added:
             continue
-        if s in incoming2:
-            continue
-        own_relations = outgoing.get(s, [])
-        if own_relations and all("設け" in x["relation"] for x in own_relations):
-            continue
-        if _has_connected_genitive_owner(s):
-            continue
-        extra.append({"source": root, "relation": "有する", "target": s, "type": "has", "claim_number": r.get("claim_number")})
-        added.add(s)
+        if s not in incoming2:
+            extra.append({"source": root, "relation": "有する", "target": s, "type": "has"})
+            added.add(s)
 
     return simplified + extra
 
@@ -2686,7 +2060,11 @@ def _simplify_hierarchy(relations, doc=None, components=None):
 
 def _clean_claim_text(text):
     """
-    請求項テキストの前処理。前後の余分な空白だけを取り除く。
+    請求項テキストの前処理。
+    ① 前後の余分な空白を取り除く
+    ② 【化１】【数１】等の化学式・数式プレースホルダーを除去する
+    ③ 「（Ａ１１０）」等の図面参照符号を除去する
+    ④ SudachiPyで英数字・記号の表記ゆれを正規化する（sudachi_preprocess）
 
     以前は改行・空白を全部取り除いていたが、改行そのものが
     GiNZAにとって長い請求項を正しく区切って解析するための
@@ -2695,91 +2073,12 @@ def _clean_claim_text(text):
     同じ1つのトークンにくっついてしまう問題は、
     extract_patent_components_general 側で「前記」「該」「うち」を
     途中に出てきても区切るようにして対応済み。
-
-    「乃至」（〜から〜まで、と同じ意味）は、GiNZAの辞書には
-    あまり登録されていないらしく、名詞や動詞に誤ってタグ付け
-    されてしまうことがある（文全体の構造解析が丸ごと崩れる
-    原因になる）。意味が同じで、GiNZAが安定して解析できる
-    「から」に置き換えることで回避する。
     """
     text = text.strip()
-    text = text.replace("乃至", "から")
+    text = _strip_formula_placeholders(text)
+    text = _strip_patent_reference_signs(text)
+    text = sudachi_preprocess(text)
     return text
-
-
-_NUMERIC_THRESHOLD_WORDS = {"以上", "以下", "未満", "超", "以内", "程度"}
-
-
-def extract_numeric_threshold_relations(doc, components):
-    """
-    「銅板の硬度が４５Ｈｖ以上であり」「反り量が２μｍ／ｍｍ以下である」の
-    ように、名詞化された比較語（以上/以下/未満/超/以内/程度）がnsubjで
-    属性名（硬度、反り量等）を取り、その直接の子として数値・単位を
-    持つ構文を扱う。
-
-    正解データでは、この種の文を
-        (「所有者の属性名」, "以上である"/"以下である"等, 数値＋単位)
-    という形（属性名の複合語自体を1つのsourceにし、比較語をrelationに、
-    数値だけをtargetにする）で表現していることが多い。
-    extract_attribute_relations は同じ構文から別の分解
-    （所有者だけをsourceにし、属性名をrelationに、数値＋比較語をまとめて
-    targetにする）で関係を作るため、そちらを変更せず、正解データの
-    慣習に合わせた形を新たに追加する（既存の抽出結果への影響を避ける）。
-    """
-    relations = []
-    for token in doc:
-        if token.text not in _NUMERIC_THRESHOLD_WORDS or token.pos_ != "NOUN":
-            continue
-
-        nsubj_token = None
-        for child in token.children:
-            if child.dep_ == "nsubj":
-                nsubj_token = child
-                break
-        if nsubj_token is None:
-            continue
-
-        # 数値＋単位（「４５Ｈｖ」「２μｍ／ｍｍ」等）は、GiNZAの解析上
-        # nsubj（属性名）と比較語（以上/以下等）の間に、compound一段だけ
-        # とは限らない構造（nummod→nmodの入れ子等）で挟まっていることが
-        # あるため、依存木を辿るのではなく、「が/は」の直後から比較語の
-        # 直前までのテキスト範囲をそのまま数値として扱う（位置ベース）。
-        case_child = None
-        for c in nsubj_token.children:
-            if c.dep_ == "case":
-                case_child = c
-        if case_child is None:
-            continue
-        value_start = case_child.i + 1
-        value_end = token.i
-        if value_start >= value_end:
-            continue
-        value_text = "".join(doc[i].text for i in range(value_start, value_end))
-        if not value_text or not (
-            value_text[0].isdigit() or value_text[0] in "．.０１２３４５６７８９"
-        ):
-            continue
-
-        attr_words = [
-            c.text for c in sorted(nsubj_token.children, key=lambda c: c.i)
-            if c.dep_ in ("compound", "amod")
-        ]
-        attr_words.append(nsubj_token.text)
-        attribute_name = "".join(attr_words)
-
-        owner = _genitive_owner_candidate(doc, nsubj_token, components)
-        if owner is None:
-            continue
-
-        full_name = _normalize_component_text(owner["text"] + "の" + attribute_name)
-
-        relations.append({
-            "source": full_name,
-            "relation": token.text + "である",
-            "target": value_text,
-            "type": "attribute",
-        })
-    return relations
 
 
 def _extract_raw_relations(text):
@@ -2802,7 +2101,6 @@ def _extract_raw_relations(text):
     capability = extract_capability_relations(doc, components)
     composition = extract_composition_relations(doc, components)
     attribute = extract_attribute_relations(doc, components)
-    numeric_threshold = extract_numeric_threshold_relations(doc, components)
     copula = extract_copula_relations(doc, components)
     comparison = extract_comparison_relations(doc, components)
     direct = extract_direct_relations(doc, components)
@@ -2810,72 +2108,16 @@ def _extract_raw_relations(text):
 
     final_relations = combine_all_relations(
         positional + location + installation + boundary,
-        direct + contact + capability + composition + attribute + numeric_threshold + copula + comparison,
+        direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
     return components, final_relations, doc
-
-
-_GENITIVE_LINK_EXCLUDE_HEADS = (
-    "一方", "他方", "双方", "反対側", "反対面", "反対", "両側", "一端", "他端",
-    "一部", "各々", "それぞれ", "夫々", "全て", "全部", "一つ", "1つ", "１つ",
-)
-
-
-def _add_genitive_provenance_relations(relations):
-    """
-    「Ｘの深さ」「Ｘの側面」「Ｘのゲート」のように、構成要素名Ｘに「の」を
-    介して付いた複合語（＝Ｘの属性・部位・値を表す名詞句）が、他の関係の
-    source/targetとして単独のエンティティのように使われている場合、
-    正解データでは、その複合語自体に加えて「Ｘは、（複合語）を持つ」という
-    出自を示す (Ｘ, "の", Ｘの◯◯) という関係が別途、明示的に付与されている
-    ことが非常に多い（例：「凹部の深さ」→(凹部, の, 凹部の深さ)）。
-
-    これは特定のクレームに依存しない一般的なパターンなので、最終的な関係
-    リストに登場する全エンティティ名を走査し、「Ｘの◯◯」の形をしていて、
-    かつＸ自身も同じクレーム内で独立したエンティティとして使われている
-    場合に、この出自関係を機械的に補完する。
-
-    ただし「Ｘの一方」「Ｘの他端」のように、「の」の直後が相対的・指示的な
-    語（一方/他方/反対側など）の場合は、それ自体が独立した属性値ではなく
-    単なる位置的な言い回しであることが多く、正解データでもこの関係が
-    付与されていないことが多いため、除外する。
-    """
-    entity_texts = set()
-    for r in relations:
-        entity_texts.add(r["source"])
-        entity_texts.add(r["target"])
-
-    new_relations = []
-    seen = {(r["source"], r["relation"], r["target"]) for r in relations}
-    for e in entity_texts:
-        idx = e.find("の")
-        if idx <= 0:
-            continue
-        owner = e[:idx]
-        rest = e[idx + 1:]
-        if not rest or owner == e:
-            continue
-        if owner not in entity_texts:
-            continue
-        if rest.startswith(_GENITIVE_LINK_EXCLUDE_HEADS):
-            continue
-        if owner.endswith(("正極側", "負極側", "一方側", "他方側", "表側", "裏側")):
-            continue
-        key = (owner, "の", e)
-        if key in seen:
-            continue
-        seen.add(key)
-        new_relations.append({"source": owner, "relation": "の", "target": e, "type": "attribute"})
-
-    return relations + new_relations
 
 
 def analyze_claim(text):
     """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
     components, final_relations, doc = _extract_raw_relations(text)
     final_relations = _simplify_hierarchy(final_relations, doc, components)
-    final_relations = _add_genitive_provenance_relations(final_relations)
     return components, final_relations
 
 
@@ -3130,41 +2372,10 @@ _DEEPSEA_PALETTE = [
 _DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
 
 
-def _assign_claim_colors(final_relations):
-    """
-    analyze_dependent_claim() が付与した claim_number を使って、
-    どのノードがどの請求項に由来するかを求め、請求項番号ごとに
-    違う色を割り当てる（同じ請求項の追加分は同じ色になる）。
-
-    ノードが複数の関係に登場する場合、一番小さい請求項番号
-    （＝一番早く登場した請求項）を採用する。
-    """
-    node_claim = {}
-    for r in final_relations:
-        num = r.get("claim_number")
-        if num is None:
-            continue
-        for n in (r["source"], r["target"]):
-            if n not in node_claim or num < node_claim[n]:
-                node_claim[n] = num
-
-    claim_numbers = sorted(set(node_claim.values()))
-    color_of_claim = {num: i % len(_BRANCH_PALETTE) for i, num in enumerate(claim_numbers)}
-
-    styles = {}
-    for n, num in node_claim.items():
-        styles[n] = _BRANCH_PALETTE[color_of_claim[num]]
-    return styles, node_claim
-
-
-def build_graphviz(final_relations, title=None, theme="deepsea", color_by="branch"):
+def build_graphviz(final_relations, title=None, theme="deepsea"):
     """
     analyze_claim()等が返した関係リストを、Graphvizのdotエンジンで
     階層型に自動レイアウトしたグラフとして組み立てる。
-
-    color_by: "branch"（既定。根から見た大枝ごとに色分け）、
-              "claim"（analyze_dependent_claim()の結果専用。
-              どの請求項番号に由来するノードかで色分けする）
 
     戻り値は graphviz.Digraph オブジェクト。
     Jupyter/Colabではそのまま表示でき、Streamlitでは
@@ -3191,17 +2402,7 @@ def build_graphviz(final_relations, title=None, theme="deepsea", color_by="branc
     if len(G.nodes()) == 0:
         return g
 
-    node_claim = {}
-    if color_by == "claim":
-        node_styles, node_claim = _assign_claim_colors(final_relations)
-        # claim_numberが分からないノード（孤立ノード補完の前に消えた等）は
-        # 通常の大枝ベースの色分けで補う
-        branch_styles, _root = _assign_branch_colors(G)
-        for n in G.nodes():
-            if n not in node_styles:
-                node_styles[n] = branch_styles.get(n, _BRANCH_PALETTE[0])
-    else:
-        node_styles, _root = _assign_branch_colors(G)
+    node_styles, _root = _assign_branch_colors(G)
 
     palette = _DEEPSEA_PALETTE if theme == "deepsea" else _BRANCH_PALETTE
     root_style = _DEEPSEA_ROOT if theme == "deepsea" else _ROOT_STYLE
@@ -3221,12 +2422,8 @@ def build_graphviz(final_relations, title=None, theme="deepsea", color_by="branc
     added = set()
     for n in G.nodes():
         style = _style_for(n)
-        label = n
-        if color_by == "claim" and n in node_claim:
-            label = f"【請求項{node_claim[n]}】\n{n}"
         g.node(
             n,
-            label=label,
             fillcolor=style["fill"],
             color=style["border"],
             fontcolor=style["font"],
@@ -4294,17 +3491,14 @@ def _split_claim_title(text):
 
 
 _CLAIM_REF_PATTERN = _re_dep.compile(
-    r"請求項(?P<nums>(?:請求項|[0-9０-９]+|[、,及びおよび又はまたはからー～\-乃至])+)"
-    r"(?:のいずれか)?(?:[0-9０-９一二三四五六七八九十]+項?)?"
-    r"(?:に)?(?:記載の|おいて)"
+    r"請求項(?P<nums>[0-9０-９、,及びおよび又はまたはからー～\-]+)(?:のいずれか)?(?:一項)?に記載の"
 )
 
 
 def _parse_claim_ref(text):
     """
-    「請求項１に記載の」「請求項１又は２に記載の」「請求項１記載の」
-    「請求項１から３のいずれか一項に記載の」
-    「請求項１乃至請求項４のいずれか一において」等から、
+    「請求項１に記載の」「請求項１又は２に記載の」
+    「請求項１から３のいずれか一項に記載の」等から、
     参照している請求項番号と、その表現の位置を取り出す。
     参照が見つからなければ None を返す（＝独立請求項）。
     """
@@ -4316,27 +3510,9 @@ def _parse_claim_ref(text):
     nums = [int(n) for n in _re_dep.findall(r"\d+", span_half)]
     if not nums:
         return None
-    if any(c in span for c in ("から", "-", "ー", "～", "乃至")) and len(nums) >= 2:
+    if any(c in span for c in ("から", "-", "ー", "～")) and len(nums) >= 2:
         nums = list(range(nums[0], nums[-1] + 1))
-    is_preamble_style = m.group(0).endswith("おいて")
-    match_end = m.end()
-    if not is_preamble_style:
-        # 「請求項１に記載の◯◯であって、〜」のように、参照表現の直後に
-        # 発明の名称を挟んでから「であって」「において」が続く場合も、
-        # 新しい限定文言がその後ろに続く「前置き型」とみなす
-        # （「において」が参照表現に直接くっついていない、この変則パターン）。
-        next_period = text.find("。", match_end)
-        search_end = next_period if next_period != -1 else len(text)
-        connector_m = _re_dep.search(r"(?:であって|において)", text[match_end:search_end])
-        if connector_m is not None:
-            is_preamble_style = True
-            match_end = match_end + connector_m.end()
-    return {
-        "numbers": sorted(set(nums)),
-        "match_start": m.start(),
-        "match_end": match_end,
-        "is_preamble_style": is_preamble_style,
-    }
+    return {"numbers": sorted(set(nums)), "match_start": m.start(), "match_end": m.end()}
 
 
 def _build_claim_chain(claim_number, claim_texts, prefer_parent=None, _seen=None):
@@ -4364,20 +3540,10 @@ def _build_claim_chain(claim_number, claim_texts, prefer_parent=None, _seen=None
     parent_num = prefer_parent if prefer_parent in ref["numbers"] else ref["numbers"][0]
     chain = _build_claim_chain(parent_num, claim_texts, _seen=_seen)
 
-    # 「請求項◯に記載の」のように参照が末尾寄りにある場合は、それより
-    # 前の部分が追加の限定文言。「請求項◯において、」のように参照が
-    # 冒頭にある場合は、それより後ろの部分（発明の名称を除く）が
-    # 追加の限定文言になる。
-    if ref["is_preamble_style"]:
-        after = text[ref["match_end"]:].strip().lstrip("、，,")
-        additional, _title = _split_claim_title(after) if after else ("", "")
-        additional = additional.strip()
-        if additional.endswith(("、", "，")):
-            additional = additional[:-1]
-    else:
-        additional = text[:ref["match_start"]].strip()
-        if additional.endswith(("、", "，")):
-            additional = additional[:-1]
+    # 「請求項◯に記載の」より前の部分が、この請求項固有の追加限定文言
+    additional = text[:ref["match_start"]].strip()
+    if additional.endswith(("、", "，")):
+        additional = additional[:-1]
     if additional and not additional.endswith("。"):
         additional += "。"
 
@@ -4428,19 +3594,13 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
             # 孤立ノードを無理に根へ繋げる処理はまだかけない
             # （全部合体させたあとで、最後に1回だけ行う）
             _, relations, _ = _extract_raw_relations(fragment_text)
-        for r in relations:
-            r = dict(r)
-            r["claim_number"] = num
-            all_relations.append(r)
+        all_relations.extend(relations)
 
     seen_keys = set()
     unique_relations = []
     for r in all_relations:
         key = (r["source"], r["relation"], r["target"], r["type"])
         if key in seen_keys:
-            # 同じ関係が複数の請求項で繰り返し登場する場合、
-            # 一番最初（＝一番根本の請求項）に登場した方の
-            # claim_numberを採用する
             continue
         seen_keys.add(key)
         unique_relations.append(r)
@@ -4452,61 +3612,6 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
 
     full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
     return (None, final_relations), full_text
-
-
-def analyze_dependent_claim_with_components(claim_number, claim_texts, prefer_parent=None):
-    """
-    analyze_dependent_claim()と同じ要領で従属請求項を親請求項の内容も
-    含めて解析するが、記載チェック（構成要素の未接続・表記ゆれ・用語の
-    不一致チェック）で使うために、各請求項の追加限定文から抽出した生の
-    構成要素リストも合わせて返す。
-
-    「請求項１に記載の」等の引用表現そのものは _build_claim_chain() の
-    段階で本文から取り除かれているため、この構成要素リストに
-    「請求項」「記載」等の語が紛れ込むことはない
-    （単に全文をanalyze_claim()に丸ごと渡した場合と違う点）。
-
-    戻り値: (components, final_relations, full_text)
-    """
-    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
-
-    all_components = []
-    all_relations = []
-    seen_component_texts = set()
-    for i, (num, fragment_text) in enumerate(chain):
-        if not fragment_text:
-            continue
-        if i == 0:
-            # 一番根本の独立請求項は、通常通りフルに解析する
-            fragment_components, raw_relations, doc = _extract_raw_relations(fragment_text)
-            relations = _simplify_hierarchy(raw_relations, doc, fragment_components)
-        else:
-            # 追加の限定文はそれ単体では不完全な断片なので、
-            # 孤立ノードを無理に根へ繋げる処理はまだかけない
-            fragment_components, relations, _ = _extract_raw_relations(fragment_text)
-
-        for c in fragment_components:
-            term = _normalize_component_text(c["text"])
-            if term and term not in seen_component_texts:
-                seen_component_texts.add(term)
-                all_components.append(c)
-        for r in relations:
-            r = dict(r)
-            r["claim_number"] = num
-            all_relations.append(r)
-
-    seen_keys = set()
-    unique_relations = []
-    for r in all_relations:
-        key = (r["source"], r["relation"], r["target"], r["type"])
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_relations.append(r)
-
-    final_relations = _simplify_hierarchy(unique_relations)
-    full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
-    return all_components, final_relations, full_text
 
 
 def parse_claims_block(text):
@@ -4541,2965 +3646,31 @@ def parse_claims_block(text):
 
 
 # ============================================================
-# ㉑ Explorer：SAOキーワード探査（自社 vs 競合の比較）
+# 解析エントリポイント（LLM不使用：GiNZA + SudachiPy前処理のみ）
 # ============================================================
-# 単なる単語頻度ではなく、SAO解析で抽出した「構成要素」「動詞」を
-# キーワードとして使うことで、技術文書としての意味のある比較を行う。
-
-# 「有する」「含む」「である」等は、ほぼ全ての請求項に出てくる
-# 構造的な言い回しであり、技術内容とは無関係なので、キーワードとしては
-# 拾わない（自社・競合比較で「共通語」に紛れ込んでも意味がないため）。
-GENERIC_KEYWORD_VERBS = {
-    "有する", "備える", "具備する", "含む", "含み", "である",
-    "有し", "備え", "含める", "含める", "とは異なる",
-}
-
-
-def extract_keywords_from_relations(relations, kind="both"):
-    """
-    1件の請求項の関係リストから、キーワードの集合を取り出す。
-    kind: "component"（構成要素のみ）, "verb"（動詞のみ）, "both"（両方）
-
-    「有する」「備える」のような構造的な動詞（技術内容と無関係で、
-    ほぼ全ての請求項に出てくる語）は、動詞キーワードから除外する。
-    """
-    keywords = set()
-    for r in relations:
-        if kind in ("component", "both"):
-            keywords.add(r["source"])
-            keywords.add(r["target"])
-        if kind in ("verb", "both"):
-            if r["relation"] not in GENERIC_KEYWORD_VERBS and r["type"] != "has":
-                keywords.add(r["relation"])
-    return keywords
-
-
-def build_keyword_frequency(database, ids=None, kind="both", source="自動", exclude=None):
-    """
-    database（build_patent_database() 等の戻り値）から、指定したid群
-    （省略時は全件）のキーワード出現頻度を集計する。
-    「出現した件数」で数える（1件の中で同じ語が何度出ても1件とする）。
-
-    source: "自動"（各エントリの持っている情報に応じて自動判定。
-            従来の挙動）、"請求項"（請求項をSAO解析した構成要素を
-            強制的に使う。"relations"を持たないエントリは無視される）、
-            "発明の名称"（発明の名称から抽出したキーワードを強制的に
-            使う。kind="verb"の場合は動詞を取れないため空になる）
-    exclude: 除外したいキーワードのリスト（集計結果から取り除く）
-    """
-    from collections import Counter
-
-    counter = Counter()
-    target_ids = set(ids) if ids is not None else None
-    exclude_set = set(exclude) if exclude else set()
-    for entry in database:
-        if target_ids is not None and entry["id"] not in target_ids:
-            continue
-        if source == "請求項":
-            keywords = (
-                extract_keywords_from_relations(entry["relations"], kind=kind)
-                if "relations" in entry else set()
-            )
-        elif source == "発明の名称":
-            if kind == "verb":
-                keywords = set()
-            else:
-                title = entry.get("発明の名称", "") or ""
-                keywords = extract_abstract_keywords(title) if title else set()
-        else:
-            keywords = _entry_keywords(entry, kind=kind)
-        if exclude_set:
-            keywords = keywords - exclude_set
-        counter.update(keywords)
-    return counter
-
-
-def compare_keyword_groups(database, group_a_ids, group_b_ids, kind="both", top_n=30):
-    """
-    2つのグループ（例：自社群 vs 競合群）のキーワード頻度を比較する。
-
-    戻り値: {
-        "common": [(語, A頻度, B頻度), ...]（両方に出てくる語、頻度の合計順）,
-        "only_a": [(語, 頻度), ...]（Aだけに出てくる語）,
-        "only_b": [(語, 頻度), ...]（Bだけに出てくる語）,
-        "freq_a": Counter, "freq_b": Counter,
-    }
-    """
-    freq_a = build_keyword_frequency(database, group_a_ids, kind=kind)
-    freq_b = build_keyword_frequency(database, group_b_ids, kind=kind)
-
-    words_a = set(freq_a.keys())
-    words_b = set(freq_b.keys())
-
-    common = sorted(
-        ((w, freq_a[w], freq_b[w]) for w in (words_a & words_b)),
-        key=lambda x: -(x[1] + x[2])
-    )[:top_n]
-    only_a = sorted(((w, freq_a[w]) for w in (words_a - words_b)), key=lambda x: -x[1])[:top_n]
-    only_b = sorted(((w, freq_b[w]) for w in (words_b - words_a)), key=lambda x: -x[1])[:top_n]
-
-    return {"common": common, "only_a": only_a, "only_b": only_b, "freq_a": freq_a, "freq_b": freq_b}
-
-
-def print_keyword_comparison(result, name_a="自社", name_b="競合"):
-    """compare_keyword_groups() の結果を、人が読みやすい形で表示する"""
-    print(f"=== 共通する語（上位{len(result['common'])}件） ===")
-    for w, fa, fb in result["common"]:
-        print(f"  {w:15s} {name_a}:{fa:3d}件 / {name_b}:{fb:3d}件")
-    print()
-    print(f"=== {name_a}だけに出てくる語（上位{len(result['only_a'])}件） ===")
-    for w, f in result["only_a"]:
-        print(f"  {w:15s} {f:3d}件")
-    print()
-    print(f"=== {name_b}だけに出てくる語（上位{len(result['only_b'])}件） ===")
-    for w, f in result["only_b"]:
-        print(f"  {w:15s} {f:3d}件")
-
-
-def plot_wordcloud(freq_counter, title="キーワード頻度", font_path=None):
-    """
-    build_keyword_frequency() 等で作った頻度カウンタから、
-    ワードクラウドの画像（matplotlib Figure）を作る。
-    """
-    from wordcloud import WordCloud
-
-    if font_path is None:
-        font_candidates = glob.glob("/tmp/NotoSansJP-Regular.ttf") + glob.glob(
-            "/usr/share/fonts/**/NotoSansCJK*.ttc", recursive=True
-        )
-        font_path = font_candidates[0] if font_candidates else None
-
-    wc = WordCloud(
-        font_path=font_path,
-        width=900, height=500,
-        background_color="white",
-        colormap="viridis",
-    ).generate_from_frequencies(dict(freq_counter))
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.imshow(wc, interpolation="bilinear")
-    ax.axis("off")
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㉒ Saturn V：意味的俯瞰マップ
-# ============================================================
-# build_patent_database() で計算済みの埋め込みベクトル（doc_embedding）を
-# PCAで2次元に落とし込み、意味的に近い特許同士が近くに配置される
-# 「地図」を作る。
-
-def build_semantic_map(database, n_components=2, method="pca",
-                        n_neighbors=15, min_dist=0.1, random_state=42):
-    """
-    database（build_patent_database()の戻り値、doc_embeddingを含む）から、
-    2次元（または指定した次元数）の座標を計算する。
-
-    method: "pca"（主成分分析。計算が速く、軸に「寄与率」という意味を
-                    持たせられる。ただし複雑なクラスタ構造は潰れて見えがち）
-            "umap"（UMAP。似た特許同士の近さ・クラスタ構造をより保った
-                    非線形な配置になりやすい。軸自体には「寄与率」に相当
-                    する意味はない）
-    n_neighbors, min_dist: method="umap"のときのみ有効なパラメータ。
-            n_neighborsは近傍点の数（小さいほど局所的、大きいほど大域的な
-            構造を重視）、min_distは点同士に許容する最小距離（小さいほど
-            密集したクラスタになる）。
-
-    戻り値: (points, explained_variance)
-        points: [{"id":.., "text":.., "x":.., "y":..}, ...]
-        explained_variance: PCAの場合は寄与率の配列。UMAPの場合は
-                             軸に寄与率の意味がないためNone。
-    """
-    import numpy as np
-
-    if len(database) < 2:
-        raise ValueError("2件以上のデータが必要です")
-
-    embeddings = np.array([e["doc_embedding"] for e in database])
-
-    if method == "umap":
-        import umap
-
-        n_comp = min(n_components, len(database) - 1)
-        n_neighbors_eff = max(2, min(n_neighbors, len(database) - 1))
-        reducer = umap.UMAP(
-            n_components=n_comp,
-            n_neighbors=n_neighbors_eff,
-            min_dist=min_dist,
-            metric="cosine",
-            random_state=random_state,
-        )
-        coords = reducer.fit_transform(embeddings)
-        explained_variance = None
-    else:
-        from sklearn.decomposition import PCA
-
-        n_comp = min(n_components, len(database) - 1, embeddings.shape[1])
-        pca = PCA(n_components=n_comp)
-        coords = pca.fit_transform(embeddings)
-        explained_variance = pca.explained_variance_ratio_
-
-    points = []
-    for entry, xy in zip(database, coords):
-        points.append({
-            "id": entry["id"],
-            "text": entry["text"],
-            "x": float(xy[0]),
-            "y": float(xy[1]) if n_comp > 1 else 0.0,
-        })
-    return points, explained_variance
-
-
-def plot_semantic_map(points, explained_variance=None, groups=None, title="意味的俯瞰マップ",
-                       theme="deepsea", max_labels=40, method="pca"):
-    """
-    build_semantic_map() の結果を、散布図として描画する。
-
-    groups: {id: グループ名, ...} を渡すと、グループごとに色分けする
-            （例：自社 vs 競合の比較地図にする場合）。
-    max_labels: ラベル（文献番号等）を表示する点の最大数。
-                点の数がこれを超える場合、ラベルはランダムに間引いて
-                表示する（全部表示すると重なって読めなくなるため）。
-                Noneを指定すると、件数に関わらず全部表示する。
-    """
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-
-    if groups:
-        group_names = sorted(set(groups.values()))
-        color_of = {g: palette[i % len(palette)] for i, g in enumerate(group_names)}
-        for g in group_names:
-            xs = [p["x"] for p in points if groups.get(p["id"]) == g]
-            ys = [p["y"] for p in points if groups.get(p["id"]) == g]
-            ax.scatter(xs, ys, s=90, alpha=0.85, color=color_of[g], edgecolors=fg,
-                       linewidths=0.6, label=g)
-        ax.legend(prop=FONT_PROP, facecolor=bg, labelcolor=fg, edgecolor=grid)
-    else:
-        xs = [p["x"] for p in points]
-        ys = [p["y"] for p in points]
-        ax.scatter(xs, ys, s=90, alpha=0.85, color=palette[0], edgecolors=fg, linewidths=0.6)
-
-    if max_labels is not None and len(points) > max_labels:
-        import random
-        rng = random.Random(0)
-        labeled_points = rng.sample(points, max_labels)
-    else:
-        labeled_points = points
-
-    for p in labeled_points:
-        ax.annotate(str(p["id"]), (p["x"], p["y"]), fontsize=8, fontproperties=FONT_PROP,
-                    color=fg, xytext=(4, 4), textcoords="offset points")
-
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
-    if method == "umap":
-        ax.set_xlabel("UMAP次元1", fontproperties=FONT_PROP, color=fg)
-        ax.set_ylabel("UMAP次元2", fontproperties=FONT_PROP, color=fg)
-    elif explained_variance is not None and len(explained_variance) >= 2:
-        ax.set_xlabel(f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
-        ax.set_ylabel(f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）", fontproperties=FONT_PROP, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(grid)
-    ax.grid(True, color=grid, alpha=0.3)
-    plt.tight_layout()
-    return fig
-
-
-def plot_semantic_map_interactive(points, explained_variance=None, groups=None,
-                                   title="意味的俯瞰マップ", theme="deepsea", method="pca"):
-    """
-    plot_semantic_map() のインタラクティブ版（Plotly）。
-    普段は丸だけを表示し、カーソルを合わせた点だけ文献番号（id）を
-    ツールチップで表示する。戻り値は plotly.graph_objects.Figure で、
-    Streamlitでは st.plotly_chart(戻り値) で表示できる。
-    """
-    import plotly.graph_objects as go
-
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    fig = go.Figure()
-
-    if groups:
-        group_names = sorted(set(groups.values()))
-        color_of = {g: palette[i % len(palette)] for i, g in enumerate(group_names)}
-        for g in group_names:
-            pts = [p for p in points if groups.get(p["id"]) == g]
-            fig.add_trace(go.Scatter(
-                x=[p["x"] for p in pts], y=[p["y"] for p in pts],
-                mode="markers", name=g,
-                marker=dict(size=11, color=color_of[g], line=dict(width=1, color=fg)),
-                text=[p["id"] for p in pts],
-                hovertemplate="%{text}<extra>" + g + "</extra>",
-            ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=[p["x"] for p in points], y=[p["y"] for p in points],
-            mode="markers",
-            marker=dict(size=11, color=palette[0], line=dict(width=1, color=fg)),
-            text=[p["id"] for p in points],
-            hovertemplate="%{text}<extra></extra>",
-        ))
-
-    if method == "umap":
-        xlabel, ylabel = "UMAP次元1", "UMAP次元2"
-    else:
-        xlabel = "第1主成分"
-        ylabel = "第2主成分"
-        if explained_variance is not None and len(explained_variance) >= 2:
-            xlabel = f"第1主成分（寄与率 {explained_variance[0]*100:.1f}%）"
-            ylabel = f"第2主成分（寄与率 {explained_variance[1]*100:.1f}%）"
-
-    fig.update_layout(
-        title=title,
-        xaxis_title=xlabel, yaxis_title=ylabel,
-        plot_bgcolor=bg, paper_bgcolor=bg,
-        font=dict(color=fg),
-        xaxis=dict(gridcolor=grid, zerolinecolor=grid),
-        yaxis=dict(gridcolor=grid, zerolinecolor=grid, scaleanchor="x", scaleratio=1),
-        legend=dict(bgcolor=bg, bordercolor=grid),
-        width=700, height=700,
-    )
-    return fig
-
-
-# ============================================================
-# ㉒-2 類似度ネットワーク図（NetworkX）
-# ============================================================
-# doc_embedding同士のコサイン類似度が閾値を超えたペアをエッジで結び、
-# 特許同士の「似ている／似ていない」の関係をネットワーク図として可視化する。
-# Saturn V（PCA／UMAPマップ）が「全体としての配置・クラスタ傾向」を見るのに
-# 向いているのに対し、こちらは「どの特許とどの特許が具体的に似ているか」を
-# 直接確認するのに向いている。
-
-def build_similarity_network(database, threshold=0.75, max_neighbors=5):
-    """
-    database（doc_embeddingを含む）から、コサイン類似度に基づく
-    networkx.Graph を作る（doc_embeddingは正規化済みのため、
-    内積がそのままコサイン類似度になる）。
-
-    threshold: この類似度以上のペアだけをエッジにする
-    max_neighbors: 1ノードあたり、類似度が高い順に最大何件まで
-                   エッジを残すか（図が線だらけになるのを防ぐ）
-
-    戻り値: networkx.Graph（各エッジは weight=類似度 属性を持つ。
-             閾値を超えるペアが1件もないノードは含まれない）
-    """
-    import numpy as np
-
-    if len(database) < 2:
-        raise ValueError("2件以上のデータが必要です")
-
-    ids = [e["id"] for e in database]
-    embeddings = np.array([e["doc_embedding"] for e in database])
-    sim_matrix = embeddings @ embeddings.T
-
-    G = nx.Graph()
-    G.add_nodes_from(ids)
-
-    n = len(ids)
-    for i in range(n):
-        neighbors = [
-            (j, sim_matrix[i, j]) for j in range(n)
-            if j != i and sim_matrix[i, j] >= threshold
-        ]
-        neighbors.sort(key=lambda x: -x[1])
-        for j, sim in neighbors[:max_neighbors]:
-            if not G.has_edge(ids[i], ids[j]):
-                G.add_edge(ids[i], ids[j], weight=float(sim))
-
-    G.remove_nodes_from(list(nx.isolates(G)))
-    return G
-
-
-def plot_similarity_network_interactive(G, groups=None, title="特許類似度ネットワーク図", theme="deepsea"):
-    """
-    build_similarity_network() の結果を、Plotlyのインタラクティブな
-    ネットワーク図として描画する。ノードにカーソルを合わせると文献番号が
-    表示される。ノードの大きさは、そのノードに繋がっているエッジの数
-    （＝似ている特許の多さ）に応じて大きくなる。
-    """
-    import plotly.graph_objects as go
-
-    if G.number_of_nodes() == 0:
-        raise ValueError("エッジが1件もありません。類似度の閾値を下げてください。")
-
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    pos = nx.spring_layout(G, seed=42, weight="weight")
-
-    edge_x, edge_y = [], []
-    for u, v in G.edges():
-        x0, y0 = pos[u]
-        x1, y1 = pos[v]
-        edge_x += [x0, x1, None]
-        edge_y += [y0, y1, None]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=edge_x, y=edge_y, mode="lines",
-        line=dict(width=1, color=grid), hoverinfo="none", showlegend=False,
-    ))
-
-    node_ids = list(G.nodes())
-    degrees = dict(G.degree())
-
-    if groups:
-        group_names = sorted(set(groups.get(i, "その他") for i in node_ids))
-        color_of = {g: palette[k % len(palette)] for k, g in enumerate(group_names)}
-        for g in group_names:
-            ids_in_group = [i for i in node_ids if groups.get(i, "その他") == g]
-            if not ids_in_group:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[pos[i][0] for i in ids_in_group],
-                y=[pos[i][1] for i in ids_in_group],
-                mode="markers", name=g,
-                marker=dict(
-                    size=[10 + degrees[i] * 3 for i in ids_in_group],
-                    color=color_of[g], line=dict(width=1, color=fg),
-                ),
-                text=[i for i in ids_in_group],
-                hovertemplate="%{text}<extra>" + g + "</extra>",
-            ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=[pos[i][0] for i in node_ids],
-            y=[pos[i][1] for i in node_ids],
-            mode="markers", showlegend=False,
-            marker=dict(
-                size=[10 + degrees[i] * 3 for i in node_ids],
-                color=palette[0], line=dict(width=1, color=fg),
-            ),
-            text=[i for i in node_ids],
-            hovertemplate="%{text}<extra></extra>",
-        ))
-
-    fig.update_layout(
-        title=title,
-        showlegend=bool(groups),
-        plot_bgcolor=bg, paper_bgcolor=bg,
-        font=dict(color=fg),
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
-        legend=dict(bgcolor=bg, bordercolor=grid),
-        width=700, height=700,
-    )
-    return fig
-
-
-# ============================================================
-# ㉓ CORE：論理式分類・ヒートマップ
-# ============================================================
-# 独自の論理式（キーワードの組み合わせ）を定義して、特許群を
-# 「課題」軸と「解決手段」軸などで分類し、ヒートマップにする。
-# 値が0のマスは、まだ誰も出願していない技術の組み合わせ
-# （ホワイトスペース）の候補になる。
-
-def evaluate_formula(keywords, formula):
-    """
-    keywords: 1件の特許から抽出したキーワードの集合
-              （extract_keywords_from_relations()の戻り値）
-    formula: {"any_of": [...], "all_of": [...], "none_of": [...]}
-             のいずれかを指定した辞書（省略したキーの条件は無視する）
-             ・any_of: このうち1つでも含まれていればよい（OR）
-             ・all_of: これら全部が含まれている必要がある（AND）
-             ・none_of: これらが1つも含まれていてはいけない（NOT）
-    """
-    if "any_of" in formula and not any(k in keywords for k in formula["any_of"]):
-        return False
-    if "all_of" in formula and not all(k in keywords for k in formula["all_of"]):
-        return False
-    if "none_of" in formula and any(k in keywords for k in formula["none_of"]):
-        return False
-    return True
-
-
-def classify_patents(database, axis1_formulas, axis2_formulas, kind="both"):
-    """
-    axis1_formulas / axis2_formulas: {カテゴリ名: formula辞書, ...}
-
-    各特許のキーワード集合を、両方の軸それぞれについて、
-    マッチする全カテゴリに分類する（1件が複数のカテゴリに
-    同時に該当してもよい。例：複数の課題を同時に解決している特許）。
-    どちらの軸にもマッチするカテゴリがない場合は「(未分類)」に入れる。
-
-    戻り値: {(axis1のカテゴリ名, axis2のカテゴリ名): [id, id, ...], ...}
-    """
-    from collections import defaultdict
-
-    matrix = defaultdict(list)
-    for entry in database:
-        keywords = _entry_keywords(entry, kind=kind)
-        matched1 = [name for name, f in axis1_formulas.items() if evaluate_formula(keywords, f)]
-        matched2 = [name for name, f in axis2_formulas.items() if evaluate_formula(keywords, f)]
-        if not matched1:
-            matched1 = ["(未分類)"]
-        if not matched2:
-            matched2 = ["(未分類)"]
-        for a1 in matched1:
-            for a2 in matched2:
-                matrix[(a1, a2)].append(entry["id"])
-    return matrix
-
-
-def classify_patents_by_sections(database, axis1_formulas, axis2_formulas,
-                                  axis1_section="課題", axis2_section="解決手段"):
-    """
-    build_abstract_database() で作った、【課題】【解決手段】等の
-    セクションに分かれた要約データベース専用の分類関数。
-
-    classify_patents() は「1件の特許が持つ全キーワード」を両方の軸に
-    使うが、この関数は縦軸を「課題」セクションのキーワードだけ、
-    横軸を「解決手段」セクションのキーワードだけで判定するので、
-    より精密に「どんな課題を、どんな手段で解決しているか」の
-    マトリクスを作れる。
-
-    axis1_section / axis2_section: 各entryの"sections"辞書から
-    参照する見出し名（省略時は"課題"/"解決手段"）。
-    """
-    from collections import defaultdict
-
-    matrix = defaultdict(list)
-    for entry in database:
-        sections = entry.get("sections", {})
-        text1 = sections.get(axis1_section, "")
-        text2 = sections.get(axis2_section, "")
-        keywords1 = extract_abstract_keywords(text1) if text1 else set()
-        keywords2 = extract_abstract_keywords(text2) if text2 else set()
-
-        matched1 = [name for name, f in axis1_formulas.items() if evaluate_formula(keywords1, f)]
-        matched2 = [name for name, f in axis2_formulas.items() if evaluate_formula(keywords2, f)]
-        if not matched1:
-            matched1 = ["(未分類)"]
-        if not matched2:
-            matched2 = ["(未分類)"]
-        for a1 in matched1:
-            for a2 in matched2:
-                matrix[(a1, a2)].append(entry["id"])
-    return matrix
-
-
-def plot_classification_heatmap(matrix, axis1_names, axis2_names, title="論理式分類ヒートマップ"):
-    """
-    classify_patents() の結果をヒートマップとして描画する。
-    値が0のマス（青枠で強調）が、ホワイトスペースの候補になる。
-    """
-    import numpy as np
-
-    arr = np.zeros((len(axis1_names), len(axis2_names)), dtype=int)
-    for i, a1 in enumerate(axis1_names):
-        for j, a2 in enumerate(axis2_names):
-            arr[i, j] = len(matrix.get((a1, a2), []))
-
-    fig, ax = plt.subplots(figsize=(max(6, len(axis2_names) * 1.3), max(4, len(axis1_names) * 0.9)))
-    im = ax.imshow(arr, cmap="YlOrRd", aspect="auto", vmin=0)
-    ax.set_xticks(range(len(axis2_names)))
-    ax.set_xticklabels(axis2_names, rotation=30, ha="right", fontproperties=FONT_PROP, fontsize=10)
-    ax.set_yticks(range(len(axis1_names)))
-    ax.set_yticklabels(axis1_names, fontproperties=FONT_PROP, fontsize=10)
-
-    vmax = arr.max() if arr.max() > 0 else 1
-    for i in range(len(axis1_names)):
-        for j in range(len(axis2_names)):
-            val = int(arr[i, j])
-            ax.text(j, i, str(val), ha="center", va="center",
-                    color="black" if val < vmax / 2 else "white", fontsize=10)
-            if val == 0:
-                ax.add_patch(mpatches.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
-                                                 edgecolor="#3b7dd8", linewidth=1.8))
-
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("件数", fontproperties=FONT_PROP)
-    plt.tight_layout()
-    return fig
-
-
-def print_white_space_cells(matrix, axis1_names, axis2_names):
-    """0件のマス（ホワイトスペース候補）だけを一覧表示する"""
-    print("=== ホワイトスペース候補（0件のマス） ===")
-    for a1 in axis1_names:
-        for a2 in axis2_names:
-            if len(matrix.get((a1, a2), [])) == 0:
-                print(f"  「{a1}」×「{a2}」")
-
-
-# ============================================================
-# ㉔ 要約データの活用：J-PlatPatで一括取得できる「要約」を、
-#    ポートフォリオ分析（Explorer / Saturn V / CORE）に使えるようにする
-# ============================================================
-# 要約は請求項と違って「〜を有する」という定型構文を持たない、
-# より自然な文章であり、かつ多くの場合【課題】【解決手段】という
-# 見出しが付いている。この見出しを頼りに、そのままCORE
-# （縦軸＝課題、横軸＝解決手段）に使える形に整理する。
-
-def parse_abstract(text):
-    """
-    「【課題】〜。【解決手段】〜。」のような、要約に含まれる
-    見出しタグを頼りに、セクションごとの本文に分割する。
-
-    戻り値: {見出し名: 本文, ...}（見出しが1つも見つからなければ
-             {"全文": text} を返す）
-    """
-    pattern = _re_dep.compile(r"【([^】]+)】")
-    matches = list(pattern.finditer(text))
-    if not matches:
-        return {"全文": text.strip()}
-
-    sections = {}
-    for i, m in enumerate(matches):
-        name = m.group(1)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        if body:
-            sections[name] = body
-    return sections
-
-
-def extract_abstract_keywords(text):
-    """
-    請求項のような「を有する」構造を前提としない、一般的な日本語文
-    （要約等）から、名詞句をキーワードとして抽出する。
-    """
-    doc = nlp(_clean_claim_text(text))
-    components = extract_patent_components_general(doc)
-    return {c["text"] for c in components}
-
-
-def build_abstract_database(records, show_progress=True):
-    """
-    records: [(id, 要約テキスト), ...]
-
-    請求項用の build_patent_database() とは違い、「有する」の
-    階層構造は作らない（要約は請求項特有の構文を持たないため）。
-    代わりに、名詞句のキーワード抽出と、文章全体の埋め込み
-    ベクトル計算だけを行う。
-
-    Explorer・Saturn V・CORE は、いずれもこのデータベースを
-    build_patent_database() の代わりにそのまま使える。
-    """
-    model = _get_embed_model()
-    database = []
-    total = len(records)
-    for i, (rid, text) in enumerate(records):
-        if show_progress:
-            print(f"[{i+1}/{total}] {rid} を解析中...")
-        try:
-            sections = parse_abstract(text)
-            keywords = set()
-            for sec_text in sections.values():
-                keywords |= extract_abstract_keywords(sec_text)
-            embedding = model.encode([text], normalize_embeddings=True)[0]
-        except Exception as e:
-            if show_progress:
-                print(f"  → 解析エラー、スキップします: {e}")
-            continue
-
-        database.append({
-            "id": rid,
-            "text": text,
-            "sections": sections,
-            "keywords": keywords,
-            "doc_embedding": embedding,
-        })
-    return database
-
-
-def _entry_keywords(entry, kind="both"):
-    """
-    Explorer・COREの内部で使う共通ヘルパー。
-    build_patent_database()（請求項、relationsを持つ）と
-    build_abstract_database()（要約、keywordsを持つ）の
-    どちらの形式のデータベースが来ても、同じようにキーワード
-    集合を取り出せるようにする。
-    """
-    if "relations" in entry:
-        return extract_keywords_from_relations(entry["relations"], kind=kind)
-    return set(entry.get("keywords", set()))
-
-
-# ============================================================
-# ㉕ 構成部位ランキング・件数分布・レーダーチャート
+# このパイプラインはLLMを一切使用しない。
+#   ① SudachiPy（前処理）で英数字・記号の表記ゆれを正規化
+#   ② GiNZAで係り受け解析
+#   ③ 特許請求項向けのルールベース補正（本ファイル①〜⑦）で
+#      構成要素抽出・SAO（Subject-Action-Object）生成
+# を行い、既存アプリ（app.py）互換のエイリアスを用意する。
 # ============================================================
 
-def rank_components(database, ids=None, kind="component", top_n=20):
-    """
-    ポートフォリオ全体（またはグループ）で、よく出てくる構成要素・動詞を
-    頻度順にランキングする（「構成部位」分析に相当）。
-    """
-    freq = build_keyword_frequency(database, ids=ids, kind=kind)
-    return freq.most_common(top_n)
-
-
-def plot_component_ranking(ranking, title="構成部位ランキング", theme="deepsea"):
-    """rank_components() の結果を横棒グラフにする"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    labels = [w for w, _ in ranking][::-1]
-    values = [c for _, c in ranking][::-1]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.35)))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.barh(labels, values, color=bar)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
-    ax.set_xlabel("出現件数", fontproperties=FONT_PROP, color=fg)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-def compute_scope_distribution(database, ids=None):
-    """
-    build_patent_database()（請求項データベース、relationsを持つ）から、
-    各特許の「広さ・狭さスコア」を計算し、分布（件数分布）を作る。
-    要約データベースには使えない（請求項の構造が必要なため）。
-    """
-    target_ids = set(ids) if ids is not None else None
-    scores = []
-    for entry in database:
-        if target_ids is not None and entry["id"] not in target_ids:
-            continue
-        if "relations" not in entry:
-            continue
-        narrowness, breadth, detail = compute_claim_scope_score(entry["relations"])
-        scores.append({"id": entry["id"], "narrowness": narrowness, "breadth": breadth})
-    return scores
-
-
-def plot_scope_distribution(scores, title="クレームの広さ・狭さの分布", theme="deepsea", bins=10):
-    """compute_scope_distribution() の結果をヒストグラムにする"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    values = [s["narrowness"] for s in scores]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.hist(values, bins=bins, color=bar, edgecolor=fg, alpha=0.85)
-    ax.set_xlabel("狭さスコア（0=広い　1=狭い）", fontproperties=FONT_PROP, color=fg)
-    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=fg)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-def compute_group_profile(database, ids):
-    """
-    グループ（自社／競合等）の「特徴プロファイル」を計算する。
-    レーダーチャート用に、複数の指標を0〜1に正規化してまとめる。
-    請求項データベース（relationsを持つ）が必要。
-    """
-    scope_list = compute_scope_distribution(database, ids)
-    target_ids = set(ids)
-    entries = [e for e in database if e["id"] in target_ids and "relations" in e]
-
-    if not entries:
-        return {}
-
-    avg_narrowness = sum(s["narrowness"] for s in scope_list) / len(scope_list) if scope_list else 0.0
-    avg_components = sum(
-        len({r["source"] for r in e["relations"]} | {r["target"] for r in e["relations"]})
-        for e in entries
-    ) / len(entries)
-    avg_relations = sum(len(e["relations"]) for e in entries) / len(entries)
-    avg_attribute = sum(
-        sum(1 for r in e["relations"] if r["type"] == "attribute") for e in entries
-    ) / len(entries)
-    unique_components = len(build_keyword_frequency(database, ids, kind="component"))
-
-    return {
-        "平均の狭さスコア": avg_narrowness,
-        "平均構成要素数": avg_components,
-        "平均関係数": avg_relations,
-        "平均数値スペック数": avg_attribute,
-        "構成要素の種類数": unique_components,
-    }
-
-
-def plot_radar_chart(profiles, title="グループ特徴比較", theme="deepsea"):
-    """
-    compute_group_profile() の結果を、複数グループ分まとめて
-    レーダーチャートにする。
-    profiles: {グループ名: compute_group_profile()の戻り値, ...}
-    """
-    import numpy as np
-
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    labels = list(next(iter(profiles.values())).keys())
-    n = len(labels)
-
-    # 指標ごとに、グループ間の最大値で正規化する（0〜1にそろえる）
-    max_per_label = {l: max(p[l] for p in profiles.values()) or 1 for l in labels}
-
-    angles = [i / n * 2 * np.pi for i in range(n)]
-    angles += angles[:1]
-
-    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-
-    for i, (name, profile) in enumerate(profiles.items()):
-        values = [profile[l] / max_per_label[l] for l in labels]
-        values += values[:1]
-        color = palette[i % len(palette)]
-        ax.plot(angles, values, color=color, linewidth=2, label=name)
-        ax.fill(angles, values, color=color, alpha=0.2)
-
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=10)
-    ax.set_yticklabels([])
-    ax.spines["polar"].set_color(grid)
-    ax.grid(color=grid)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg, pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), prop=FONT_PROP, facecolor=bg, labelcolor=fg)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㉖ Mission Control：メタデータ付きCSVの読み込み
-# ============================================================
-# 文献番号・出願番号・出願日・公知日・発明の名称・出願人/権利者・FI・
-# 要約・公開番号・公告番号・登録番号・審判番号・その他・ステージ・
-# イベント詳細・文献URL、という列を持つCSVを読み込み、
-# 全モジュール（ATLAS・MEGA・Saturn V・Explorer・CORE）で
-# 共通して使える形に正規化する。
-
-PATENT_METADATA_COLUMNS = [
-    "文献番号", "出願番号", "出願日", "公知日", "発明の名称", "出願人/権利者",
-    "FI", "要約", "公開番号", "公告番号", "登録番号", "審判番号",
-    "その他", "ステージ", "イベント詳細", "文献URL",
-]
-
-
-def load_patent_metadata_csv(csv_text):
-    """
-    上記の列を持つCSVのテキストを読み込み、
-    [{"id":.., "出願日":datetime, "出願人":[...], "FI":[...], "要約":.., ...}, ...]
-    のリストにして返す（Mission Controlの役割）。
-
-    ・出願人/権利者は「／」「、」「,」等で複数人書かれていることがあるので、
-      リストに分割しておく。
-    ・FIも同様に複数書かれていることがあるので、空白や「;」等で分割する。
-    ・出願日／公知日は日付型に変換する（変換できない場合はNoneのまま）。
-    """
-    import csv
-    import io
-    from datetime import datetime
-
-    def _split_applicants(value, seps=("／", "、", ",", ";", "；")):
-        if not value:
-            return []
-        text = value
-        for s in seps[1:]:
-            text = text.replace(s, seps[0])
-        return [v.strip() for v in text.split(seps[0]) if v.strip()]
-
-    def _split_fi(value, seps=("；", ";", "、", ",")):
-        # FIコード自体に「/」（メイングループ/サブグループの区切り）が
-        # 含まれるため、出願人の分割とは違い「/」では分割しない。
-        # 「＠Ｚ」「＠Ａ」等は、FIコードの正式な一部（展開記号）であり、
-        # ノイズではないので取り除かない。
-        # 一方、「Ｈ１０Ｋ８５／６０，１５０」や「Ｂ２３Ｋ３５／３０，３１０＠Ｃ」
-        # のように、FIコードの後ろにコンマ＋「数字（＋＠記号）」だけの
-        # 「展開記号（細分）」が続くことがあり、これは新しいFIコードでは
-        # なく、直前のコードの一部である。このパターンに一致するトークンは
-        # 独立したコードとして分割せず、直前のコードに結合する。
-        if not value:
-            return []
-        text = value
-        for s in seps[1:]:
-            text = text.replace(s, seps[0])
-        raw_tokens = [v.strip() for v in text.split(seps[0]) if v.strip()]
-
-        sub_position_pattern = _re_dep.compile(r"^[0-9]+(?:[＠@][A-Za-zＡ-Ｚａ-ｚ0-9０-９]+)?$")
-        merged = []
-        for t in raw_tokens:
-            if sub_position_pattern.match(t) and merged:
-                merged[-1] = merged[-1] + "," + t
-            else:
-                merged.append(t)
-        return merged
-
-    def _parse_date(value):
-        if not value:
-            return None
-        value = value.strip().replace("/", "-").replace(".", "-")
-        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
-            try:
-                return datetime.strptime(value, fmt)
-            except ValueError:
-                continue
-        return None
-
-    reader = csv.DictReader(io.StringIO(csv_text))
-    records = []
-    for i, row in enumerate(reader):
-        rid = row.get("文献番号") or row.get("出願番号") or row.get("公開番号") or f"行{i+1}"
-        stage = row.get("ステージ", "").strip()
-        registration_no = row.get("登録番号", "").strip()
-        publication_no = row.get("公開番号", "").strip()
-        if not stage:
-            # ステージ欄が空の場合、登録番号・公開番号の有無から推測する
-            if registration_no:
-                stage = "登録"
-            elif publication_no:
-                stage = "公開"
-        records.append({
-            "id": rid,
-            "出願番号": row.get("出願番号", ""),
-            "出願日": _parse_date(row.get("出願日", "")),
-            "公知日": _parse_date(row.get("公知日", "")),
-            "発明の名称": row.get("発明の名称", ""),
-            "出願人": _split_applicants(row.get("出願人/権利者", "")),
-            "FI": _split_fi(row.get("FI", "")),
-            "要約": row.get("要約", ""),
-            "公開番号": publication_no,
-            "公告番号": row.get("公告番号", "").strip(),
-            "登録番号": registration_no,
-            "審判番号": row.get("審判番号", "").strip(),
-            "ステージ": stage,
-            "文献URL": row.get("文献URL", ""),
-        })
-    return records
-
-
-def build_full_database(metadata_records, show_progress=True):
-    """
-    load_patent_metadata_csv() の結果から、要約（あれば）と発明の名称の
-    両方からキーワードを抽出し、メタデータと1つにまとめたデータベースを
-    作る。ATLAS・MEGA・Saturn V・Explorer・COREのすべてに共通して
-    使える、一番リッチな形式。
-
-    要約が空の行でも、発明の名称からキーワード・埋め込みベクトルを
-    計算するので、キーワードが空になって後段のワードクラウド等が
-    エラーになることはない。
-    """
-    model = _get_embed_model()
-    total = len(metadata_records)
-    database = []
-    for i, r in enumerate(metadata_records):
-        if show_progress:
-            print(f"[{i+1}/{total}] {r['id']} を解析中...")
-        entry = dict(r)
-        title = (r.get("発明の名称") or "").strip()
-        abstract = (r.get("要約") or "").strip()
-        combined_text = (title + "。" + abstract) if abstract else title
-
-        try:
-            sections = parse_abstract(abstract) if abstract else {}
-            keywords = set()
-            for sec_text in sections.values():
-                keywords |= extract_abstract_keywords(sec_text)
-            if title:
-                keywords |= extract_abstract_keywords(title)
-            embed_source = combined_text or r["id"]
-            embedding = model.encode([embed_source], normalize_embeddings=True)[0]
-        except Exception as e:
-            if show_progress:
-                print(f"  → 解析エラー、スキップします: {e}")
-            keywords = set()
-            sections = {}
-            embedding = None
-
-        entry["sections"] = sections
-        entry["keywords"] = keywords
-        entry["doc_embedding"] = embedding
-        entry["text"] = combined_text
-        database.append(entry)
-    return database
-
-
-# ============================================================
-# ㉗ ATLAS：基礎特許マップ
-# ============================================================
-# 出願件数の時系列推移、出願人ランキング、FI（IPC）ランキングなど、
-# 特許分析において最も基本的な統計グラフを描画する。
-
-def _atlas_style(theme="deepsea"):
-    if theme == "deepsea":
-        return {"bg": "#04121C", "fg": "#E8FBFF", "bar": "#5FD4E0", "grid": "#1a3a4a"}
-    return {"bg": "#FFFFFF", "fg": "#233044", "bar": "#4C87C6", "grid": "#dddddd"}
-
-
-def plot_filing_trend(database, date_field="出願日", freq="Y", title="出願件数の推移", theme="deepsea"):
-    """
-    出願日（または公知日）を使って、件数の時系列推移を折れ線グラフにする。
-    freq: "Y"（年単位）または "M"（月単位）
-    """
-    from collections import Counter
-
-    counter = Counter()
-    for entry in database:
-        d = entry.get(date_field)
-        if d is None:
-            continue
-        key = d.year if freq == "Y" else (d.year, d.month)
-        counter[key] += 1
-
-    keys_sorted = sorted(counter.keys())
-    if freq == "Y":
-        labels = [str(k) for k in keys_sorted]
-    else:
-        labels = [f"{k[0]}-{k[1]:02d}" for k in keys_sorted]
-    values = [counter[k] for k in keys_sorted]
-
-    s = _atlas_style(theme)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    fig.patch.set_facecolor(s["bg"])
-    ax.set_facecolor(s["bg"])
-    ax.plot(labels, values, marker="o", color=s["bar"], linewidth=2)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
-    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=s["fg"])
-    ax.tick_params(colors=s["fg"], rotation=45)
-    for label in ax.get_xticklabels():
-        label.set_fontproperties(FONT_PROP)
-    for spine in ax.spines.values():
-        spine.set_color(s["grid"])
-    ax.grid(True, color=s["grid"], alpha=0.3)
-    plt.tight_layout()
-    return fig
-
-
-def rank_by_field(database, field="出願人", top_n=15):
-    """
-    出願人やFIのような「リストを持つフィールド」で、
-    出現件数のランキングを作る。
-    """
-    from collections import Counter
-
-    counter = Counter()
-    for entry in database:
-        values = entry.get(field) or []
-        counter.update(set(values))
-    return counter.most_common(top_n)
-
-
-def fi_to_subclass(fi_code):
-    """
-    FIコードからサブクラスを取り出す（先頭4文字。例：「H10K85/60,150」→「H10K」）。
-    """
-    return fi_code[:4]
-
-
-def fi_to_maingroup(fi_code):
-    """
-    FIコードからメイングループを取り出す。
-    先頭6文字（例：「H10K85/60,150」→「H10K85」）。
-    6文字に満たない場合は先頭5文字だけを使う。
-    """
-    if len(fi_code) >= 6:
-        return fi_code[:6]
-    return fi_code[:5]
-
-
-def rank_fi(database, level="サブクラス", top_n=15):
-    """
-    FIコードを、指定した粒度（"サブクラス"＝先頭4文字、
-    "メイングループ"＝先頭6文字（無ければ5文字）、"そのまま"＝元のコード）
-    に丸めてから集計する。粒度を粗くすることで、細分番号の違いに
-    埋もれがちな技術分野ごとの傾向が見えやすくなる。
-    """
-    from collections import Counter
-
-    if level == "サブクラス":
-        convert = fi_to_subclass
-    elif level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    counter = Counter()
-    for entry in database:
-        values = entry.get("FI") or []
-        counter.update({convert(v) for v in values})
-    return counter.most_common(top_n)
-
-
-def plot_ranking_bar(ranking, title="ランキング", xlabel="件数", theme="deepsea"):
-    """rank_by_field() の結果を横棒グラフにする"""
-    s = _atlas_style(theme)
-    labels = [w for w, _ in ranking][::-1]
-    values = [c for _, c in ranking][::-1]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
-    fig.patch.set_facecolor(s["bg"])
-    ax.set_facecolor(s["bg"])
-    ax.barh(labels, values, color=s["bar"])
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
-    ax.set_xlabel(xlabel, fontproperties=FONT_PROP, color=s["fg"])
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
-    ax.tick_params(colors=s["fg"])
-    for spine in ax.spines.values():
-        spine.set_color(s["fg"])
-    plt.tight_layout()
-    return fig
-
-
-def plot_applicant_fi_bubble(database, top_applicants=10, top_fi=10, fi_level="サブクラス",
-                              title="出願人×FI バブルチャート", theme="deepsea"):
-    """
-    出願人 × FI の組み合わせごとの件数を、対数スケールのバブルの
-    大きさで表す散布図（バブルチャート）にする。
-
-    fi_level: "サブクラス"（先頭4文字）、"メイングループ"（先頭6文字。
-              無ければ5文字）、"そのまま"（元のコード）から選ぶ。
-              細分番号まで含めた元のコードのままだと、同じ技術分野の
-              コードが細かく分散してしまい傾向が見えにくいため、
-              既定値は"サブクラス"にしている。
-    """
-    from collections import Counter
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    applicant_counter = Counter()
-    fi_counter = Counter()
-    for entry in database:
-        applicant_counter.update(set(entry.get("出願人") or []))
-        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
-
-    top_applicant_names = [a for a, _ in applicant_counter.most_common(top_applicants)]
-    top_fi_names = [f for f, _ in fi_counter.most_common(top_fi)]
-
-    pair_counter = Counter()
-    for entry in database:
-        for a in set(entry.get("出願人") or []):
-            if a not in top_applicant_names:
-                continue
-            for f in {convert(v) for v in (entry.get("FI") or [])}:
-                if f not in top_fi_names:
-                    continue
-                pair_counter[(a, f)] += 1
-
-    if not pair_counter:
-        raise ValueError("出願人・FIの組み合わせデータが見つかりません。")
-
-    import numpy as np
-
-    s = _atlas_style(theme)
-    fig, ax = plt.subplots(figsize=(max(8, len(top_fi_names) * 0.9), max(5, len(top_applicant_names) * 0.6)))
-    fig.patch.set_facecolor(s["bg"])
-    ax.set_facecolor(s["bg"])
-
-    for (a, f), count in pair_counter.items():
-        x = top_fi_names.index(f)
-        y = top_applicant_names.index(a)
-        size = 80 * np.log1p(count) ** 2 + 40
-        ax.scatter(x, y, s=size, color=s["bar"], alpha=0.7, edgecolors=s["fg"], linewidths=0.5)
-        ax.text(x, y, str(count), ha="center", va="center", fontsize=8, color=s["bg"])
-
-    ax.set_xticks(range(len(top_fi_names)))
-    ax.set_xticklabels(top_fi_names, rotation=45, ha="right", fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
-    ax.set_yticks(range(len(top_applicant_names)))
-    ax.set_yticklabels(top_applicant_names, fontproperties=FONT_PROP, color=s["fg"], fontsize=9)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=s["fg"])
-    ax.tick_params(colors=s["fg"])
-    for spine in ax.spines.values():
-        spine.set_color(s["grid"])
-    ax.grid(True, color=s["grid"], alpha=0.2)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㉘ 出願人×FI（IPCサブクラス等）のレーダーチャート
-# ============================================================
-
-def build_applicant_fi_radar_data(database, applicants=None, fi_level="サブクラス",
-                                   top_applicants=5, top_fi=6, axis_selection="複数社共通"):
-    """
-    出願人ごとに、よく使うFI（サブクラス等）の件数をまとめ、
-    plot_radar_chart() にそのまま渡せる形（{出願人名: {FI名: 件数, ...}, ...}）
-    にする。
-
-    applicants: 対象にする出願人名のリスト（省略時は出現件数が多い順に
-                top_applicants件を自動選択する）
-    fi_level: fi_to_subclass/fi_to_maingroupと同じ粒度指定
-    top_fi: レーダーの軸として使うFIの数
-    axis_selection: "複数社共通"（複数の出願人にまたがって出てくるFIを
-                    優先して軸にする。1社だけが突出したFIが軸になり、
-                    他社が軒並み0になって尖った形になるのを防ぐ）
-                    "全体件数順"（単純に全体の件数が多い順）
-    """
-    from collections import Counter
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    if applicants is None:
-        applicant_counter = Counter()
-        for entry in database:
-            applicant_counter.update(set(entry.get("出願人") or []))
-        applicants = [a for a, _ in applicant_counter.most_common(top_applicants)]
-
-    fi_counter = Counter()
-    for entry in database:
-        matched_applicants = set(entry.get("出願人") or []) & set(applicants)
-        if not matched_applicants:
-            continue
-        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
-
-    # FIごとに「何社が使っているか」を数える
-    fi_applicant_sets = {}
-    for entry in database:
-        matched_applicants = set(entry.get("出願人") or []) & set(applicants)
-        if not matched_applicants:
-            continue
-        for fi in {convert(v) for v in (entry.get("FI") or [])}:
-            fi_applicant_sets.setdefault(fi, set()).update(matched_applicants)
-
-    if axis_selection == "複数社共通":
-        # 「使っている社数」を最優先、同数なら全体件数が多い順にする
-        fi_axes = sorted(
-            fi_counter.keys(),
-            key=lambda f: (-len(fi_applicant_sets.get(f, set())), -fi_counter[f]),
-        )[:top_fi]
-    else:
-        fi_axes = [f for f, _ in fi_counter.most_common(top_fi)]
-
-    profiles = {}
-    for applicant in applicants:
-        counts = Counter()
-        for entry in database:
-            if applicant not in (entry.get("出願人") or []):
-                continue
-            counts.update({convert(v) for v in (entry.get("FI") or [])})
-        profiles[applicant] = {fi: counts.get(fi, 0) for fi in fi_axes}
-
-    return profiles
-
-
-# ============================================================
-# ㉙ キーワード地形図（等高線ヒートマップ）
-# ============================================================
-# よく出てくるキーワードを、意味の近さに基づいて地図上に配置し、
-# 頻度を「山の高さ」として等高線で表現する。密集している場所ほど
-# 赤く盛り上がった「山」になり、技術用語の集中地帯が一目で分かる。
-
-def build_keyword_landscape(database, top_n=40, kind="component"):
-    """
-    ポートフォリオ全体でよく出てくるキーワードを取り出し、
-    意味的な近さに基づいて2次元の座標を計算する。
-
-    戻り値: [{"word":.., "freq":.., "x":.., "y":..}, ...]
-    """
-    import numpy as np
-    from sklearn.decomposition import PCA
-
-    freq = build_keyword_frequency(database, kind=kind)
-    top_words = freq.most_common(top_n)
-    if not top_words:
-        return []
-
-    words = [w for w, _ in top_words]
-    freqs = [f for _, f in top_words]
-
-    model = _get_embed_model()
-    embeddings = model.encode(words, normalize_embeddings=True)
-
-    n_comp = min(2, max(len(words) - 1, 1))
-    pca = PCA(n_components=n_comp)
-    coords = pca.fit_transform(embeddings)
-    if coords.shape[1] < 2:
-        coords = np.hstack([coords, np.zeros((coords.shape[0], 1))])
-
-    points = []
-    for w, f, xy in zip(words, freqs, coords):
-        points.append({"word": w, "freq": f, "x": float(xy[0]), "y": float(xy[1])})
-    return points
-
-
-def plot_keyword_landscape(points, title="キーワード地形図", grid_size=200, bandwidth=None):
-    """
-    build_keyword_landscape() の結果を、等高線の地形図（ヒートマップ）
-    として描画する。山（赤い部分）が、意味的に近いキーワードが
-    密集している＝技術的に厚みのある領域を表す。
-    """
-    import numpy as np
-    import matplotlib.patheffects as pe
-
-    if not points:
-        raise ValueError("キーワードが見つかりませんでした")
-
-    xs = np.array([p["x"] for p in points])
-    ys = np.array([p["y"] for p in points])
-    freqs = np.array([p["freq"] for p in points], dtype=float)
-
-    x_pad = (xs.max() - xs.min()) * 0.25 + 1e-6
-    y_pad = (ys.max() - ys.min()) * 0.25 + 1e-6
-    x_lin = np.linspace(xs.min() - x_pad, xs.max() + x_pad, grid_size)
-    y_lin = np.linspace(ys.min() - y_pad, ys.max() + y_pad, grid_size)
-    X, Y = np.meshgrid(x_lin, y_lin)
-
-    if bandwidth is None:
-        span = max(xs.max() - xs.min(), ys.max() - ys.min())
-        bandwidth = span / 7 + 1e-6
-
-    Z = np.zeros_like(X)
-    for x, y, f in zip(xs, ys, freqs):
-        Z += f * np.exp(-((X - x) ** 2 + (Y - y) ** 2) / (2 * bandwidth ** 2))
-
-    fig, ax = plt.subplots(figsize=(11, 9))
-    ax.contourf(X, Y, Z, levels=30, cmap="turbo")
-    ax.contour(X, Y, Z, levels=12, colors="white", linewidths=0.3, alpha=0.35)
-
-    max_freq = freqs.max() if freqs.max() > 0 else 1
-    for p in points:
-        size = 9 + 9 * (p["freq"] / max_freq)
-        ax.text(
-            p["x"], p["y"], p["word"], fontsize=size, fontproperties=FONT_PROP,
-            ha="center", va="center", color="white",
-            path_effects=[pe.withStroke(linewidth=2.5, foreground="black")],
-            zorder=5,
-        )
-
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㉚ キーワード×FIサブクラスのホワイトスペースマップ（全自動）
-# ============================================================
-# COREとは違い、カテゴリを手入力する必要がない。発明の名称から
-# 自動でキーワードを抽出し、縦軸＝キーワード、横軸＝FIサブクラス
-# （データに含まれる全種類）の出願件数マトリクスを自動で作る。
-# 色が濃いマスほど出願が多く、白いマスがホワイトスペース候補。
-
-def build_keyword_fi_matrix(database, top_keywords=25, top_fi=25, fi_level="サブクラス",
-                             title_field="発明の名称", source="発明の名称", applicant_filter=None):
-    """
-    database: build_full_database() や build_claims_metadata_database() 等の戻り値
-
-    source: "発明の名称"（発明の名称からキーワードを抽出）、
-            "請求項"（請求項本文をSAO解析した構成要素をキーワードとして使う。
-            database の各エントリが "relations" を持っている必要がある）
-    applicant_filter: 出願人名のリストを指定すると、その出願人が
-                       関わる特許だけに絞り込んでからマトリクスを作る
-
-    戻り値: (matrix, keyword_list, fi_list)
-        matrix: {(キーワード, FI): [id, id, ...], ...}
-        keyword_list: 縦軸に使うキーワード（出現件数が多い順）
-        fi_list: 横軸に使うFI（出現件数が多い順）
-    """
-    from collections import Counter
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    if applicant_filter:
-        applicant_set = set(applicant_filter)
-        database = [e for e in database if set(e.get("出願人") or []) & applicant_set]
-
-    entry_keywords = []
-    keyword_counter = Counter()
-    fi_counter = Counter()
-    for entry in database:
-        if source == "請求項":
-            kws = _entry_keywords(entry, kind="component")
-        else:
-            title = entry.get(title_field, "") or ""
-            kws = extract_abstract_keywords(title) if title else set()
-        entry_keywords.append(kws)
-        keyword_counter.update(kws)
-        fi_counter.update({convert(v) for v in (entry.get("FI") or [])})
-
-    keyword_list = [w for w, _ in keyword_counter.most_common(top_keywords)]
-    fi_list = [f for f, _ in fi_counter.most_common(top_fi)]
-    keyword_set = set(keyword_list)
-    fi_set = set(fi_list)
-
-    matrix = {}
-    for entry, kws in zip(database, entry_keywords):
-        fis = {convert(v) for v in (entry.get("FI") or [])} & fi_set
-        for kw in kws & keyword_set:
-            for fi in fis:
-                matrix.setdefault((kw, fi), []).append(entry["id"])
-
-    return matrix, keyword_list, fi_list
-
-
-def plot_keyword_fi_heatmap(matrix, keyword_list, fi_list, title="キーワード×FI ホワイトスペースマップ"):
-    """build_keyword_fi_matrix() の結果をヒートマップにする"""
-    import numpy as np
-
-    if not keyword_list or not fi_list:
-        # 出願人フィルタ等の条件によって、キーワード・FIのどちらかが
-        # 0件になることがある。この場合 arr が空配列（size=0）になり、
-        # 後段の arr.max() が「zero-size array」のValueErrorで落ちてしまう
-        # ため、先にわかりやすいエラーメッセージで弾く。
-        raise ValueError("キーワードまたはFIが0件のため、マップを作成できません。絞り込み条件を緩めてください。")
-
-    arr = np.zeros((len(keyword_list), len(fi_list)), dtype=int)
-    for i, kw in enumerate(keyword_list):
-        for j, fi in enumerate(fi_list):
-            arr[i, j] = len(matrix.get((kw, fi), []))
-
-    fig, ax = plt.subplots(figsize=(max(8, len(fi_list) * 0.5), max(6, len(keyword_list) * 0.35)))
-    im = ax.imshow(arr, cmap="YlOrRd", aspect="auto", vmin=0)
-    ax.set_xticks(range(len(fi_list)))
-    ax.set_xticklabels(fi_list, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(keyword_list)))
-    ax.set_yticklabels(keyword_list, fontproperties=FONT_PROP, fontsize=9)
-
-    vmax = arr.max() if arr.max() > 0 else 1
-    for i in range(len(keyword_list)):
-        for j in range(len(fi_list)):
-            val = int(arr[i, j])
-            if val == 0:
-                continue
-            ax.text(j, i, str(val), ha="center", va="center",
-                    color="black" if val < vmax / 2 else "white", fontsize=7)
-
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("出願件数", fontproperties=FONT_PROP)
-    plt.tight_layout()
-    return fig
+# 明示的にGiNZAだけで解析したい場合（analyze_claim と同じ実体）。
+analyze_claim_ginza = analyze_claim
+analyze_claim_with_ginza = analyze_claim
 
+# 以前はLLMとのハイブリッド解析用の名前だったが、
+# 現在はLLMを使用しないため analyze_claim（GiNZAのみ）のエイリアスとする。
+analyze_claim_hybrid = analyze_claim
 
-# ============================================================
-# ㉛ MEGA：動態分析（活動量×勢いのフェーズ診断）
-# ============================================================
 
-def compute_activity_momentum(database, group_by="出願人", recent_years=3, compare_years=3):
+def llm_available():
     """
-    各グループ（出願人 or FI）ごとに、直近recent_years年間の
-    出願件数（活動量）と、その直前compare_years年間からのCAGR
-    （年平均成長率＝勢い）を計算する。
-
-    group_by: "出願人" または "FI"（どちらもリストを持つフィールド）
-    """
-    from collections import defaultdict
-
-    if group_by == "FI":
-        def get_groups(entry):
-            return {fi_to_subclass(v) for v in (entry.get("FI") or [])}
-    else:
-        def get_groups(entry):
-            return set(entry.get(group_by) or [])
-
-    year_counts = defaultdict(lambda: defaultdict(int))
-    for entry in database:
-        d = entry.get("出願日")
-        if d is None:
-            continue
-        for g in get_groups(entry):
-            year_counts[g][d.year] += 1
-
-    all_years = sorted({y for counts in year_counts.values() for y in counts.keys()})
-    if not all_years:
-        return {}, None, recent_years, compare_years
-
-    latest_year = all_years[-1]
-    earliest_year = all_years[0]
-    span = latest_year - earliest_year + 1
-
-    # 指定された期間（recent_years + compare_years）がデータの実際の
-    # 年範囲より広い場合、そのままでは「比較期間」に実績が存在せず、
-    # 全グループが判定不能な「新興」扱いに落ちてしまう。
-    # その場合は、実際の年範囲を半分ずつに自動で割り直す。
-    if span < recent_years + compare_years:
-        half = max(1, span // 2)
-        recent_years = half
-        compare_years = span - half if span - half > 0 else half
-
-    recent_range = range(latest_year - recent_years + 1, latest_year + 1)
-    compare_range = range(latest_year - recent_years - compare_years + 1, latest_year - recent_years + 1)
-
-    result = {}
-    for g, counts in year_counts.items():
-        recent_total = sum(counts.get(y, 0) for y in recent_range)
-        compare_total = sum(counts.get(y, 0) for y in compare_range)
-        total_all = sum(counts.values())
-        if compare_total > 0:
-            cagr = (recent_total / compare_total) ** (1.0 / recent_years) - 1
-        elif recent_total > 0:
-            cagr = 1.0  # 直前期間に実績がなく、直近だけ出願がある＝新興とみなす
-        else:
-            cagr = 0.0
-        result[g] = {
-            "活動量": recent_total,
-            "総出願件数": total_all,
-            "勢い": cagr,
-            "年別件数": dict(sorted(counts.items())),
-        }
-    return result, latest_year, recent_years, compare_years
-
-
-def classify_phase(activity, momentum, activity_threshold):
-    """活動量と勢いから、リーダー/新興/成熟/衰退の4象限に分類する"""
-    if activity >= activity_threshold:
-        return "リーダー" if momentum >= 0 else "成熟"
-    else:
-        return "新興" if momentum >= 0 else "衰退"
-
-
-def plot_mega_chart(mega_data, title="MEGA：活動量×勢い", top_n=15, theme="deepsea"):
-    """
-    compute_activity_momentum() の結果を、活動量(x)×勢い(y)の
-    散布図にする。4象限がそれぞれ「リーダー・新興・成熟・衰退」に
-    対応し、点の位置からその技術・出願人が今どのフェーズにあるかが
-    分かる。
-    """
-    import numpy as np
-
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    items = sorted(mega_data.items(), key=lambda x: -x[1]["総出願件数"])[:top_n]
-    if not items:
-        raise ValueError("データが見つかりませんでした")
-
-    activities = [v["総出願件数"] for _, v in items]
-    momentums = [v["勢い"] for _, v in items]
-    activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-
-    x_max = max(activities) * 1.3 + 1
-    y_max = max(max(momentums), 0.1) * 1.3
-    y_min = min(min(momentums), -0.1) * 1.3
-
-    # 4象限の背景色（薄く）
-    ax.axvspan(activity_threshold, x_max, 0.5, 1, color=palette[0], alpha=0.08)
-    ax.axvspan(0, activity_threshold, 0.5, 1, color=palette[1], alpha=0.08)
-    ax.axvspan(activity_threshold, x_max, 0, 0.5, color=palette[2], alpha=0.08)
-    ax.axvspan(0, activity_threshold, 0, 0.5, color=palette[3], alpha=0.08)
-
-    ax.axhline(0, color=grid, linewidth=1)
-    ax.axvline(activity_threshold, color=grid, linewidth=1, linestyle="--")
-
-    for i, (name, v) in enumerate(items):
-        color = palette[i % len(palette)]
-        ax.scatter(v["総出願件数"], v["勢い"], s=140, color=color, edgecolors=fg, linewidths=0.8, zorder=5)
-        ax.annotate(name, (v["総出願件数"], v["勢い"]), fontsize=9, fontproperties=FONT_PROP,
-                    color=fg, xytext=(6, 6), textcoords="offset points", zorder=6)
-
-    ax.set_xlim(0, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_xlabel("総出願量", fontproperties=FONT_PROP, color=fg)
-    ax.set_ylabel("勢い（年平均成長率 CAGR）", fontproperties=FONT_PROP, color=fg)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=16, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(grid)
-
-    label_style = dict(fontproperties=FONT_PROP, fontsize=11, color=fg, alpha=0.6)
-    ax.text(x_max * 0.98, y_max * 0.92, "リーダー", ha="right", **label_style)
-    ax.text(activity_threshold * 0.4, y_max * 0.92, "新興", ha="center", **label_style)
-    ax.text(x_max * 0.98, y_min * 0.92, "成熟", ha="right", **label_style)
-    ax.text(activity_threshold * 0.4, y_min * 0.92, "衰退", ha="center", **label_style)
-
-    plt.tight_layout()
-    return fig
-
-
-def plot_mega_chart_interactive(mega_data, title="MEGA：活動量×勢い", top_n=15, theme="deepsea"):
-    """
-    plot_mega_chart() のインタラクティブ版（Plotly）。
-    普段は丸だけを表示し、カーソルを合わせた点だけ出願人（またはFI）名を
-    ツールチップで表示する。戻り値は plotly.graph_objects.Figure。
-    """
-    import plotly.graph_objects as go
-
-    if theme == "deepsea":
-        bg, fg, grid = "#04121C", "#E8FBFF", "#1a3a4a"
-        palette = [s["border"] for s in _DEEPSEA_PALETTE]
-    else:
-        bg, fg, grid = "#FFFFFF", "#233044", "#dddddd"
-        palette = [s["edge"] for s in _BRANCH_PALETTE]
-
-    items = sorted(mega_data.items(), key=lambda x: -x[1]["総出願件数"])[:top_n]
-    if not items:
-        raise ValueError("データが見つかりませんでした")
-
-    names = [name for name, _ in items]
-    activities = [v["総出願件数"] for _, v in items]
-    momentums = [v["勢い"] for _, v in items]
-    activity_threshold = sorted(activities)[len(activities) // 2] if activities else 0
-
-    x_max = max(activities) * 1.3 + 1
-    y_max = max(max(momentums), 0.1) * 1.3
-    y_min = min(min(momentums), -0.1) * 1.3
-
-    fig = go.Figure()
-    # 4象限の背景色
-    fig.add_shape(type="rect", x0=activity_threshold, x1=x_max, y0=0, y1=y_max,
-                  fillcolor=palette[0], opacity=0.08, line_width=0)
-    fig.add_shape(type="rect", x0=0, x1=activity_threshold, y0=0, y1=y_max,
-                  fillcolor=palette[1], opacity=0.08, line_width=0)
-    fig.add_shape(type="rect", x0=activity_threshold, x1=x_max, y0=y_min, y1=0,
-                  fillcolor=palette[2], opacity=0.08, line_width=0)
-    fig.add_shape(type="rect", x0=0, x1=activity_threshold, y0=y_min, y1=0,
-                  fillcolor=palette[3], opacity=0.08, line_width=0)
-    fig.add_hline(y=0, line_color=grid)
-    fig.add_vline(x=activity_threshold, line_color=grid, line_dash="dash")
-
-    colors = [palette[i % len(palette)] for i in range(len(items))]
-    fig.add_trace(go.Scatter(
-        x=activities, y=momentums, mode="markers", text=names,
-        marker=dict(size=16, color=colors, line=dict(width=1, color=fg)),
-        hovertemplate="%{text}<br>総出願件数: %{x}<br>勢い: %{y:.2f}<extra></extra>",
-    ))
-
-    for label, x_pos, y_pos, anchor in [
-        ("リーダー", x_max * 0.98, y_max * 0.95, "right"),
-        ("新興", activity_threshold * 0.4, y_max * 0.95, "center"),
-        ("成熟", x_max * 0.98, y_min * 0.95, "right"),
-        ("衰退", activity_threshold * 0.4, y_min * 0.95, "center"),
-    ]:
-        fig.add_annotation(x=x_pos, y=y_pos, text=label, showarrow=False,
-                           font=dict(color=fg, size=13), opacity=0.6, xanchor=anchor)
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="総出願量", yaxis_title="直近の成長率（CAGR）",
-        plot_bgcolor=bg, paper_bgcolor=bg,
-        font=dict(color=fg),
-        xaxis=dict(gridcolor=grid, zerolinecolor=grid, range=[0, x_max]),
-        yaxis=dict(gridcolor=grid, zerolinecolor=grid, range=[y_min, y_max]),
-        showlegend=False,
-    )
-    return fig
-
-
-# ============================================================
-# ㉜ 出願人ごとの自動グループ化（手作業のグループ分け不要）
-# ============================================================
-
-def get_applicant_groups(database, top_n=5):
-    """
-    データベースに「出願人」情報が含まれる場合、出願件数が多い順に
-    上位top_n件の出願人ごとに、idのリストをまとめる。
-    手作業でのグループ分けをせず、自動で比較グループを作るために使う。
-
-    戻り値: {出願人名: [id, id, ...], ...}（出願件数が多い順）
-            出願人情報が無いデータベースの場合は空の辞書を返す。
-    """
-    from collections import Counter, defaultdict
-
-    if not any(e.get("出願人") for e in database):
-        return {}
-
-    applicant_counter = Counter()
-    for entry in database:
-        applicant_counter.update(set(entry.get("出願人") or []))
-
-    top_applicants = [a for a, _ in applicant_counter.most_common(top_n)]
-    groups = defaultdict(list)
-    for entry in database:
-        for a in set(entry.get("出願人") or []):
-            if a in top_applicants:
-                groups[a].append(entry["id"])
-    # 出願件数の多い順を維持する
-    return {a: groups[a] for a in top_applicants if a in groups}
-
-
-# ============================================================
-# ㉝ メタデータ（発明の名称・FI）だけで完結する分布・プロファイル
-# ============================================================
-# 請求項データベース（relationsを持つ）がなくても、
-# 「発明の名称」から抽出したキーワード数や、FIコード数を使って、
-# クレームの広さ・狭さの分布や、出願人ごとの特徴比較の代わりにする。
-
-def compute_metadata_distribution(database, ids=None, metric="キーワード数"):
-    """
-    請求項データベースを使わず、発明の名称のキーワード数や
-    FIコード数の分布を作る（compute_scope_distribution() の代わり）。
-
-    metric: "キーワード数"（発明の名称から抽出した語の種類数）
-            "FIコード数"（付与されているFIコードの種類数）
-    """
-    target_ids = set(ids) if ids is not None else None
-    scores = []
-    for entry in database:
-        if target_ids is not None and entry["id"] not in target_ids:
-            continue
-        if metric == "FIコード数":
-            value = len(set(entry.get("FI") or []))
-        else:
-            value = len(_entry_keywords(entry, kind="component"))
-        scores.append({"id": entry["id"], "value": value})
-    return scores
-
-
-def plot_metadata_distribution(scores, metric="キーワード数", title=None, theme="deepsea", bins=10):
-    """compute_metadata_distribution() の結果をヒストグラムにする"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    values = [s["value"] for s in scores]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.hist(values, bins=bins, color=bar, edgecolor=fg, alpha=0.85)
-    ax.set_xlabel(metric, fontproperties=FONT_PROP, color=fg)
-    ax.set_ylabel("件数", fontproperties=FONT_PROP, color=fg)
-    ax.set_title(title or f"{metric}の分布", fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-def compute_metadata_group_profile(database, ids):
-    """
-    請求項データベースを使わず、発明の名称・FIのメタデータだけで
-    グループ（出願人等）の特徴プロファイルを作る
-    （compute_group_profile() の代わり）。レーダーチャート用。
-    """
-    target_ids = set(ids)
-    entries = [e for e in database if e["id"] in target_ids]
-    if not entries:
-        return {}
-
-    avg_keywords = sum(len(_entry_keywords(e, kind="component")) for e in entries) / len(entries)
-    avg_fi = sum(len(set(e.get("FI") or [])) for e in entries) / len(entries)
-    unique_keywords = len(build_keyword_frequency(database, ids, kind="component"))
-    unique_fi = len({fi_to_subclass(v) for e in entries for v in (e.get("FI") or [])})
-
-    return {
-        "出願件数": len(entries),
-        "平均キーワード数": avg_keywords,
-        "平均FIコード数": avg_fi,
-        "キーワードの種類数": unique_keywords,
-        "FIサブクラスの種類数": unique_fi,
-    }
-
-
-# ============================================================
-# ㉞ 出願人の名寄せ（グループ会社をまとめる）
-# ============================================================
-# 「株式会社東芝」「東芝デバイス＆ストレージ株式会社」「東芝マテリアル
-# 株式会社」のような、同じグループの子会社・関連会社がバラバラの
-# 出願人として扱われてしまう問題に対応する。
-
-DEFAULT_APPLICANT_GROUP_KEYWORDS = ["富士電機", "三菱電機", "ローム", "東芝"]
-
-
-def normalize_applicant_name(name, group_keywords=None):
-    """
-    出願人名を、グループ会社に共通する親会社名に正規化する。
-    例：「東芝デバイス＆ストレージ株式会社」→「東芝」
-
-    group_keywords で指定した語のいずれかが出願人名に含まれていれば、
-    その語（＝親会社名）を正規化後の名前として返す。どれにも一致
-    しなければ、元の名前をそのまま返す。
-    複数の語に一致する場合は、一番長く一致した語を優先する
-    （誤って短い語に丸められるのを防ぐため）。
-    """
-    keywords = group_keywords if group_keywords is not None else DEFAULT_APPLICANT_GROUP_KEYWORDS
-    matched = [kw for kw in keywords if kw and kw in name]
-    if not matched:
-        return name
-    return max(matched, key=len)
-
-
-def apply_applicant_normalization(database, group_keywords=None, field="出願人"):
-    """
-    データベース全体の出願人名を正規化した、新しいデータベースを返す
-    （元のデータベースは変更しない）。正規化前の名前は
-    "{field}_元" というキーにそのまま保存しておく。
-    """
-    new_db = []
-    for entry in database:
-        new_entry = dict(entry)
-        original = entry.get(field) or []
-        normalized = sorted({normalize_applicant_name(n, group_keywords) for n in original})
-        new_entry[field] = normalized
-        new_entry[f"{field}_元"] = original
-        new_db.append(new_entry)
-    return new_db
-
-
-# ============================================================
-# ㉟ 登録率分析：どのグループが権利化に成功しやすいか
-# ============================================================
-
-def _is_registered(entry):
-    """1件の特許が登録済みかどうかを判定する"""
-    if entry.get("登録番号"):
-        return True
-    stage = entry.get("ステージ") or ""
-    return "登録" in stage
-
-
-def compute_registration_rate(database, group_by="出願人", fi_level="サブクラス", top_n=15):
-    """
-    グループ（出願人・FI・発明の名称のキーワード）ごとに、
-    登録済みの割合（登録率）を計算する。
-
-    group_by: "出願人"、"FI"、"キーワード"（発明の名称から抽出）
-    戻り値: [{"グループ": .., "総数": .., "登録数": .., "登録率": ..}, ...]
-            （総数が多い順、上位top_n件）
-    """
-    from collections import defaultdict
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    counts = defaultdict(lambda: {"総数": 0, "登録数": 0})
-    for entry in database:
-        registered = _is_registered(entry)
-        if group_by == "出願人":
-            groups = set(entry.get("出願人") or [])
-        elif group_by == "FI":
-            groups = {convert(v) for v in (entry.get("FI") or [])}
-        else:
-            groups = extract_abstract_keywords(entry.get("発明の名称") or "")
-        for g in groups:
-            counts[g]["総数"] += 1
-            if registered:
-                counts[g]["登録数"] += 1
-
-    result = []
-    for g, c in counts.items():
-        result.append({
-            "グループ": g,
-            "総数": c["総数"],
-            "登録数": c["登録数"],
-            "登録率": c["登録数"] / c["総数"] if c["総数"] else 0.0,
-        })
-    result.sort(key=lambda x: -x["総数"])
-    return result[:top_n]
-
-
-def plot_registration_rate(rows, title="登録率", theme="deepsea"):
-    """compute_registration_rate() の結果を横棒グラフにする（登録率でソート）"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    rows_sorted = sorted(rows, key=lambda x: x["登録率"])
-    labels = [f'{r["グループ"]}（{r["登録数"]}/{r["総数"]}）' for r in rows_sorted]
-    values = [r["登録率"] * 100 for r in rows_sorted]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.barh(labels, values, color=bar)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
-    ax.set_xlabel("登録率（%）", fontproperties=FONT_PROP, color=fg)
-    ax.set_xlim(0, 100)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㊱ 権利化期間分析：どのグループ・技術が早く／遅く公開されるか
-# ============================================================
-
-def compute_time_to_publication(database, group_by="出願人", fi_level="サブクラス", top_n=15):
-    """
-    グループ（出願人・FI）ごとに、出願日から公知日までの日数（権利化に
-    かかった期間の目安）の平均・中央値を計算する。
-    出願日・公知日の両方がある行だけを対象にする。
-
-    戻り値: [{"グループ": .., "件数": .., "平均日数": .., "中央値日数": ..}, ...]
-            （件数が多い順、上位top_n件）
-    """
-    from collections import defaultdict
-    import statistics
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    days_by_group = defaultdict(list)
-    for entry in database:
-        d1 = entry.get("出願日")
-        d2 = entry.get("公知日")
-        if d1 is None or d2 is None:
-            continue
-        days = (d2 - d1).days
-        if days < 0:
-            continue
-        if group_by == "出願人":
-            groups = set(entry.get("出願人") or [])
-        else:
-            groups = {convert(v) for v in (entry.get("FI") or [])}
-        for g in groups:
-            days_by_group[g].append(days)
-
-    result = []
-    for g, days_list in days_by_group.items():
-        result.append({
-            "グループ": g,
-            "件数": len(days_list),
-            "平均日数": statistics.mean(days_list),
-            "中央値日数": statistics.median(days_list),
-        })
-    result.sort(key=lambda x: -x["件数"])
-    return result[:top_n]
-
-
-def plot_time_to_publication(rows, title="出願から公知までの期間", theme="deepsea"):
-    """compute_time_to_publication() の結果を横棒グラフにする（平均日数でソート）"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    rows_sorted = sorted(rows, key=lambda x: x["平均日数"])
-    labels = [f'{r["グループ"]}（{r["件数"]}件）' for r in rows_sorted]
-    values = [r["平均日数"] / 365.25 for r in rows_sorted]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.barh(labels, values, color=bar)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=FONT_PROP, color=fg, fontsize=9)
-    ax.set_xlabel("平均期間（年）", fontproperties=FONT_PROP, color=fg)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㊲ 技術の「先願者」年表：どのマスを誰が最初に押さえたか
-# ============================================================
-
-def find_first_filers(database, top_keywords=25, top_fi=25, fi_level="サブクラス",
-                       title_field="発明の名称"):
-    """
-    build_keyword_fi_matrix() と同じ「キーワード×FI」のマス目について、
-    各マスに最も早く出願したのが誰（どの出願人）で、いつだったかを求める。
-    「この技術の組み合わせは、実はどの会社が先行して押さえていたか」を
-    可視化するために使う。
-
-    戻り値: [{"キーワード":.., "FI":.., "最初の出願人":.., "最初の出願日":..,
-              "件数":..}, ...]（キーワード×FIのマスごとに1行、出願日が早い順）
-    """
-    matrix, keyword_list, fi_list = build_keyword_fi_matrix(
-        database, top_keywords=top_keywords, top_fi=top_fi, fi_level=fi_level, title_field=title_field
-    )
-    db_by_id = {e["id"]: e for e in database}
-
-    rows = []
-    for (kw, fi), ids in matrix.items():
-        entries = [db_by_id[i] for i in ids if i in db_by_id and db_by_id[i].get("出願日") is not None]
-        if not entries:
-            continue
-        entries.sort(key=lambda e: e["出願日"])
-        first = entries[0]
-        rows.append({
-            "キーワード": kw,
-            "FI": fi,
-            "最初の出願人": "、".join(first.get("出願人") or ["（不明）"]),
-            "最初の出願日": first["出願日"],
-            "件数": len(entries),
-        })
-    rows.sort(key=lambda r: r["最初の出願日"])
-    return rows
-
-
-# ============================================================
-# ㊳ 請求項データベース（メタデータ付き）の読み込み・構築
-# ============================================================
-# 「id,特許番号,出願日,出願人,発明の名称,FI/IPC,請求項番号,請求項本文」
-# 形式のCSV（Dataset A用テンプレート）を読み込み、請求項本文をSAO解析
-# した上で、出願人・FIのメタデータと合わせたデータベースを作る。
-# これにより「請求項から抽出した構成要素×FI」のホワイトスペースマップ
-# や、出願人別の絞り込みができるようになる。
-
-def load_claims_with_metadata_csv(csv_text):
-    """
-    請求項本文とメタデータ（出願人・FI等）を両方持つCSVを読み込む。
-    列名: id（省略可）, 出願人（または出願人/権利者）, FI（またはFI/IPC）,
-          請求項本文, 発明の名称（任意）, 出願日（任意）, 特許番号（任意）
-    """
-    import csv
-    import io
-    from datetime import datetime
-
-    def _split_multi(value, seps=("／", "、", ",", ";", "；")):
-        if not value:
-            return []
-        text = value
-        for s in seps[1:]:
-            text = text.replace(s, seps[0])
-        return [v.strip() for v in text.split(seps[0]) if v.strip()]
-
-    def _parse_date(value):
-        if not value:
-            return None
-        value = value.strip().replace("/", "-").replace(".", "-")
-        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
-            try:
-                return datetime.strptime(value, fmt)
-            except ValueError:
-                continue
-        return None
-
-    reader = csv.DictReader(io.StringIO(csv_text))
-    records = []
-    for i, row in enumerate(reader):
-        text = (row.get("請求項本文") or row.get("text") or "").strip()
-        if not text:
-            continue
-        rid = row.get("id") or row.get("特許番号") or f"行{i+1}"
-        applicant_raw = row.get("出願人") or row.get("出願人/権利者") or ""
-        fi_raw = row.get("FI/IPC") or row.get("FI") or ""
-        records.append({
-            "id": rid,
-            "出願人": _split_multi(applicant_raw),
-            "FI": _split_multi(fi_raw),
-            "請求項本文": text,
-            "発明の名称": (row.get("発明の名称") or "").strip(),
-            "出願日": _parse_date(row.get("出願日", "")),
-            "特許番号": (row.get("特許番号") or "").strip(),
-        })
-    return records
-
-
-def build_claims_metadata_database(records, show_progress=True):
-    """
-    load_claims_with_metadata_csv() の結果から、各行の請求項本文を
-    SAO解析し、メタデータ（出願人・FI等）と合わせたデータベースを作る。
-
-    build_patent_database()/build_abstract_database()等と同様に、
-    文書全体の平均埋め込みベクトル（doc_embedding）も合わせて計算する
-    （類似度ネットワーク図・意味的俯瞰マップ等、doc_embeddingを前提とする
-    機能をこのデータベースでも使えるようにするため）。
-    """
-    import numpy as np
-
-    model = _get_embed_model()
-    database = []
-    total = len(records)
-    for i, r in enumerate(records):
-        if show_progress:
-            print(f"[{i+1}/{total}] {r['id']} を解析中...")
-        try:
-            _, relations = analyze_claim(r["請求項本文"])
-        except Exception as e:
-            if show_progress:
-                print(f"  → 解析エラー、スキップします: {e}")
-            continue
-        entry = dict(r)
-        entry["relations"] = relations
-        entry["text"] = r["請求項本文"]
-
-        triples = sorted(relations_to_triple_set(relations, normalize_numbers=True)) if relations else []
-        if triples:
-            texts = [_triple_to_text(t) for t in triples]
-            embeddings = model.encode(texts, normalize_embeddings=True)
-            doc_embedding = np.mean(embeddings, axis=0)
-            doc_embedding = doc_embedding / (np.linalg.norm(doc_embedding) + 1e-8)
-        else:
-            # SAOが1件も抽出できなかった請求項は、代わりに請求項本文
-            # そのものを埋め込む（他の関数のように行ごと捨ててしまうと、
-            # メタデータ一覧・出願人フィルタ等、他の機能で件数が
-            # 合わなくなってしまうため、このデータベースでは行を残す）。
-            embedding = model.encode([r["請求項本文"]], normalize_embeddings=True)[0]
-            doc_embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-        entry["doc_embedding"] = doc_embedding
-
-        database.append(entry)
-    return database
-
-
-# ============================================================
-# ㊴ キーワード → FI推薦（J-PlatPat検索式の作成支援）
-# ============================================================
-# 単純なAI推測ではなく、「実際のデータの中で、そのキーワードを含む
-# 特許にどのFIが多く付与されているか」を統計的に集計し、根拠（出現率・
-# 実例）付きで推薦する。J-PlatPatで検索条件（FI）を決める際の
-# 参考情報として使う。
-
-def _entry_searchable_text(entry):
-    """
-    出願人検索用に、そのエントリが持っているテキスト情報
-    （発明の名称・要約・請求項本文）を全部つなげたものを返す。
-    """
-    parts = []
-    for field in ("発明の名称", "text", "請求項本文"):
-        v = entry.get(field)
-        if v:
-            parts.append(v)
-    return "".join(parts)
-
-
-def recommend_fi_for_keywords(database, keywords, match_mode="いずれか", fi_level="サブクラス", top_n=10):
-    """
-    指定したキーワードを含む特許を検索し、その特許群でよく使われている
-    FIを、出現率（スコア）付きで推薦する。
-
-    keywords: 検索したいキーワードのリスト
-    match_mode: "いずれか"（OR、キーワードのうち1つでも含まれていればよい）
-                "すべて"（AND、全部のキーワードを含む特許だけを対象にする。
-                キーワードの組み合わせによる推薦に使う）
-    fi_level: fi_to_subclass/fi_to_maingroupと同じ粒度指定
-
-    戻り値: {
-        "matched_count": マッチした特許の件数,
-        "recommendations": [
-            {"FI": .., "件数": .., "スコア": .., "サンプルid": [id, ...]}, ...
-        ]（スコアが高い順）
-    }
-    """
-    from collections import Counter, defaultdict
-
-    if fi_level == "サブクラス":
-        convert = fi_to_subclass
-    elif fi_level == "メイングループ":
-        convert = fi_to_maingroup
-    else:
-        convert = lambda x: x
-
-    keywords = [k for k in keywords if k]
-    matched = []
-    for entry in database:
-        text = _entry_searchable_text(entry)
-        if not text:
-            continue
-        if match_mode == "すべて":
-            ok = all(kw in text for kw in keywords)
-        else:
-            ok = any(kw in text for kw in keywords)
-        if ok:
-            matched.append(entry)
-
-    fi_counter = Counter()
-    fi_examples = defaultdict(list)
-    for entry in matched:
-        fis = {convert(v) for v in (entry.get("FI") or [])}
-        for fi in fis:
-            fi_counter[fi] += 1
-            if len(fi_examples[fi]) < 5:
-                fi_examples[fi].append(entry["id"])
-
-    total = len(matched)
-    recommendations = []
-    for fi, count in fi_counter.most_common(top_n):
-        recommendations.append({
-            "FI": fi,
-            "件数": count,
-            "スコア": count / total if total else 0.0,
-            "サンプルid": fi_examples[fi],
-        })
-
-    return {"matched_count": total, "recommendations": recommendations}
-
-
-def plot_fi_recommendations(result, title="キーワード→FI推薦", theme="deepsea"):
-    """recommend_fi_for_keywords() の結果を横棒グラフ（出現率）にする"""
-    if theme == "deepsea":
-        bg, fg, bar = "#04121C", "#E8FBFF", "#5FD4E0"
-    else:
-        bg, fg, bar = "#FFFFFF", "#233044", "#4C87C6"
-
-    recs = list(reversed(result["recommendations"]))
-    labels = [f'{r["FI"]}（{r["件数"]}/{result["matched_count"]}件）' for r in recs]
-    values = [r["スコア"] * 100 for r in recs]
-
-    fig, ax = plt.subplots(figsize=(8, max(3, len(labels) * 0.4)))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.barh(labels, values, color=bar)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=FONT_PROP, fontsize=9, color=fg)
-    ax.set_xlabel("出現率（%）", fontproperties=FONT_PROP, color=fg)
-    ax.set_xlim(0, 100)
-    ax.set_title(title, fontproperties=FONT_PROP, fontsize=14, color=fg)
-    ax.tick_params(colors=fg)
-    for spine in ax.spines.values():
-        spine.set_color(fg)
-    plt.tight_layout()
-    return fig
-
-
-# ============================================================
-# ㊵ SAO抽出精度の定量評価（適合率・再現率・F1値）
-# ============================================================
-# 人手で作った正解SAOトリプルと、システムの抽出結果を比較して、
-# 定量的に精度を評価する。卒論の「検証実験」章にそのまま使える。
-
-def _normalize_relation_for_match(text):
+    このパイプラインはLLMを使用しない構成のため、常にFalseを返す。
+    （app.py側の互換性のために関数自体は残してある。）
     """
-    動詞の活用形の違い（「有し」「有する」「有している」等）を吸収する
-    ために、関係のテキストから漢字部分だけを取り出して正規化する。
-    """
-    return "".join(_re_dep.findall(r"[一-龥]+", text)) or text
-
-
-# 請求項の中では「有する」「備える」「具備する」「含む」のように、
-# 漢字表記が全く異なるのに実質的に同じ意味（全体が部分を持つ、という
-# 関係）で使われる動詞群がある。_normalize_relation_for_match の
-# 「漢字部分の一致」だけではこれらは別の関係として扱われてしまい、
-# 正解データの語彙選択とシステムの語彙選択がたまたま違うだけで
-# 不一致（誤り）とカウントされてしまう。評価の趣旨は「意味として
-# 正しい関係を抽出できているか」なので、既知の同義語グループは
-# 同じ関係とみなして比較する。
-RELATION_SYNONYM_GROUPS = [
-    {"有する", "備える", "具備する", "含む", "含める"},
-    {"配置される", "配置", "設けられる", "設置される", "設置"},
-    {"接続される", "接続", "連結される", "連結"},
-    {"接触する", "接触", "当接する", "当接"},
-    {"形成される", "形成"},
-    {"固定される", "固定"},
-]
-
-
-def _relation_synonym_match(rel_a, rel_b):
-    """relation文字列が既知の同義語グループで一致するかを判定する"""
-    for group in RELATION_SYNONYM_GROUPS:
-        a_in = any(g in rel_a for g in group)
-        b_in = any(g in rel_b for g in group)
-        if a_in and b_in:
-            return True
     return False
 
 
-def evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=True):
-    """
-    システムが抽出したSAOトリプル（predicted_relations）と、
-    人手で作った正解トリプル（gold_triples）を比較し、
-    適合率（Precision）・再現率（Recall）・F1値を計算する。
-
-    predicted_relations / gold_triples: どちらも
-        {"source":.., "relation":.., "target":..} の形の辞書のリスト
-        （"type"キーは比較に使わない）
-
-    lenient_relation_match: Trueの場合、relation（動詞部分）の比較を、
-        漢字部分だけを取り出して行う（「有し」「有する」「有している」の
-        ような活用の違いを吸収するため）。片方がもう片方の漢字部分を
-        含んでいればよい（「決め」と「位置決めされる」のような、
-        複合語の一部一致も許容する）。
-        Falseの場合はrelationも完全一致でなければ正解としない。
-
-    戻り値: {
-        "precision":.., "recall":.., "f1":..,
-        "正解数":.., "システム抽出数":.., "正解データ数":..,
-        "matched_pred": [...]（正解した抽出結果）,
-        "unmatched_pred": [...]（システムが誤って抽出した関係）,
-        "unmatched_gold": [...]（システムが見逃した関係）,
-    }
-    """
-    def _match(p, g):
-        if p["source"] != g["source"] or p["target"] != g["target"]:
-            return False
-        if p["relation"] == g["relation"]:
-            return True
-        if lenient_relation_match:
-            pn = _normalize_relation_for_match(p["relation"])
-            gn = _normalize_relation_for_match(g["relation"])
-            if pn == gn or pn in gn or gn in pn:
-                return True
-            return _relation_synonym_match(p["relation"], g["relation"])
-        return False
-
-    matched_gold_idx = set()
-    matched_pred_idx = set()
-    for pi, p in enumerate(predicted_relations):
-        for gi, g in enumerate(gold_triples):
-            if gi in matched_gold_idx:
-                continue
-            if _match(p, g):
-                matched_pred_idx.add(pi)
-                matched_gold_idx.add(gi)
-                break
-
-    matched_pred = [predicted_relations[i] for i in sorted(matched_pred_idx)]
-    unmatched_pred = [p for i, p in enumerate(predicted_relations) if i not in matched_pred_idx]
-    unmatched_gold = [g for i, g in enumerate(gold_triples) if i not in matched_gold_idx]
-
-    tp = len(matched_pred_idx)
-    precision = tp / len(predicted_relations) if predicted_relations else 0.0
-    recall = tp / len(gold_triples) if gold_triples else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "正解数": tp,
-        "システム抽出数": len(predicted_relations),
-        "正解データ数": len(gold_triples),
-        "matched_pred": matched_pred,
-        "unmatched_pred": unmatched_pred,
-        "unmatched_gold": unmatched_gold,
-    }
-
-
-def print_evaluation_report(predicted_relations, gold_triples, name="請求項", lenient_relation_match=True):
-    """evaluate_triples() の結果を、人が読みやすい形で表示する"""
-    result = evaluate_triples(predicted_relations, gold_triples, lenient_relation_match=lenient_relation_match)
-    print(f"=== {name} の評価 ===")
-    print(f"適合率(Precision): {result['precision']*100:5.1f}%  （{result['正解数']}/{result['システム抽出数']}）")
-    print(f"再現率(Recall):    {result['recall']*100:5.1f}%  （{result['正解数']}/{result['正解データ数']}）")
-    print(f"F1値:              {result['f1']*100:5.1f}%")
-    if result["unmatched_pred"]:
-        print("--- システムが誤って抽出した関係（誤検出） ---")
-        for r in result["unmatched_pred"]:
-            print(f"  {r['source']} --{r['relation']}--> {r['target']}")
-    if result["unmatched_gold"]:
-        print("--- システムが見逃した関係（未検出） ---")
-        for r in result["unmatched_gold"]:
-            print(f"  {r['source']} --{r['relation']}--> {r['target']}")
-    return result
-
-
-def batch_evaluate(test_cases, lenient_relation_match=True):
-    """
-    複数の請求項をまとめて評価する。
-
-    test_cases: [(名前, 請求項テキスト, 正解トリプルのリスト), ...]
-                または、難易度カテゴリ別集計もしたい場合は
-                [(名前, 請求項テキスト, 正解トリプルのリスト, 難易度カテゴリ), ...]
-
-    マイクロ平均（全件の正解数・抽出数・正解データ数を合算してから
-    Precision/Recall/F1を計算。件数の多い請求項の影響が大きくなる）と、
-    マクロ平均（各件のF1を単純平均。すべての請求項を対等に扱う）の
-    両方を返す。難易度カテゴリを指定していれば、カテゴリ別の集計も返す。
-    """
-    from collections import defaultdict
-
-    results = []
-    for case in test_cases:
-        if len(case) == 4:
-            name, text, gold, category = case
-        else:
-            name, text, gold = case
-            category = None
-        _, predicted = analyze_claim(text)
-        result = evaluate_triples(predicted, gold, lenient_relation_match=lenient_relation_match)
-        result["name"] = name
-        result["category"] = category
-        results.append(result)
-
-    total_tp = sum(r["正解数"] for r in results)
-    total_pred = sum(r["システム抽出数"] for r in results)
-    total_gold = sum(r["正解データ数"] for r in results)
-    micro_precision = total_tp / total_pred if total_pred else 0.0
-    micro_recall = total_tp / total_gold if total_gold else 0.0
-    micro_f1 = (
-        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
-        if (micro_precision + micro_recall) > 0 else 0.0
-    )
-
-    macro_precision = sum(r["precision"] for r in results) / len(results) if results else 0.0
-    macro_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
-    macro_f1 = sum(r["f1"] for r in results) / len(results) if results else 0.0
-
-    category_summary = {}
-    if any(r["category"] for r in results):
-        by_cat = defaultdict(list)
-        for r in results:
-            by_cat[r["category"] or "(未分類)"].append(r)
-        for cat, rs in by_cat.items():
-            tp = sum(r["正解数"] for r in rs)
-            pred = sum(r["システム抽出数"] for r in rs)
-            gold_n = sum(r["正解データ数"] for r in rs)
-            p = tp / pred if pred else 0.0
-            rcl = tp / gold_n if gold_n else 0.0
-            f = 2 * p * rcl / (p + rcl) if (p + rcl) > 0 else 0.0
-            category_summary[cat] = {"件数": len(rs), "precision": p, "recall": rcl, "f1": f}
-
-    return {
-        "results": results,
-        "micro": {"precision": micro_precision, "recall": micro_recall, "f1": micro_f1},
-        "macro": {"precision": macro_precision, "recall": macro_recall, "f1": macro_f1},
-        "category_summary": category_summary,
-    }
-
-
-def print_batch_evaluation_report(batch_result):
-    """batch_evaluate() の結果を、人が読みやすい形で表示する"""
-    print("=== 全体（マイクロ平均） ===")
-    m = batch_result["micro"]
-    print(f"適合率: {m['precision']*100:5.1f}%  再現率: {m['recall']*100:5.1f}%  F1: {m['f1']*100:5.1f}%")
-    print()
-    print("=== 全体（マクロ平均） ===")
-    M = batch_result["macro"]
-    print(f"適合率: {M['precision']*100:5.1f}%  再現率: {M['recall']*100:5.1f}%  F1: {M['f1']*100:5.1f}%")
-
-    if batch_result["category_summary"]:
-        print()
-        print("=== 難易度カテゴリ別 ===")
-        for cat, s in batch_result["category_summary"].items():
-            print(f"{cat}（{s['件数']}件）: 適合率{s['precision']*100:5.1f}%  再現率{s['recall']*100:5.1f}%  F1{s['f1']*100:5.1f}%")
-
-    print()
-    print("=== 請求項ごとの詳細 ===")
-    for r in batch_result["results"]:
-        cat_label = f"[{r['category']}] " if r.get("category") else ""
-        print(
-            f"{cat_label}{r['name']}: 適合率{r['precision']*100:5.1f}%  再現率{r['recall']*100:5.1f}%  "
-            f"F1{r['f1']*100:5.1f}%  （抽出{r['システム抽出数']}件中{r['正解数']}件正解、正解データ{r['正解データ数']}件）"
-        )
-
-
-# ============================================================
-# ㊶ 信頼度フラグ：この請求項の抽出結果は信頼できるか
-# ============================================================
-# これまでの検証で分かった「SAO抽出が苦手なパターン」を請求項の
-# テキストから事前に検出し、抽出結果をそのまま信じてよいか、
-# それとも人間が読み直すべきかの目安を示す。知財担当者が、
-# 「怪しい部分だけ確認する」形で読む速度を上げるために使う。
-
-def assess_claim_confidence(text):
-    """
-    請求項のテキストを解析し、既知の弱点パターンに当てはまるかどうかから、
-    抽出結果の信頼度を「高」「中」「低」で判定する。
-
-    戻り値: {"level": "高"|"中"|"低", "score": 数値, "reasons": [検出理由, ...]}
-    """
-    reasons = []
-    score = 0
-
-    length = len(text)
-    if length > 400:
-        reasons.append(f"文字数が非常に多い長文です（{length}文字）")
-        score += 2
-    elif length > 250:
-        reasons.append(f"文字数がやや多いです（{length}文字）")
-        score += 1
-
-    # 深い所有格の連鎖（「Ａの…Ｂの…Ｃの」のように「の」が何度も連なる）
-    deep_no = len(_re_dep.findall(r"の(?:前記)?[^、。]{1,15}の(?:前記)?[^、。]{1,15}の", text))
-    if deep_no >= 1:
-        reasons.append("深い所有格の連鎖（AのBのCの…）が含まれています")
-        score += 2
-
-    # 3つ以上の並列列挙
-    enum_count = len(_re_dep.findall(r"及び|および|又は|または", text))
-    if enum_count >= 2:
-        reasons.append(f"並列列挙（及び／又は等）が複数箇所あります（{enum_count}箇所）")
-        score += 1
-
-    # 「〜に対して〜される」という特殊な受身構文
-    if _re_dep.search(r"に対し(?:て)?[^。]{0,20}(?:さ|られ)れ", text):
-        reasons.append("「〜に対して〜される」という特殊な受身構文が含まれています")
-        score += 1
-
-    # 条件節・空間配置の表現
-    if "場合" in text or "平面視" in text:
-        reasons.append("条件節や空間配置の表現（「〜場合」「平面視において」等）が含まれています")
-        score += 1
-
-    # 「含む」「有する」の入れ子が深い
-    nest_count = len(_re_dep.findall(r"含み|含む|有し|有する|備え|備える", text))
-    if nest_count >= 5:
-        reasons.append(f"「含む」「有する」「備える」の入れ子が多いです（{nest_count}箇所）")
-        score += 1
-
-    # 修飾語を伴わないと意味が定まりにくい一般的な語
-    generic_terms = ["一方", "他方", "ゲート", "ソース", "ドレイン"]
-    found_generic = [t for t in generic_terms if t in text]
-    if found_generic:
-        reasons.append(f"単体では意味が定まりにくい語（{'、'.join(found_generic)}）が含まれています")
-        score += 1
-
-    if score >= 5:
-        level = "低"
-    elif score >= 2:
-        level = "中"
-    else:
-        level = "高"
-
-    return {"level": level, "score": score, "reasons": reasons}
-
-
-# ============================================================
-# ㊷ 記載チェック：「前記」の整合性確認、明確性要件のリスク検出
-# ============================================================
-# SAO抽出の精度とは別に、知財実務で実際にチェックされている観点
-# （「前記」参照の整合性、明確性要件違反になりやすい表現）を、
-# 請求項のテキストから自動で検出する。読む速度を上げるための、
-# 実務直結の機能。
-
-def check_zenki_consistency(claim_number, claim_texts, prefer_parent=None):
-    """
-    請求項Ｎで使われている「前記Ｘ」「該Ｘ」が、その従属先
-    （さらにその従属先を含む）より前に一度も登場していない場合、
-    記載不備（明確性要件違反）の疑いがあるとして検出する。
-
-    claim_texts: {番号: 本文} の辞書（parse_claims_block()の戻り値）
-
-    戻り値: [{"claim_number": 検出元の請求項番号, "term": "Ｘ"}, ...]
-    """
-    chain = _build_claim_chain(claim_number, claim_texts, prefer_parent=prefer_parent)
-    warnings = []
-    accumulated_text = ""
-    seen_terms = set()
-
-    for num, fragment_text in chain:
-        if not fragment_text:
-            continue
-        cleaned = _clean_claim_text(fragment_text)
-        doc = nlp(cleaned)
-        for i, tok in enumerate(doc):
-            if tok.text not in ("前記", "該"):
-                continue
-            words = []
-            j = i + 1
-            while j < len(doc) and doc[j].pos_ in ("NOUN", "PROPN"):
-                if doc[j].text in ("前記", "該") or not doc[j].text.strip():
-                    break
-                words.append(doc[j].text)
-                j += 1
-            if not words:
-                continue
-            term = _normalize_component_text("".join(words))
-            if not term or term in seen_terms:
-                continue
-            # 「前記」「該」より前に登場していればOK。判定対象は
-            # 「これまでの請求項（従属先）の蓄積テキスト」＋「同じ請求項内で
-            # この語より前の部分」。後者を含めないと、同一請求項内で先に
-            # 定義した構成要素を後段で「前記」で受けているだけの、ごく普通の
-            # 記載まで誤検出してしまう（例：独立請求項である請求項1は
-            # 従属先を持たないため、accumulated_textが常に空になる）。
-            text_before_here = accumulated_text + cleaned[:tok.idx]
-            if term not in text_before_here:
-                warnings.append({"claim_number": num, "term": term})
-                seen_terms.add(term)
-        accumulated_text += cleaned
-
-    return warnings
-
-
-# 明確性要件（特許法36条6項2号）違反を指摘されやすい表現パターン。
-# 判例（知財高裁 平17(行ケ)10015号、平21(行ケ)10395号 等）を根拠とする。
-CLARITY_RISK_PATTERNS = [
-    ("所定の", "明細書等で具体的に特定されていないと不明確と指摘される可能性があります（知財高裁 平21(行ケ)10395号）"),
-    ("一定の", "具体的な基準が明細書で示されていないと不明確と指摘される可能性があります"),
-    ("適切な", "主観的な表現であり、判断基準が明確でないと指摘される可能性があります"),
-    ("必要に応じて", "条件が明確に特定されていないと指摘される可能性があります"),
-    ("好ましくは", "任意的な限定であることが明確でも、権利範囲の外延が曖昧になりやすい表現です"),
-]
-
-# 抽象的で、具体的な裏付けがないと不明確と指摘されやすい語（単独使用時に注意）
-CLARITY_RISK_ABSTRACT_NOUNS = ["構造", "手段", "機構"]
-
-
-def check_clarity_risks(text):
-    """
-    明確性要件違反（特許法36条6項2号）を指摘されやすい表現パターンを
-    テキストから検出する。
-
-    戻り値: [{"phrase": 検出された表現, "reason": 根拠・説明}, ...]
-    """
-    findings = []
-    for phrase, reason in CLARITY_RISK_PATTERNS:
-        if phrase in text:
-            findings.append({"phrase": phrase, "reason": reason})
-
-    for noun in CLARITY_RISK_ABSTRACT_NOUNS:
-        if noun in text:
-            findings.append({
-                "phrase": noun,
-                "reason": f"「{noun}」は、具体的な構成（ハードウェア・処理内容等）と結びついた記載でないと、明確性要件違反（知財高裁 平17(行ケ)10015号）を指摘される可能性があります",
-            })
-
-    return findings
-
-
-# ============================================================
-# ㉔ 構成要素の未接続チェック
-# ============================================================
-# analyze_claim() が抽出した構成要素のうち、SAO関係（has・直接関係・
-# 位置関係を問わず）を一度も持たない、つまりグラフ上で孤立している
-# ものを検出する。既存のSAO抽出結果をそのまま利用できる。
-
-def check_disconnected_components(components, relations):
-    """
-    components, relations: analyze_claim() / analyze_dependent_claim() の
-    戻り値（構成要素リスト・関係リスト）。
-
-    戻り値: [{"term": 構成要素名}, ...]（他の構成要素と一切関係を
-             持たなかったものの一覧。抽出漏れの兆候である可能性がある）
-    """
-    connected = set()
-    for r in relations:
-        connected.add(_normalize_component_text(r["source"]))
-        connected.add(_normalize_component_text(r["target"]))
-
-    warnings = []
-    seen = set()
-    for c in components:
-        term = _normalize_component_text(c["text"])
-        if not term or term in seen:
-            continue
-        seen.add(term)
-        if term not in connected:
-            warnings.append({"term": term})
-    return warnings
-
-
-# ============================================================
-# ㉕ 用語の表記ゆれ・不一致チェック
-# ============================================================
-# 「第１端子」と「第1端子」のように、全角/半角の違いなど見た目だけが
-# 違う表記ゆれ（check_notation_variants）と、「第１端子」で定義したのに
-# 後段で「前記第１電極」のように番号は同じでも名詞が食い違っている
-# ケース（check_ordinal_term_consistency）、「制御部」と「制御装置」の
-# ように、幹は同じで末尾の役割語（装置／部／手段等）だけが違う用語の
-# ペア（check_similar_terms）を検出する。
-
-_ZENKAKU_DIGITS_TO_HANKAKU = str.maketrans("０１２３４５６７８９", "0123456789")
-
-
-def _canonicalize_for_variant_check(term):
-    """
-    表記ゆれ判定用に、全角数字→半角、スペース除去などの正規化を行う
-    （意味は変えず、見た目の表記だけを揃える）。
-    """
-    t = term.translate(_ZENKAKU_DIGITS_TO_HANKAKU)
-    t = t.replace(" ", "").replace("　", "")
-    return t
-
-
-def check_notation_variants(components):
-    """
-    構成要素名のうち、正規化（全角/半角数字の統一等）すると同じに
-    なるのに、異なる表記のまま複数種類登場しているものを検出する。
-
-    戻り値: [{"canonical": 正規化後の形, "variants": [表記1, 表記2, ...]}, ...]
-    """
-    groups = {}
-    for c in components:
-        term = _normalize_component_text(c["text"])
-        if not term:
-            continue
-        canon = _canonicalize_for_variant_check(term)
-        groups.setdefault(canon, set()).add(term)
-
-    warnings = []
-    for canon, variants in groups.items():
-        if len(variants) > 1:
-            warnings.append({"canonical": canon, "variants": sorted(variants)})
-    return warnings
-
-
-_ORDINAL_TERM_PATTERN = re.compile(r"^第(?P<num>[0-9]+)の?(?P<rest>.+)$")
-
-
-def check_ordinal_term_consistency(components):
-    """
-    「第１端子」のように序数＋名詞で定義された構成要素について、
-    同じ序数番号なのに末尾の名詞（端子／電極 等）が請求項内で
-    食い違っていないかを検出する（例：「第１端子」と定義したのに、
-    後段で「前記第１電極」と記載されている）。
-
-    戻り値: [{"num": 序数（文字列）, "terms": [用語1, 用語2, ...]}, ...]
-    """
-    groups = {}
-    seen = set()
-    for c in components:
-        term = _normalize_component_text(c["text"])
-        if not term or term in seen:
-            continue
-        seen.add(term)
-        m = _ORDINAL_TERM_PATTERN.match(term.translate(_ZENKAKU_DIGITS_TO_HANKAKU))
-        if not m:
-            continue
-        groups.setdefault(m.group("num"), set()).add(term)
-
-    warnings = []
-    for num, terms in groups.items():
-        if len(terms) > 1:
-            warnings.append({"num": num, "terms": sorted(terms)})
-    return warnings
-
-
-
-# 「制御部」「制御装置」のように、末尾に付く「役割語」（同じ機能を指すのに
-# 名詞の言い換えとしてよく使われる語）の一覧。ここに挙がっている語で終わる
-# 構成要素名は、それより前の部分（＝幹）と役割語に分けて扱う。
-# 長い候補から先にマッチさせるため長さ降順に並べる。
-_ROLE_SUFFIXES = sorted(
-    ["装置", "デバイス", "部品", "ユニット", "モジュール", "手段", "機構",
-     "回路", "素子", "ブロック", "セクション", "システム", "部", "器", "機"],
-    key=len, reverse=True,
-)
-
-
-def _split_stem_and_role_suffix(term):
-    """
-    「制御装置」→ ("制御", "装置") のように、末尾の役割語（装置・部・
-    手段等）を切り出す。該当する役割語で終わっていなければ (term, None)。
-    """
-    for suf in _ROLE_SUFFIXES:
-        if term.endswith(suf) and len(term) > len(suf):
-            return term[: -len(suf)], suf
-    return term, None
-
-
-def check_similar_terms(components):
-    """
-    構成要素名のうち、中心となる語（幹）は同じなのに、末尾の役割語
-    （装置／部／手段／ユニット等）だけが違う組み合わせを検出する
-    （例：「制御部」と「制御装置」、「半導体素子」と「半導体デバイス」）。
-    check_notation_variants()で検出できる、正規化すれば一致する表記ゆれは
-    対象外（そちらの方が確度が高い別種の指摘のため）。
-
-    以前は埋め込みベクトルによる意味的類似度で判定していたが、「表示部」と
-    「通信部」のように役割語が同じだけで中身は無関係な語同士まで高い類似度
-    が出てしまい、実用に耐えなかったため、幹の完全一致で判定する方式に
-    変更した。その分、幹の表記まで違う言い換え（例：「制御部」と
-    「コントローラ」）は検出できない。
-
-    戻り値: [{"term_a":.., "term_b":.., "stem":..}, ...]
-    """
-    terms = sorted({_normalize_component_text(c["text"]) for c in components if c["text"].strip()})
-    terms = [t for t in terms if t]
-
-    by_stem = {}
-    for t in terms:
-        stem, suf = _split_stem_and_role_suffix(t)
-        if suf is None or not stem:
-            continue
-        by_stem.setdefault(stem, set()).add(t)
-
-    pairs = []
-    for stem, terms_with_suffix in by_stem.items():
-        if len(terms_with_suffix) < 2:
-            continue
-        terms_sorted = sorted(terms_with_suffix)
-        for i in range(len(terms_sorted)):
-            for j in range(i + 1, len(terms_sorted)):
-                pairs.append({"term_a": terms_sorted[i], "term_b": terms_sorted[j], "stem": stem})
-
-    return pairs
-
-
-# ============================================================
-# ㉖ 数値・単位チェック
-# ============================================================
-# 請求項に含まれる「数値＋単位」の組を抽出して一覧化し、同じ単位が
-# 複数の表記（"mm"と"ｍｍ"、"um"と"μm"等）で混在していないかを検出する。
-
-_UNIT_ALIASES = {
-    "mm": "mm", "ｍｍ": "mm",
-    "cm": "cm", "ｃｍ": "cm",
-    "nm": "nm", "ｎｍ": "nm",
-    "um": "μm", "μm": "μm",
-    "℃": "℃", "度c": "℃", "度C": "℃",
-    "mpa": "MPa", "MPa": "MPa", "Mpa": "MPa",
-    "kpa": "kPa", "kPa": "kPa",
-    "gpa": "GPa", "GPa": "GPa",
-    "pa": "Pa", "Pa": "Pa",
-    "%": "%", "％": "%", "パーセント": "%",
-    "kg": "kg", "ｋｇ": "kg",
-    "mg": "mg", "ｍｇ": "mg",
-    "g": "g", "ｇ": "g",
-    "kv": "kV", "kV": "kV",
-    "mv": "mV", "mV": "mV",
-    "v": "V", "V": "V", "ｖ": "V",
-    "ma": "mA", "mA": "mA",
-    "a": "A", "A": "A", "ａ": "A",
-    "khz": "kHz", "kHz": "kHz",
-    "mhz": "MHz", "MHz": "MHz",
-    "ghz": "GHz", "GHz": "GHz",
-    "hz": "Hz", "Hz": "Hz",
-    "Ω": "Ω", "ω": "Ω", "オーム": "Ω",
-    "ms": "ms", "秒": "s", "s": "s",
-}
-
-_NUMERIC_SPEC_PATTERN = re.compile(
-    r"(?P<value>[0-9０-９]+(?:[.．][0-9０-９]+)?)"
-    r"\s*"
-    r"(?P<unit>mm|ｍｍ|cm|ｃｍ|nm|ｎｍ|μm|um|℃|度[Cc]|"
-    r"MPa|Mpa|mpa|kPa|kpa|GPa|gpa|Pa|pa|%|％|パーセント|"
-    r"kg|ｋｇ|mg|ｍｇ|g|ｇ|kV|kv|mV|mv|V|ｖ|mA|ma|A|ａ|"
-    r"kHz|khz|MHz|mhz|GHz|ghz|Hz|hz|Ω|ω|オーム|ms|秒|s)"
-)
-
-
-def extract_numeric_specs(text):
-    """
-    請求項テキストから「数値＋単位」の組を抽出する
-    （例：「10mm」「10 mm」「０．１ｍｍ」等）。
-
-    戻り値: [{"raw": 元の表記, "value": 数値(float), "unit": 元の単位表記,
-              "unit_normalized": 正規化後の単位, "position": 出現位置(文字index)}, ...]
-    """
-    results = []
-    for m in _NUMERIC_SPEC_PATTERN.finditer(text):
-        raw_value = m.group("value").translate(_ZENKAKU_DIGITS_TO_HANKAKU).replace("．", ".")
-        try:
-            value = float(raw_value)
-        except ValueError:
-            continue
-        unit_raw = m.group("unit")
-        unit_normalized = _UNIT_ALIASES.get(unit_raw, unit_raw)
-        results.append({
-            "raw": m.group(0),
-            "value": value,
-            "unit": unit_raw,
-            "unit_normalized": unit_normalized,
-            "position": m.start(),
-        })
-    return results
-
-
-def check_unit_notation_consistency(text):
-    """
-    extract_numeric_specs()の結果から、同じ単位（正規化後）が複数の
-    異なる表記で書かれていないか（例："mm"と"ｍｍ"、"um"と"μm"）を検出する。
-
-    戻り値: [{"unit_normalized": .., "raw_variants": [表記1, 表記2, ...]}, ...]
-    """
-    specs = extract_numeric_specs(text)
-    groups = {}
-    for s in specs:
-        groups.setdefault(s["unit_normalized"], set()).add(s["unit"])
-
-    warnings = []
-    for unit_normalized, raws in groups.items():
-        if len(raws) > 1:
-            warnings.append({"unit_normalized": unit_normalized, "raw_variants": sorted(raws)})
-    return warnings
-
-
-# ============================================================
-# ㉗ 請求項の引用関係
-# ============================================================
-# parse_claims_block() で分割した請求項群から、各請求項がどの請求項を
-# 引用（従属）しているかを取り出し、引用関係図として可視化する。
-# 「請求項◯に記載の」等の参照表現の解析には、_build_claim_chain()等が
-# 既に使っている _parse_claim_ref() をそのまま利用する。
-
-def build_claim_dependency_graph(claim_texts):
-    """
-    claim_texts: {番号: 本文} の辞書（parse_claims_block()の戻り値）
-
-    戻り値: {請求項番号: [引用している親請求項番号, ...]}
-            （独立請求項は空リスト。「請求項１又は２に記載の」のように
-            複数を引用している場合は複数の番号が入る）
-    """
-    dependency = {}
-    for num, text in claim_texts.items():
-        ref = _parse_claim_ref(text)
-        dependency[num] = ref["numbers"] if ref else []
-    return dependency
-
-
-def plot_claim_dependency_graphviz(dependency_graph, theme="deepsea"):
-    """
-    build_claim_dependency_graph()の結果を、請求項の引用関係図として
-    Graphvizで描画する（例：請求項3 → 請求項1, 請求項2）。
-
-    戻り値は graphviz.Digraph オブジェクト。Streamlitでは
-    st.graphviz_chart(戻り値) でそのまま描画できる。
-    """
-    import graphviz
-
-    g = graphviz.Digraph(engine="dot")
-    g.attr(rankdir="LR", splines="spline", nodesep="0.3", ranksep="0.7", bgcolor="transparent")
-
-    if theme == "deepsea":
-        dep_fill, dep_border, dep_font = "#0E3A52", "#5FD4E0", "#E8FBFF"
-        indep_fill, indep_border, indep_font = "#04121C", "#8FE0F0", "#FFFFFF"
-        edge_color = "#5FD4E0"
-    else:
-        dep_fill, dep_border, dep_font = "#EAF2FF", "#5B8DEF", "#233044"
-        indep_fill, indep_border, indep_font = "#3B4252", "#B0B7C6", "#FFFFFF"
-        edge_color = "#5B8DEF"
-
-    g.attr("node", shape="box", style="rounded,filled", fontname="IPAexGothic",
-           fontsize="13", margin="0.2,0.12", penwidth="1.8")
-    g.attr("edge", color=edge_color, penwidth="1.6", arrowsize="0.8")
-
-    for num, parents in dependency_graph.items():
-        is_independent = not parents
-        g.node(
-            str(num),
-            label=f"請求項{num}" + ("\n（独立項）" if is_independent else ""),
-            fillcolor=indep_fill if is_independent else dep_fill,
-            color=indep_border if is_independent else dep_border,
-            fontcolor=indep_font if is_independent else dep_font,
-        )
-
-    for num, parents in dependency_graph.items():
-        for p in parents:
-            if p in dependency_graph:
-                g.edge(str(num), str(p))
-
-    return g
+print("GiNZA + SudachiPy前処理によるSAO解析を有効化しました。（LLM不使用）")
