@@ -1573,19 +1573,29 @@ def extract_direct_relations(doc, components):
                     # 「場合」は条件節の目印であって、動作主ではないので除外する
                     # （GiNZAが超長文でここに主語を誤って結びつけることがある）
                     continue
-                if case_frame_role(verb, child) == "location":
-                    # 簡易格フレーム辞書上、この格が「場所」だと分かっている
-                    # 場合は、受身の動作主（source）とは扱わない
-                    # （格フレーム法：「Ａには〜」のＡを動作主と誤認しない）。
-                    continue
-                source = (
+                role = case_frame_role(verb, child)
+                counterpart = (
                     find_previous_component_by_word(components, child)
                     or find_referenced_component(components, child)
                 )
-                if source is None or source["text"] == head_component["text"]:
+                if counterpart is None or counterpart["text"] == head_component["text"]:
+                    continue
+                if role == "location":
+                    # 「Ａに配置され」「Ａに設けられ」のように、簡易格フレーム
+                    # 辞書上この「に」が場所だと分かっている場合は、動作主
+                    # (source)としてではなく、「配置されたもの→場所」という
+                    # 向きの位置関係として登録する（格フレーム法）。
+                    # ここで単に読み飛ばすと、場所しか係り先がない受身文
+                    # （「〜に配置され、」等）の関係が丸ごと失われてしまう。
+                    relations.append({
+                        "source": head_component["text"],
+                        "relation": verb.text,
+                        "target": counterpart["text"],
+                        "type": "direct",
+                    })
                     continue
                 relations.append({
-                    "source": source["text"],
+                    "source": counterpart["text"],
                     "relation": verb.text,
                     "target": head_component["text"],
                     "type": "direct",
