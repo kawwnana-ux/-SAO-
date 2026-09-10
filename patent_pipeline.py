@@ -2393,14 +2393,52 @@ _DEEPSEA_PALETTE = [
 _DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
 
 
-def build_graphviz(final_relations, title=None, theme="deepsea"):
-    """
-    analyze_claim()等が返した関係リストを、Graphvizのdotエンジンで
-    階層型に自動レイアウトしたグラフとして組み立てる。
+def _containment_forest(final_relations):
+    """`type == "has"` だけから、描画専用の包含森林を作る。
 
-    戻り値は graphviz.Digraph オブジェクト。
-    Jupyter/Colabではそのまま表示でき、Streamlitでは
-    st.graphviz_chart(戻り値) でそのまま描画できる。
+    SAOのグラフでは1つの要素に複数の「有する」辺が入る場合があるが、
+    Graphvizのclusterは1ノードを複数の箱に入れられない。そのため、ここでは
+    最初に得られた親を採用して「表示用の親」を一意にする。採用されなかった
+    有する辺は、後段で通常の補助辺として残すので情報は失わない。
+    """
+    nodes = set()
+    has_edges = []
+    for r in final_relations:
+        nodes.add(r["source"])
+        nodes.add(r["target"])
+        if r.get("type") == "has" and r["source"] != r["target"]:
+            has_edges.append((r["source"], r["target"]))
+
+    parent = {}
+    children = {node: [] for node in nodes}
+    for source, target in has_edges:
+        # 自己参照と循環を避け、clusterに必要な木構造だけを採用する。
+        cursor = source
+        makes_cycle = False
+        while cursor in parent:
+            cursor = parent[cursor]
+            if cursor == target:
+                makes_cycle = True
+                break
+        if target not in parent and not makes_cycle:
+            parent[target] = source
+            children[source].append(target)
+
+    roots = [node for node in nodes if node not in parent]
+    return nodes, parent, children, roots
+
+
+def build_graphviz(final_relations, title=None, theme="deepsea", nested=True):
+    """関係をGraphvizで描画する。
+
+    ``nested=True``（既定）では、`type == "has"` の関係を実際の入れ子の
+    clusterとして描画する。一方、接続・配置・位置決め・属性などは親子では
+    ないため、clusterをまたぐ破線の補助辺として描く。この分離により、
+    「構成の内部関係」と「構成間の横断関係」を同一図内で区別できる。
+
+    Streamlitでは従来どおり ``st.graphviz_chart(build_graphviz(relations))``
+    として利用できる。旧来のフラット表示が必要なときだけ
+    ``nested=False`` を指定する。
     """
     import graphviz
 
@@ -2412,49 +2450,84 @@ def build_graphviz(final_relations, title=None, theme="deepsea"):
 
     g = graphviz.Digraph(engine="dot")
     g.attr(
-        rankdir="LR", splines="spline", nodesep="0.25", ranksep="0.85",
-        bgcolor="transparent",
+        rankdir="LR", splines="spline", nodesep="0.35", ranksep="0.95",
+        compound="true", newrank="true", bgcolor="transparent",
     )
     if title:
         g.attr(label=title, labelloc="t", fontsize="20",
                fontname="IPAexGothic",
                fontcolor="#E8FBFF" if theme == "deepsea" else "#233044")
-
-    if len(G.nodes()) == 0:
+    if len(G.nodes) == 0:
         return g
 
-    node_styles, _root = _assign_branch_colors(G)
-
+    node_styles, root = _assign_branch_colors(G)
     palette = _DEEPSEA_PALETTE if theme == "deepsea" else _BRANCH_PALETTE
     root_style = _DEEPSEA_ROOT if theme == "deepsea" else _ROOT_STYLE
+    cluster_border = "#2F7891" if theme == "deepsea" else "#9BBBC8"
+    cross_edge = "#F0C96A" if theme == "deepsea" else "#A66D00"
 
-    def _style_for(n):
-        s = node_styles.get(n)
-        if s is _ROOT_STYLE:
+    def style_for(node):
+        style = node_styles.get(node)
+        if style is _ROOT_STYLE:
             return root_style
-        if s in _BRANCH_PALETTE:
-            return palette[_BRANCH_PALETTE.index(s)]
+        if style in _BRANCH_PALETTE:
+            return palette[_BRANCH_PALETTE.index(style)]
         return palette[0]
+
+    def node_id(node):
+        # 日本語ラベル・記号をDOTのIDに直接使わず、IDと表示名を分離する。
+        return "node_" + str(node_index[node])
 
     g.attr("node", shape="box", style="rounded,filled", fontname="IPAexGothic",
            fontsize="12", margin="0.18,0.1", penwidth="1.8")
-    g.attr("edge", fontname="IPAexGothic", fontsize="10", penwidth="1.6")
+    g.attr("edge", fontname="IPAexGothic", fontsize="10", penwidth="1.5")
 
-    added = set()
-    for n in G.nodes():
-        style = _style_for(n)
-        g.node(
-            n,
-            fillcolor=style["fill"],
-            color=style["border"],
-            fontcolor=style["font"],
-        )
-        added.add(n)
+    nodes, parent, children, roots = _containment_forest(final_relations)
+    ordered_nodes = list(G.nodes())
+    node_index = {node: i for i, node in enumerate(ordered_nodes)}
 
-    for u, v, d in G.edges(data=True):
-        line_style = _style_for(v)
-        g.edge(u, v, label="→ " + d["relation"], color=line_style["border"],
-               fontcolor=line_style["border"] if theme == "deepsea" else "#445566")
+    def add_node(container, node):
+        style = style_for(node)
+        container.node(node_id(node), label=node, fillcolor=style["fill"],
+                       color=style["border"], fontcolor=style["font"])
+
+    def add_cluster(container, node, ancestors=frozenset()):
+        # 子を持つ構成要素だけをclusterにする。葉は通常ノードのままにして、
+        # 無意味に箱を増やさない。
+        if not children.get(node) or node in ancestors:
+            add_node(container, node)
+            return
+        cluster = graphviz.Digraph(name="cluster_" + str(node_index[node]))
+        cluster.attr(label="包含：" + node, labelloc="t", labeljust="l",
+                     fontname="IPAexGothic", fontsize="11", fontcolor=cluster_border,
+                     color=cluster_border, penwidth="1.4", style="rounded,dashed",
+                     margin="14")
+        add_node(cluster, node)
+        for child in children[node]:
+            add_cluster(cluster, child, ancestors | {node})
+        container.subgraph(cluster)
+
+    if nested:
+        for top in roots:
+            add_cluster(g, top)
+    else:
+        for node in ordered_nodes:
+            add_node(g, node)
+
+    selected_has = {(source, target) for target, source in parent.items()}
+    for u, v, data in G.edges(data=True):
+        relation_type = data.get("type")
+        is_tree_edge = relation_type == "has" and (u, v) in selected_has
+        color = style_for(v)["border"] if is_tree_edge else cross_edge
+        edge_kwargs = {
+            "label": "→ " + data.get("relation", "関係"),
+            "color": color,
+            "fontcolor": color if theme == "deepsea" else "#445566",
+        }
+        if not is_tree_edge:
+            # 横断関係を階層配置の制約から外し、親子構造を崩さない。
+            edge_kwargs.update({"style": "dashed", "constraint": "false", "penwidth": "1.25"})
+        g.edge(node_id(u), node_id(v), **edge_kwargs)
 
     return g
 
