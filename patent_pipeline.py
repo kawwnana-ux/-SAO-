@@ -363,10 +363,21 @@ def _normalize_component_text(phrase):
 def _consume_noun_run(doc, i):
     """
     iから始まるNOUN/PROPNの連続を集めて (words, 止まった位置i) を返す。
-    「前記」「該」「うち」や、動詞に係る一般的な位置関係語
-    （_is_generic_relation_word）に当たった時点で止める。
+
+    先頭のトークンは無条件に取り込む（呼び出し側はdoc[i]がNOUN/PROPN
+    であることを保証している想定）。2語目以降は「前記」「該」「うち」や、
+    動詞に係る一般的な位置関係語（_is_generic_relation_word）に
+    当たった時点で止める。
+
+    重要：先頭のトークンだけを条件付きにすると、「側」等の位置関係語が
+    連続の先頭に来たときに1語も消費せずiを進めないまま返してしまい、
+    呼び出し元のメインループが同じ位置で無限ループするバグになる
+    （実際にこのバグが発生していたので、先頭は必ず消費するようにしている）。
     """
-    words = []
+    if i >= len(doc) or doc[i].pos_ not in {"NOUN", "PROPN"}:
+        return [], i
+    words = [doc[i].text]
+    i += 1
     while i < len(doc) and doc[i].pos_ in {"NOUN", "PROPN"}:
         if _is_generic_relation_word(doc[i]) or doc[i].text in ("前記", "該", "うち") or not doc[i].text.strip():
             break
