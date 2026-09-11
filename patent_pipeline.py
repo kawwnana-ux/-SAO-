@@ -419,6 +419,26 @@ def _maybe_extend_relation_suffix_phrase(doc, i, words):
     return words, i
 
 
+def _is_non_component_phrase(doc, start, end, phrase):
+    """特許クレームで構成要素ノードにしない修飾・数量・位置語を判定する。"""
+    normalized = re.sub(r"\s+", "", phrase)
+    # 数量・程度を表す断片。「少なく」が単独ノードになるのを防ぐ。
+    if normalized in {"少なく", "少なくとも", "少ない", "多く", "多くとも"}:
+        return True
+    if normalized.startswith("少なく") and normalized != "少なくとも１つの":
+        return True
+
+    # 「Aの主面に配置されたB」の「主面」はBの配置先を表す位置語であり、
+    # このSAOでは独立した構成部品ノードにはしない。
+    if normalized in {"主面", "表面", "上面", "下面", "側面", "端面"}:
+        # 「～面に配置/設けられた」の位置修飾として使われる場合のみ除外。
+        if end + 1 < len(doc) and doc[end + 1].text == "に":
+            for j in range(end + 2, min(len(doc), end + 7)):
+                if doc[j].lemma_ in {"配置", "設ける", "設置", "載置"} or doc[j].text in {"配置", "設け", "設置", "載置"}:
+                    return True
+    return False
+
+
 def extract_patent_components_general(doc):
     components = []
     i = 0
@@ -447,7 +467,8 @@ def extract_patent_components_general(doc):
             words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
+            if (phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS
+                    and not _is_non_component_phrase(doc, start, end, phrase)):
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -460,7 +481,8 @@ def extract_patent_components_general(doc):
             words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS:
+            if (phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS
+                    and not _is_non_component_phrase(doc, start, end, phrase)):
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -2314,9 +2336,7 @@ def _correct_patent_claim_relations(text, components, relations):
     # ------------------------------------------------------------
     between_pattern = re.compile(
         r"(?P<subject>(?:前記|該)?[^、。\n]{1,70}?)(?:は|が)[、\s]*"
-        r"(?P<left>[^、。\n]{1,120}?)"
-        r"(?:と|、|及び|および|並びに|ならびに)"
-        r"[^、。\n]{0,80}?"
+        r"(?P<middle>[^。\n]{1,260}?)"
         r"(?P<right>(?:前記|該)?[^、。\n]{1,60}?)との間に"
         r"(?:位置する|位置している|位置される|設けられる|設けられた)"
     )
@@ -2326,10 +2346,16 @@ def _correct_patent_claim_relations(text, components, relations):
         if subject is None:
             continue
 
-        # subjectの後ろにある「と／及び」で区切られた構成要素を、
-        # 表面上の範囲から安全に回収する。rightは必ず別途追加する。
-        left_text = m.group("left")
-        left_parts = [x.strip() for x in re.split(r"、|，|及び|および|並びに|ならびに|と", left_text) if x.strip()]
+        # 「Xと、Yとの間に」の左側を、列挙語で分割して構成要素へ照合する。
+        middle = m.group("middle").strip(" 、，")
+        left_text = re.sub(
+            rf"(?:前記|該)?{re.escape(m.group('right').strip())}$", "", middle
+        ).strip(" 、，")
+        left_parts = [
+            x.strip(" 、，")
+            for x in re.split(r"、|，|及び|および|並びに|ならびに|と", left_text)
+            if x.strip(" 、，")
+        ]
         left_components = []
         for part in left_parts:
             c = _component_by_surface(components, part)
@@ -2339,26 +2365,27 @@ def _correct_patent_claim_relations(text, components, relations):
         targets = left_components[:]
         if right is not None and right["text"] != subject["text"] and right not in targets:
             targets.append(right)
-
         if not targets:
             continue
 
-        # 「間に位置する」に関する既存関係は、この明確な節についてのみ
-        # 主体を取り違えたものを除去する。正しいsubject起点の関係は残す。
+        # この節については、GiNZAが逆向きに作った「間」関係を全て除去し、
+        # 文法上の主語（subject）からの関係だけを残す。
         target_names = {c["text"] for c in targets}
         corrected = _remove_relation_if(
             corrected,
             lambda r: (
                 "間" in r.get("relation", "")
-                and r.get("source") != subject["text"]
                 and (
-                    r.get("target") in target_names
-                    or r.get("source") in target_names
+                    r.get("source") in target_names
+                    or r.get("target") in target_names
+                    or r.get("source") != subject["text"]
                 )
             )
         )
         for target in targets:
-            _add_relation_unique(corrected, subject["text"], "間に位置する", target["text"], "positional")
+            _add_relation_unique(
+                corrected, subject["text"], "間に位置する", target["text"], "positional"
+            )
 
     # ------------------------------------------------------------
     # 4. 「Aは、BによりCに対して位置決めされている」
@@ -2380,6 +2407,13 @@ def _correct_patent_claim_relations(text, components, relations):
     #    「Xは…との間に位置する」節以外には触らない。
     #    ここでは新しい推測を行わない。
     # ------------------------------------------------------------
+
+    # 数量語・位置語が誤って構成要素化されていた場合の最終防波堤。
+    bad_nodes = {"少なく", "少なくとも", "少ない", "多く", "多くとも", "主面"}
+    corrected = [
+        r for r in corrected
+        if r.get("source") not in bad_nodes and r.get("target") not in bad_nodes
+    ]
 
     # 最終重複除去
     unique = []
