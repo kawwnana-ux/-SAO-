@@ -2102,6 +2102,89 @@ def _clean_claim_text(text):
     return text
 
 
+_CONTAINMENT_VERB_RE = r"含(?:む|み)|有(?:する|し)|備(?:える|え)|具備(?:する|し)"
+_ENUMERATION_SPLIT_RE = re.compile(r"(?:、|，|及び|および|ならびに|並びに|と)")
+_LEADING_QUANTIFIER_RE = re.compile(
+    r"^(?:前記|該)?(?:少なくとも\s*)?[０-９0-9一二三四五六七八九十]+(?:つ|個|本|枚|台|基)?の?"
+)
+
+
+def _canonical_relation_node(text, known_nodes):
+    """列挙補正で使う名詞句を、既出ノードに可能な限り寄せる。"""
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"^(?:前記|該)", "", text)
+    text = _LEADING_QUANTIFIER_RE.sub("", text).strip("、，とを ")
+    if not text:
+        return None
+
+    # 同一文字列を最優先し、次に「前記」を除いた包含一致を使う。
+    if text in known_nodes:
+        return text
+    candidates = [node for node in known_nodes if text in node or node in text]
+    if candidates:
+        return min(candidates, key=lambda node: abs(len(node) - len(text)))
+    return text
+
+
+def _add_enumerated_containment_relations(text, relations):
+    """係り受けが崩れやすい列挙型の包含関係を、控えめに補完する。
+
+    対象は ``Aは、B、CおよびDを含む``、``Aは、BとCを備える`` のような
+    特許請求項で頻出の骨格である。GiNZAが長文中の並列目的語を一つしか
+    ``obj`` と認識しない場合でも、各項目を ``type="has"`` として保持する。
+    部材名の辞書には依存しないため、半導体以外の請求項にも適用できる。
+    """
+    known_nodes = {
+        node
+        for relation in relations
+        for node in (relation["source"], relation["target"])
+    }
+    additions = []
+    # 文末まで貪欲に取り過ぎないよう、述語の直前の「を」までに限定する。
+    pattern = re.compile(
+        rf"(?P<owner>(?:前記|該)?[^、。\n]{{1,80}}?)(?:は|が)[、\s]*"
+        rf"(?P<items>[^。\n]{{1,240}}?)を(?P<verb>{_CONTAINMENT_VERB_RE})",
+    )
+    for match in pattern.finditer(text):
+        owner = _canonical_relation_node(match.group("owner"), known_nodes)
+        if owner is None:
+            continue
+        items_text = match.group("items")
+        # 位置句・修飾節の一部を誤って要素化しないよう、列挙記号がない
+        # 単独句は既出ノードに一致する場合だけ採用する。
+        raw_items = [part.strip() for part in _ENUMERATION_SPLIT_RE.split(items_text) if part.strip()]
+        if len(raw_items) == 1 and _canonical_relation_node(raw_items[0], known_nodes) not in known_nodes:
+            continue
+        for raw_item in raw_items:
+            item = _canonical_relation_node(raw_item, known_nodes)
+            if item is None or item == owner:
+                continue
+            additions.append({
+                "source": owner,
+                "relation": "含む" if match.group("verb").startswith("含") else "有する",
+                "target": item,
+                "type": "has",
+            })
+            known_nodes.add(item)
+
+    # 既存の「含む」等の直接関係も、包含レイアウトに使えるようtypeを統一する。
+    normalized = []
+    for relation in relations:
+        copied = dict(relation)
+        if copied.get("relation") in {"含む", "含み", "有する", "有し", "備える", "備え", "具備する", "具備し"}:
+            copied["type"] = "has"
+        normalized.append(copied)
+
+    seen = set()
+    result = []
+    for relation in normalized + additions:
+        key = (relation["source"], relation["target"], relation["type"])
+        if key not in seen:
+            seen.add(key)
+            result.append(relation)
+    return result
+
+
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
@@ -2132,6 +2215,7 @@ def _extract_raw_relations(text):
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
+    final_relations = _add_enumerated_containment_relations(text, final_relations)
     return components, final_relations, doc
 
 
@@ -2409,9 +2493,32 @@ def _containment_forest(final_relations):
         if r.get("type") == "has" and r["source"] != r["target"]:
             has_edges.append((r["source"], r["target"]))
 
+    # 同じ子に対する候補親を一旦すべて保持する。請求項の長文では
+    # 「装置→全要素」という粗い辺と「モジュール→端子」という具体的な辺が
+    # 共存しうるため、単に最初の辺を採るとフラットな図に逆戻りする。
+    candidates = {node: [] for node in nodes}
+    out_degree = {node: 0 for node in nodes}
+    has_targets = set()
+    for source, target in has_edges:
+        candidates[target].append(source)
+        out_degree[source] += 1
+        has_targets.add(target)
+
     parent = {}
     children = {node: [] for node in nodes}
-    for source, target in has_edges:
+    # 他の包含関係の子になっている親ほど、全体装置より具体的な親である
+    # 可能性が高い。これを優先して「IPM→端子」より
+    # 「パワー半導体モジュール→端子」を選ぶ。
+    for target in sorted(
+        (node for node, sources in candidates.items() if sources),
+        key=lambda node: (len(candidates[node]), node),
+    ):
+        parent_options = sorted(
+            candidates[target],
+            key=lambda source: (source in has_targets, out_degree[source], source),
+            reverse=True,
+        )
+        source = parent_options[0]
         # 自己参照と循環を避け、clusterに必要な木構造だけを採用する。
         cursor = source
         makes_cycle = False
