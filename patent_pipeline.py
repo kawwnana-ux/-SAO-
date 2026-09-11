@@ -1,4 +1,5 @@
 import re
+import zlib
 import spacy
 import ginza
 import ja_ginza
@@ -2461,6 +2462,87 @@ _DEEPSEA_PALETTE = [
 ]
 _DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
 
+# ============================================================
+# 関係（→の矢印）の色分け：relation（関係の種類）ごとに固定の色を割り当てる
+# ============================================================
+# ノードの色は枝（どの大枝に属するか）で塗り分けたままにしておき、
+# 矢印（辺）の色だけを「どんな関係か」で塗り分ける。
+# キーワード一致で「よくある関係のカテゴリ」に分類し、
+# 該当しないものは関係テキストのハッシュ値から一貫した色を
+# 割り当てる（同じ関係名は常に同じ色になる）。
+_RELATION_CATEGORY_RULES = [
+    (("接続",), "connect"),
+    (("配置", "設け", "搭載", "収容", "配設"), "place"),
+    (("有する", "備える", "具備", "含む"), "has"),
+    (("検出",), "detect"),
+    (("出力", "供給"), "output"),
+    (("間に位置する", "位置する", "の間", "対向"), "position"),
+    (("形成",), "form"),
+    (("固定", "支持", "保持"), "fix"),
+    (("オン", "オフ", "駆動", "制御"), "control"),
+]
+
+_RELATION_PALETTE_DEEPSEA = {
+    "connect":  "#5FD4E0",
+    "place":    "#4FE0A8",
+    "has":      "#F0D25C",
+    "detect":   "#FF8AC0",
+    "output":   "#9C7CF0",
+    "position": "#7CAEFF",
+    "form":     "#6FE8E0",
+    "fix":      "#E0A45F",
+    "control":  "#FF9E6D",
+    "other":    "#8FA3B8",
+}
+_RELATION_PALETTE_LIGHT = {
+    "connect":  "#5B8DEF",
+    "place":    "#34A870",
+    "has":      "#C9A400",
+    "detect":   "#D4529C",
+    "output":   "#8A63D2",
+    "position": "#2FA3B8",
+    "form":     "#2E9E8F",
+    "fix":      "#E08A2E",
+    "control":  "#D9704F",
+    "other":    "#7A8794",
+}
+
+# ハッシュ経由でカテゴリ外の関係名に割り当てるための予備色（テーマ別）
+_RELATION_FALLBACK_COLORS_DEEPSEA = [
+    "#5FD4E0", "#4FE0A8", "#F0D25C", "#FF8AC0", "#9C7CF0",
+    "#7CAEFF", "#6FE8E0", "#E0A45F", "#FF9E6D", "#B0E0A0",
+]
+_RELATION_FALLBACK_COLORS_LIGHT = [
+    "#5B8DEF", "#34A870", "#C9A400", "#D4529C", "#8A63D2",
+    "#2FA3B8", "#2E9E8F", "#E08A2E", "#D9704F", "#7BAE5E",
+]
+
+
+def _relation_category(relation_text):
+    """関係テキストをキーワード一致で大まかなカテゴリに分類する。"""
+    for keywords, category in _RELATION_CATEGORY_RULES:
+        if any(k in relation_text for k in keywords):
+            return category
+    return None
+
+
+def relation_color(relation_text, theme="deepsea"):
+    """
+    関係（→のラベル）ごとに一貫した色を返す。
+    まずキーワードでよくあるカテゴリに分類し、当てはまらない場合は
+    関係テキストのハッシュ値から予備色パレットの中で一貫した色を選ぶ
+    （同じ関係名なら、同じグラフ内・別のグラフ間でも常に同じ色になる）。
+    """
+    palette = _RELATION_PALETTE_DEEPSEA if theme == "deepsea" else _RELATION_PALETTE_LIGHT
+    fallback_colors = (
+        _RELATION_FALLBACK_COLORS_DEEPSEA if theme == "deepsea" else _RELATION_FALLBACK_COLORS_LIGHT
+    )
+    category = _relation_category(relation_text)
+    if category is not None:
+        return palette[category]
+    idx = zlib.crc32(relation_text.encode("utf-8")) % len(fallback_colors)
+    return fallback_colors[idx]
+
 
 def build_graphviz(final_relations, title=None, theme="deepsea"):
     """
@@ -2521,9 +2603,9 @@ def build_graphviz(final_relations, title=None, theme="deepsea"):
         added.add(n)
 
     for u, v, d in G.edges(data=True):
-        line_style = _style_for(v)
-        g.edge(u, v, label="→ " + d["relation"], color=line_style["border"],
-               fontcolor=line_style["border"] if theme == "deepsea" else "#445566")
+        edge_color = relation_color(d["relation"], theme=theme)
+        g.edge(u, v, label="→ " + d["relation"], color=edge_color,
+               fontcolor=edge_color)
 
     return g
 
@@ -2591,9 +2673,8 @@ def visualize_relations(final_relations, title="特許請求項の構成要素�
     # 辺（ベジェ曲線）を先に描く
     # ------------------------------------------------------
     for u, v, d in edge_list:
-        branch_style = node_styles.get(v, node_styles.get(u, _BRANCH_PALETTE[0]))
-        line_color = branch_style["line"] if branch_style is not _ROOT_STYLE else "#B0B7C6"
-        edge_color = branch_style["edge"] if branch_style is not _ROOT_STYLE else "#8A93A6"
+        edge_color = relation_color(d["relation"], theme="light")
+        line_color = edge_color
         x0, y0 = pos[u]
         x1, y1 = pos[v]
         w0, h0 = _box_size(labels[u])
@@ -3733,6 +3814,138 @@ def parse_claims_block(text):
         if body:
             result[num] = body
     return result
+
+
+# ============================================================
+# 精度検証（ゴールドラベルなしでの自動ヘルスチェック）
+# ============================================================
+# 532件のような大量の請求項には人手で作ったSAOの正解データが
+# ないため、「正解と何%一致したか」という意味での精度は測れない。
+# その代わりに、これまで実際に見つかった不具合パターン
+# （関係が1件も取れない・自己ループ・意味のない語がノードになる・
+# 　無関係な動詞が全部同じ終端ノードに誤って集まる・部品が孤立する等）
+# を自動チェックする「構造的な健全性スコア」を計算し、
+# その合格率を精度の代理指標として使う。
+_CLAIM_ENDING_NOUN_RE = re.compile(
+    r"([一-龥ァ-ヶー０-９0-9]{2,20})。\s*$"
+)
+
+
+def _extract_claim_ending_noun(text):
+    """
+    「…電力変換装置。」のように、請求項の末尾に置かれる発明の名称
+    （倒置形式の主題）をテキストから直接取り出す（GiNZAには頼らない）。
+    """
+    m = _CLAIM_ENDING_NOUN_RE.search(text.strip())
+    return m.group(1) if m else None
+
+
+def evaluate_claim_health(text, components, relations):
+    """
+    1件の請求項について、analyze_claim() が返した components/relations の
+    構造的な健全性をチェックし、チェック項目ごとの合否と総合合否を返す。
+    """
+    checks = {}
+
+    checks["has_components"] = len(components) > 0
+    checks["has_relations"] = len(relations) > 0
+
+    checks["no_self_loop"] = not any(
+        r["source"] == r["target"] for r in relations
+    )
+
+    bad_words = RELATION_WORDS | GENERIC_NOUNS | _PARTITIVE_GENERIC_WORDS
+    checks["no_bare_generic_node"] = not any(
+        c["text"] in bad_words for c in components
+    )
+
+    ending_noun = _extract_claim_ending_noun(text)
+    if ending_noun:
+        checks["ending_noun_present"] = any(
+            ending_noun in c["text"] or c["text"] in ending_noun
+            for c in components
+        )
+    else:
+        checks["ending_noun_present"] = True  # 判定できない場合は減点しない
+
+    if components:
+        used = set()
+        for r in relations:
+            used.add(r["source"])
+            used.add(r["target"])
+        orphan_ratio = 1 - (sum(1 for c in components if c["text"] in used) / len(components))
+        checks["orphan_ratio_ok"] = orphan_ratio <= 0.5
+    else:
+        checks["orphan_ratio_ok"] = False
+
+    # 1つのノードに、明らかに種類の違う動詞（関係ラベル）から
+    # 大量に集まりすぎていないか（＝動詞連鎖を遡りすぎて無関係な
+    # 終端ノードに誤って集約されるバグの兆候）を粗くチェックする。
+    incoming = {}
+    for r in relations:
+        incoming.setdefault(r["target"], set()).add(r["relation"])
+    max_fan_in_labels = max((len(v) for v in incoming.values()), default=0)
+    checks["no_fan_in_anomaly"] = max_fan_in_labels <= max(4, len(components) // 2)
+
+    passed = all(checks.values())
+    return passed, checks
+
+
+def evaluate_corpus_health(records, analyze_fn=None, progress_callback=None):
+    """
+    (id, text) のリスト（またはtextだけのリスト）を受け取り、各請求項を
+    analyze_fn（省略時はこのモジュールのanalyze_claim）で解析して、
+    evaluate_claim_health() の結果を集計する。
+
+    戻り値:
+      results: 請求項ごとの詳細（id, text, passed, checks, n_components,
+                n_relations, error のいずれかを含む辞書）のリスト
+      summary: 全体の合格率などをまとめた辞書
+    """
+    if analyze_fn is None:
+        analyze_fn = analyze_claim
+
+    results = []
+    for idx, item in enumerate(records):
+        if isinstance(item, (tuple, list)):
+            claim_id, text = item[0], item[1]
+        else:
+            claim_id, text = idx, item
+
+        row = {"id": claim_id, "text": text}
+        try:
+            components, relations = analyze_fn(text)
+            passed, checks = evaluate_claim_health(text, components, relations)
+            row.update({
+                "passed": passed,
+                "n_components": len(components),
+                "n_relations": len(relations),
+                "error": None,
+                **{f"check_{k}": v for k, v in checks.items()},
+            })
+        except Exception as e:
+            row.update({
+                "passed": False,
+                "n_components": 0,
+                "n_relations": 0,
+                "error": str(e),
+            })
+        results.append(row)
+        if progress_callback:
+            progress_callback(idx + 1, len(records))
+
+    total = len(results)
+    n_passed = sum(1 for r in results if r["passed"])
+    n_errors = sum(1 for r in results if r.get("error"))
+    summary = {
+        "total": total,
+        "passed": n_passed,
+        "pass_rate": (n_passed / total) if total else 0.0,
+        "errors": n_errors,
+        "avg_components": (sum(r["n_components"] for r in results) / total) if total else 0.0,
+        "avg_relations": (sum(r["n_relations"] for r in results) / total) if total else 0.0,
+    }
+    return results, summary
 
 
 # ============================================================

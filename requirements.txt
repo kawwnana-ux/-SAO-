@@ -9,5 +9,6 @@ matplotlib
 pandas
 numpy
 scipy
+sentence-transformers
 japanize-matplotlib
-graphviz
+openpyxl

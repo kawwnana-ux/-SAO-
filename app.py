@@ -1,5 +1,7 @@
 import base64
+import io
 import matplotlib.pyplot as plt
+import pandas as pd
 import streamlit as st
 
 # Matplotlibの日本語文字化け対策
@@ -26,6 +28,10 @@ if "dependent_result" not in st.session_state:
     st.session_state.dependent_result = None
 if "stats_df" not in st.session_state:
     st.session_state.stats_df = None
+if "eval_results" not in st.session_state:
+    st.session_state.eval_results = None
+if "eval_summary" not in st.session_state:
+    st.session_state.eval_summary = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -141,7 +147,10 @@ st.markdown(
 st.title("🪼 日本語特許請求項SAO構造分析")
 st.caption("SudachiPyで表記ゆれを正規化し、GiNZAの係り受け解析とルールベースの補正だけでSAO構造を抽出・可視化します（LLM不使用）")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索", "🪼 従属請求項を展開", "📊 特許統計分析"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🪸 1つの請求項を解析", "🐚 2つの請求項を比較", "🔦 まとめて検索",
+    "🪼 従属請求項を展開", "📊 特許統計分析", "✅ 精度検証",
+])
 
 
 # ============================================================
@@ -909,3 +918,129 @@ with tab5:
             )
 
         _show_patent_statistics(st.session_state.stats_df)
+
+
+with tab6:
+    st.subheader("✅ 大量の請求項に対する精度検証（自動ヘルスチェック）")
+    st.caption(
+        "人手のSAO正解データがない前提で、既知の不具合パターン"
+        "（関係が1件も取れない・自己ループ・意味のない語がノードになる・"
+        "動詞連鎖を遡りすぎて無関係な終端ノードに集まる・部品が孤立する 等）"
+        "を自動チェックし、その合格率を精度の代理指標として使います。"
+    )
+
+    eval_uploaded = st.file_uploader(
+        "📁 請求項リスト（.xlsx / .csv）をアップロード",
+        type=["xlsx", "csv"],
+        key="eval_file_upload",
+    )
+
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
+        eval_text_col = st.text_input(
+            "請求項本文の列名", value="請求項本文", key="eval_text_col"
+        )
+    with col_e2:
+        eval_id_col = st.text_input(
+            "ID列名（無ければ空欄でOK）", value="id", key="eval_id_col"
+        )
+
+    eval_limit = st.number_input(
+        "検証する件数の上限（0で全件）", min_value=0, value=0, step=10,
+        key="eval_limit",
+        help="全532件だと時間がかかるので、まず50〜100件で試すのがおすすめです。",
+    )
+
+    if st.button("🚀 精度検証を実行する", type="primary", key="eval_run"):
+        if eval_uploaded is None:
+            st.warning("ファイルをアップロードしてください。")
+        else:
+            try:
+                if eval_uploaded.name.lower().endswith(".xlsx"):
+                    eval_df = pd.read_excel(eval_uploaded)
+                else:
+                    eval_df = pd.read_csv(eval_uploaded)
+
+                if eval_text_col not in eval_df.columns:
+                    st.error(f"列「{eval_text_col}」が見つかりません。列一覧: {list(eval_df.columns)}")
+                else:
+                    texts = eval_df[eval_text_col].fillna("").astype(str).tolist()
+                    if eval_id_col and eval_id_col in eval_df.columns:
+                        ids = eval_df[eval_id_col].astype(str).tolist()
+                    else:
+                        ids = list(range(len(texts)))
+
+                    records = [(i, t) for i, t in zip(ids, texts) if t.strip()]
+                    if eval_limit and eval_limit > 0:
+                        records = records[: int(eval_limit)]
+
+                    progress_bar = st.progress(0, text=f"0/{len(records)}件")
+
+                    def _on_progress(done, total):
+                        progress_bar.progress(
+                            done / total if total else 0, text=f"{done}/{total}件"
+                        )
+
+                    with st.spinner("解析＆ヘルスチェック中..."):
+                        results, summary = pp.evaluate_corpus_health(
+                            records, progress_callback=_on_progress
+                        )
+                    progress_bar.empty()
+
+                    st.session_state.eval_results = results
+                    st.session_state.eval_summary = summary
+            except Exception as e:
+                st.error(f"検証中にエラーが発生しました: {e}")
+
+    if st.session_state.eval_summary is not None:
+        summary = st.session_state.eval_summary
+        pass_rate_pct = summary["pass_rate"] * 100
+
+        st.markdown("### 📈 結果サマリー")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("合格率", f"{pass_rate_pct:.1f}%")
+        m2.metric("検証件数", f"{summary['total']}件")
+        m3.metric("平均構成要素数", f"{summary['avg_components']:.1f}")
+        m4.metric("平均関係数", f"{summary['avg_relations']:.1f}")
+
+        if pass_rate_pct >= 90:
+            st.success(f"🎉 目標の90%以上を達成しています（{pass_rate_pct:.1f}%）。")
+        else:
+            st.warning(
+                f"⚠️ 目標の90%にはまだ届いていません（{pass_rate_pct:.1f}%）。"
+                "下の「不合格の請求項」を確認して、どのチェック項目で"
+                "落ちているものが多いか見てみてください。"
+            )
+
+        results_df = pd.DataFrame(st.session_state.eval_results)
+        check_cols = [c for c in results_df.columns if c.startswith("check_")]
+        if check_cols:
+            st.markdown("### 🔍 チェック項目別の合格率")
+            check_summary = (
+                results_df[check_cols].mean().sort_values() * 100
+            ).round(1)
+            st.dataframe(
+                check_summary.rename("合格率(%)").reset_index().rename(
+                    columns={"index": "チェック項目"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### 📋 詳細結果")
+        show_only_failed = st.checkbox("不合格のものだけ表示", value=True, key="eval_show_failed")
+        display_df = results_df[~results_df["passed"]] if show_only_failed else results_df
+        st.dataframe(
+            display_df[["id", "text", "passed", "n_components", "n_relations", "error"] + check_cols]
+            if len(display_df) > 0 else display_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        csv_bytes = results_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ 詳細結果をCSVでダウンロード",
+            data=csv_bytes,
+            file_name="claim_health_check_results.csv",
+            mime="text/csv",
+        )
