@@ -635,6 +635,41 @@ def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
     return results
 
 
+def _find_taishite_target(verb, components):
+    """
+    「Ａに対して位置決めされる」「Ａに対して固定される」のように、
+    「に対して」「に対する」で明示的に示された対象（相手・比較先）を
+    優先的に拾う。
+
+    「に対して」は目的語マーカーとしての意味が強く、動詞連鎖を
+    どこまでも遡るフォールバック（find_target_component_from_verb）より
+    先に採用すべき手がかりである。これがないと、「決め」（「位置決め」の
+    活用語尾がSudachi/GiNZAで独立した動詞に分割された場合など）のように
+    直接の係り先が別の動詞になっている受身動詞が、本来の対象
+    （「取り付けフレーム」等）を素通りして、遡った先にある文末の
+    無関係な対象（請求項末尾の装置名等）に誤って結び付いてしまう。
+    """
+    for child in verb.children:
+        if child.dep_ != "obl":
+            continue
+        case_texts = []
+        for c in child.children:
+            if c.dep_ in ("case", "fixed"):
+                case_texts.append(c.text)
+                for gc in c.children:
+                    if gc.dep_ in ("case", "fixed"):
+                        case_texts.append(gc.text)
+        joined = "".join(case_texts)
+        if "対し" in joined or "対する" in joined:
+            comp = (
+                find_previous_component_by_word(components, child)
+                or find_referenced_component(components, child)
+            )
+            if comp is not None:
+                return comp
+    return None
+
+
 def find_target_component_from_verb(components, verb):
     targets = []
     current = verb
@@ -1586,6 +1621,10 @@ def extract_direct_relations(doc, components):
 
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
+        if head_component is None and _is_passive(verb):
+            # 動詞連鎖の途中で係り先が別の動詞になっている受身動詞は、
+            # 延々と遡るフォールバックの前に「に対して」の対象を確認する。
+            head_component = _find_taishite_target(verb, components)
         if head_component is None:
             # 係り先が構成要素でない場合（別の動詞に連なっている等）は、
             # さらに上まで遡って構成要素を探す
