@@ -2185,6 +2185,214 @@ def _add_enumerated_containment_relations(text, relations):
     return result
 
 
+def _normalize_surface_component(text):
+    """特許請求項中の「前記」「該」などを除いて比較用の表記にする。"""
+    if text is None:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"^(?:前記|該)", "", text)
+    return text.strip("、，。")
+
+
+def _component_by_surface(components, text):
+    """表面文字列から構成要素を安全に引く。完全一致を最優先する。"""
+    key = _normalize_surface_component(text)
+    if not key:
+        return None
+    exact = []
+    for c in components:
+        ckey = _normalize_surface_component(c.get("text", ""))
+        if ckey == key:
+            exact.append(c)
+    if exact:
+        return exact[-1]
+    # 「取り付けフレームの一部」のような複合表現について、
+    # 既存ノードがそのまま存在する場合だけ包含一致を許可する。
+    candidates = []
+    for c in components:
+        ckey = _normalize_surface_component(c.get("text", ""))
+        if key in ckey or ckey in key:
+            candidates.append(c)
+    if candidates:
+        return min(candidates, key=lambda c: abs(len(_normalize_surface_component(c["text"])) - len(key)))
+    return None
+
+
+def _add_relation_unique(relations, source, relation, target, rel_type="direct"):
+    if not source or not target or source == target:
+        return
+    key = (source, relation, target)
+    if not any((r.get("source"), r.get("relation"), r.get("target")) == key for r in relations):
+        relations.append({
+            "source": source,
+            "relation": relation,
+            "target": target,
+            "type": rel_type,
+        })
+
+
+def _remove_relation_if(relations, predicate):
+    return [r for r in relations if not predicate(r)]
+
+
+def _correct_patent_claim_relations(text, components, relations):
+    """
+    長い日本語特許請求項でGiNZAの係り受けが崩れやすい典型構文を、
+    表面上の請求項構造に基づいて控えめに補正する。
+
+    重要なのは「全部を正規表現で解析し直す」のではなく、GiNZAが抽出した
+    構成要素を必ず照合先として使い、明確な特許請求項パターンだけを追加・修正
+    することである。特に、
+      ・AのBに配置されたC
+      ・AはB、CおよびDを含む
+      ・AはBを有する
+      ・AはBとCとの間に位置する
+    を対象にする。
+    """
+    corrected = [dict(r) for r in relations]
+
+    # ------------------------------------------------------------
+    # 1. 「Aは、B、CおよびDを含み／有し／備え」
+    #    係り受けが長くても、所有者と列挙された構成要素を確定する。
+    # ------------------------------------------------------------
+    containment_pattern = re.compile(
+        rf"(?P<owner>(?:前記|該)?[^、。\n]{{1,80}}?)(?:は|が)[、\s]*"
+        rf"(?P<items>[^。\n]{{1,220}}?)を(?P<verb>{_CONTAINMENT_VERB_RE}|含(?:む|み))"
+    )
+    for m in containment_pattern.finditer(text):
+        owner = _component_by_surface(components, m.group("owner"))
+        if owner is None:
+            continue
+        items_text = m.group("items")
+        # 「少なくとも１つの」等は構成要素名の照合時にGiNZA側のノードへ寄せる。
+        parts = [x.strip() for x in re.split(r"、|，|及び|および|並びに|ならびに|と", items_text) if x.strip()]
+        matched = []
+        for part in parts:
+            c = _component_by_surface(components, part)
+            if c is not None and c["text"] != owner["text"] and c not in matched:
+                matched.append(c)
+        # 2項以上の列挙、または単独項目でも完全に照合できた場合のみ追加。
+        if len(matched) >= 2 or (len(parts) == 1 and len(matched) == 1):
+            label = "含む" if m.group("verb").startswith("含") else "有する"
+            for c in matched:
+                _add_relation_unique(corrected, owner["text"], label, c["text"], "has")
+
+    # ------------------------------------------------------------
+    # 2. 「AのBに配置されたC」
+    #    例：放熱装置の主面に配置された取り付けフレーム
+    #    「主面」を独立ノードにするのではなく、C→A の配置関係にする。
+    # ------------------------------------------------------------
+    placement_pattern = re.compile(
+        r"(?P<owner>(?:前記|該)?[^、。\n]{1,50}?)の"
+        r"(?P<place>[^、。\n]{1,30}?)に配置(?:された|されている|される|され)"
+        r"(?:少なくとも\s*)?(?:[０-９0-9一二三四五六七八九十]+つの)?"
+        r"(?P<subject>[^、。\n]{1,50}?)(?=と、|と\s|、|。|を|は|が|\n|$)"
+    )
+    for m in placement_pattern.finditer(text):
+        owner = _component_by_surface(components, m.group("owner"))
+        subject = _component_by_surface(components, m.group("subject"))
+        if owner is None or subject is None or owner["text"] == subject["text"]:
+            continue
+        # 既存の「配置」を一律に消さず、明らかに「主面」等の中間位置語を
+        # source/targetにしている誤りだけを除去する。
+        owner_text = owner["text"]
+        subject_text = subject["text"]
+        corrected = _remove_relation_if(
+            corrected,
+            lambda r: (
+                r.get("relation", "").startswith("配置")
+                and r.get("source") not in {subject_text, owner_text}
+                and r.get("target") not in {subject_text, owner_text}
+            )
+        )
+        _add_relation_unique(corrected, subject_text, "配置", owner_text, "positional")
+
+    # ------------------------------------------------------------
+    # 3. 「Aは、Bと、Cとの間に位置する」
+    #    今回の誤りの中心。位置する主体は「A」であり、B/C側ではない。
+    #    Bが「正側端子、負側端子および出力端子」のような列挙なら全て拾う。
+    # ------------------------------------------------------------
+    between_pattern = re.compile(
+        r"(?P<subject>(?:前記|該)?[^、。\n]{1,70}?)(?:は|が)[、\s]*"
+        r"(?P<left>[^、。\n]{1,120}?)"
+        r"(?:と|、|及び|および|並びに|ならびに)"
+        r"[^、。\n]{0,80}?"
+        r"(?P<right>(?:前記|該)?[^、。\n]{1,60}?)との間に"
+        r"(?:位置する|位置している|位置される|設けられる|設けられた)"
+    )
+    for m in between_pattern.finditer(text):
+        subject = _component_by_surface(components, m.group("subject"))
+        right = _component_by_surface(components, m.group("right"))
+        if subject is None:
+            continue
+
+        # subjectの後ろにある「と／及び」で区切られた構成要素を、
+        # 表面上の範囲から安全に回収する。rightは必ず別途追加する。
+        left_text = m.group("left")
+        left_parts = [x.strip() for x in re.split(r"、|，|及び|および|並びに|ならびに|と", left_text) if x.strip()]
+        left_components = []
+        for part in left_parts:
+            c = _component_by_surface(components, part)
+            if c is not None and c["text"] != subject["text"] and c not in left_components:
+                left_components.append(c)
+
+        targets = left_components[:]
+        if right is not None and right["text"] != subject["text"] and right not in targets:
+            targets.append(right)
+
+        if not targets:
+            continue
+
+        # 「間に位置する」に関する既存関係は、この明確な節についてのみ
+        # 主体を取り違えたものを除去する。正しいsubject起点の関係は残す。
+        target_names = {c["text"] for c in targets}
+        corrected = _remove_relation_if(
+            corrected,
+            lambda r: (
+                "間" in r.get("relation", "")
+                and r.get("source") != subject["text"]
+                and (
+                    r.get("target") in target_names
+                    or r.get("source") in target_names
+                )
+            )
+        )
+        for target in targets:
+            _add_relation_unique(corrected, subject["text"], "間に位置する", target["text"], "positional")
+
+    # ------------------------------------------------------------
+    # 4. 「Aは、BによりCに対して位置決めされている」
+    #    「により」は手段なので、A→Cの位置決めを優先する。
+    # ------------------------------------------------------------
+    positioning_pattern = re.compile(
+        r"(?P<subject>(?:前記|該)?[^、。\n]{1,70}?)(?:は|が)[、\s]*"
+        r"(?:[^、。\n]{1,50}?)により"
+        r"(?P<target>(?:前記|該)?[^、。\n]{1,50}?)に対して位置決めされ(?:て|る|た)?"
+    )
+    for m in positioning_pattern.finditer(text):
+        subject = _component_by_surface(components, m.group("subject"))
+        target = _component_by_surface(components, m.group("target"))
+        if subject is not None and target is not None and subject["text"] != target["text"]:
+            _add_relation_unique(corrected, subject["text"], "位置決めされる", target["text"], "direct")
+
+    # ------------------------------------------------------------
+    # 5. 「AのB」だけで誤って生成された「間」関係を、今回の明確な
+    #    「Xは…との間に位置する」節以外には触らない。
+    #    ここでは新しい推測を行わない。
+    # ------------------------------------------------------------
+
+    # 最終重複除去
+    unique = []
+    seen = set()
+    for r in corrected:
+        key = (r.get("source"), r.get("relation"), r.get("target"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    return unique
+
+
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
@@ -2220,8 +2428,14 @@ def _extract_raw_relations(text):
 
 
 def analyze_claim(text):
-    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
+    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す。"""
     components, final_relations, doc = _extract_raw_relations(text)
+
+    # GiNZAの係り受けが長文特許で崩れた場合に、明確な特許定型構文だけを
+    # 表面構造から補正する。LLMは使用しない。
+    final_relations = _correct_patent_claim_relations(
+        _clean_claim_text(text), components, final_relations
+    )
     final_relations = _simplify_hierarchy(final_relations, doc, components)
     return components, final_relations
 
