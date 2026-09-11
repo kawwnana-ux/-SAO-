@@ -235,6 +235,15 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 # 一般的な語（構成要素としては登録しない）
 GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため"}
 
+# 「Ｘの一部」「Ｘの全体」のように、単独では何の一部・全体か分からず、
+# 必ず「Ｘの」を伴って初めて意味を持つ部分・全体を表す語。
+# RELATION_WORDS（側・端・面等）と同じ扱いで、後方合体の対象にする。
+_PARTITIVE_GENERIC_WORDS = {"一部", "部分", "全部", "全体"}
+
+# 「Ｘの底面」「Ｘの一部」のように、構成要素名の後方に来て初めて
+# 意味を持つ語（位置・部位語＋部分/全体語）をまとめた集合。
+_MERGEABLE_SUFFIX_WORDS = RELATION_WORDS | _PARTITIVE_GENERIC_WORDS
+
 # ============================================================
 # 簡易格フレーム辞書（格フレーム法）
 # ============================================================
@@ -419,26 +428,6 @@ def _maybe_extend_relation_suffix_phrase(doc, i, words):
     return words, i
 
 
-def _is_non_component_phrase(doc, start, end, phrase):
-    """特許クレームで構成要素ノードにしない修飾・数量・位置語を判定する。"""
-    normalized = re.sub(r"\s+", "", phrase)
-    # 数量・程度を表す断片。「少なく」が単独ノードになるのを防ぐ。
-    if normalized in {"少なく", "少なくとも", "少ない", "多く", "多くとも"}:
-        return True
-    if normalized.startswith("少なく") and normalized != "少なくとも１つの":
-        return True
-
-    # 「Aの主面に配置されたB」の「主面」はBの配置先を表す位置語であり、
-    # このSAOでは独立した構成部品ノードにはしない。
-    if normalized in {"主面", "表面", "上面", "下面", "側面", "端面"}:
-        # 「～面に配置/設けられた」の位置修飾として使われる場合のみ除外。
-        if end + 1 < len(doc) and doc[end + 1].text == "に":
-            for j in range(end + 2, min(len(doc), end + 7)):
-                if doc[j].lemma_ in {"配置", "設ける", "設置", "載置"} or doc[j].text in {"配置", "設け", "設置", "載置"}:
-                    return True
-    return False
-
-
 def extract_patent_components_general(doc):
     components = []
     i = 0
@@ -467,8 +456,7 @@ def extract_patent_components_general(doc):
             words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if (phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS
-                    and not _is_non_component_phrase(doc, start, end, phrase)):
+            if phrase not in _MERGEABLE_SUFFIX_WORDS and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -479,10 +467,30 @@ def extract_patent_components_general(doc):
             start = i
             words, i = _consume_noun_run(doc, i)
             words, i = _maybe_extend_relation_suffix_phrase(doc, i, words)
+
+            # 「Ｘの底面」「Ｘの一部」のように、部位・部分を表す語
+            # （_MERGEABLE_SUFFIX_WORDS）が「の」の直後・単独で構成要素に
+            # なってしまう場合、直前の「（既出の構成要素）の」と
+            # 1つの構成要素名にまとめる。これがないと、「底面」や
+            # 「一部」だけの意味を成さないノードが、本体が違う複数個所
+            # から集まって1つに潰れてしまう
+            # （①の「正極側のスイッチング素子」対応の、左右逆パターン）。
+            if (
+                words
+                and words[0] in _MERGEABLE_SUFFIX_WORDS
+                and start > 0
+                and doc[start - 1].text == "の"
+                and doc[start - 1].dep_ == "case"
+                and components
+                and components[-1]["end"] == start - 2
+            ):
+                prev = components.pop()
+                start = prev["start"]
+                words = [prev["text"], "の"] + words
+
             end = i - 1
             phrase = _normalize_component_text("".join(words))
-            if (phrase not in RELATION_WORDS and phrase not in GENERIC_NOUNS
-                    and not _is_non_component_phrase(doc, start, end, phrase)):
+            if phrase not in _MERGEABLE_SUFFIX_WORDS and phrase not in GENERIC_NOUNS:
                 components.append({"text": phrase, "start": start, "end": end})
             continue
 
@@ -2124,309 +2132,6 @@ def _clean_claim_text(text):
     return text
 
 
-_CONTAINMENT_VERB_RE = r"含(?:む|み)|有(?:する|し)|備(?:える|え)|具備(?:する|し)"
-_ENUMERATION_SPLIT_RE = re.compile(r"(?:、|，|及び|および|ならびに|並びに|と)")
-_LEADING_QUANTIFIER_RE = re.compile(
-    r"^(?:前記|該)?(?:少なくとも\s*)?[０-９0-9一二三四五六七八九十]+(?:つ|個|本|枚|台|基)?の?"
-)
-
-
-def _canonical_relation_node(text, known_nodes):
-    """列挙補正で使う名詞句を、既出ノードに可能な限り寄せる。"""
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"^(?:前記|該)", "", text)
-    text = _LEADING_QUANTIFIER_RE.sub("", text).strip("、，とを ")
-    if not text:
-        return None
-
-    # 同一文字列を最優先し、次に「前記」を除いた包含一致を使う。
-    if text in known_nodes:
-        return text
-    candidates = [node for node in known_nodes if text in node or node in text]
-    if candidates:
-        return min(candidates, key=lambda node: abs(len(node) - len(text)))
-    return text
-
-
-def _add_enumerated_containment_relations(text, relations):
-    """係り受けが崩れやすい列挙型の包含関係を、控えめに補完する。
-
-    対象は ``Aは、B、CおよびDを含む``、``Aは、BとCを備える`` のような
-    特許請求項で頻出の骨格である。GiNZAが長文中の並列目的語を一つしか
-    ``obj`` と認識しない場合でも、各項目を ``type="has"`` として保持する。
-    部材名の辞書には依存しないため、半導体以外の請求項にも適用できる。
-    """
-    known_nodes = {
-        node
-        for relation in relations
-        for node in (relation["source"], relation["target"])
-    }
-    additions = []
-    # 文末まで貪欲に取り過ぎないよう、述語の直前の「を」までに限定する。
-    pattern = re.compile(
-        rf"(?P<owner>(?:前記|該)?[^、。\n]{{1,80}}?)(?:は|が)[、\s]*"
-        rf"(?P<items>[^。\n]{{1,240}}?)を(?P<verb>{_CONTAINMENT_VERB_RE})",
-    )
-    for match in pattern.finditer(text):
-        owner = _canonical_relation_node(match.group("owner"), known_nodes)
-        if owner is None:
-            continue
-        items_text = match.group("items")
-        # 位置句・修飾節の一部を誤って要素化しないよう、列挙記号がない
-        # 単独句は既出ノードに一致する場合だけ採用する。
-        raw_items = [part.strip() for part in _ENUMERATION_SPLIT_RE.split(items_text) if part.strip()]
-        if len(raw_items) == 1 and _canonical_relation_node(raw_items[0], known_nodes) not in known_nodes:
-            continue
-        for raw_item in raw_items:
-            item = _canonical_relation_node(raw_item, known_nodes)
-            if item is None or item == owner:
-                continue
-            additions.append({
-                "source": owner,
-                "relation": "含む" if match.group("verb").startswith("含") else "有する",
-                "target": item,
-                "type": "has",
-            })
-            known_nodes.add(item)
-
-    # 既存の「含む」等の直接関係も、包含レイアウトに使えるようtypeを統一する。
-    normalized = []
-    for relation in relations:
-        copied = dict(relation)
-        if copied.get("relation") in {"含む", "含み", "有する", "有し", "備える", "備え", "具備する", "具備し"}:
-            copied["type"] = "has"
-        normalized.append(copied)
-
-    seen = set()
-    result = []
-    for relation in normalized + additions:
-        key = (relation["source"], relation["target"], relation["type"])
-        if key not in seen:
-            seen.add(key)
-            result.append(relation)
-    return result
-
-
-def _normalize_surface_component(text):
-    """特許請求項中の「前記」「該」などを除いて比較用の表記にする。"""
-    if text is None:
-        return ""
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"^(?:前記|該)", "", text)
-    return text.strip("、，。")
-
-
-def _component_by_surface(components, text):
-    """表面文字列から構成要素を安全に引く。完全一致を最優先する。"""
-    key = _normalize_surface_component(text)
-    if not key:
-        return None
-    exact = []
-    for c in components:
-        ckey = _normalize_surface_component(c.get("text", ""))
-        if ckey == key:
-            exact.append(c)
-    if exact:
-        return exact[-1]
-    # 「取り付けフレームの一部」のような複合表現について、
-    # 既存ノードがそのまま存在する場合だけ包含一致を許可する。
-    candidates = []
-    for c in components:
-        ckey = _normalize_surface_component(c.get("text", ""))
-        if key in ckey or ckey in key:
-            candidates.append(c)
-    if candidates:
-        return min(candidates, key=lambda c: abs(len(_normalize_surface_component(c["text"])) - len(key)))
-    return None
-
-
-def _add_relation_unique(relations, source, relation, target, rel_type="direct"):
-    if not source or not target or source == target:
-        return
-    key = (source, relation, target)
-    if not any((r.get("source"), r.get("relation"), r.get("target")) == key for r in relations):
-        relations.append({
-            "source": source,
-            "relation": relation,
-            "target": target,
-            "type": rel_type,
-        })
-
-
-def _remove_relation_if(relations, predicate):
-    return [r for r in relations if not predicate(r)]
-
-
-def _correct_patent_claim_relations(text, components, relations):
-    """
-    長い日本語特許請求項でGiNZAの係り受けが崩れやすい典型構文を、
-    表面上の請求項構造に基づいて控えめに補正する。
-
-    重要なのは「全部を正規表現で解析し直す」のではなく、GiNZAが抽出した
-    構成要素を必ず照合先として使い、明確な特許請求項パターンだけを追加・修正
-    することである。特に、
-      ・AのBに配置されたC
-      ・AはB、CおよびDを含む
-      ・AはBを有する
-      ・AはBとCとの間に位置する
-    を対象にする。
-    """
-    corrected = [dict(r) for r in relations]
-
-    # ------------------------------------------------------------
-    # 1. 「Aは、B、CおよびDを含み／有し／備え」
-    #    係り受けが長くても、所有者と列挙された構成要素を確定する。
-    # ------------------------------------------------------------
-    containment_pattern = re.compile(
-        rf"(?P<owner>(?:前記|該)?[^、。\n]{{1,80}}?)(?:は|が)[、\s]*"
-        rf"(?P<items>[^。\n]{{1,220}}?)を(?P<verb>{_CONTAINMENT_VERB_RE}|含(?:む|み))"
-    )
-    for m in containment_pattern.finditer(text):
-        owner = _component_by_surface(components, m.group("owner"))
-        if owner is None:
-            continue
-        items_text = m.group("items")
-        # 「少なくとも１つの」等は構成要素名の照合時にGiNZA側のノードへ寄せる。
-        parts = [x.strip() for x in re.split(r"、|，|及び|および|並びに|ならびに|と", items_text) if x.strip()]
-        matched = []
-        for part in parts:
-            c = _component_by_surface(components, part)
-            if c is not None and c["text"] != owner["text"] and c not in matched:
-                matched.append(c)
-        # 2項以上の列挙、または単独項目でも完全に照合できた場合のみ追加。
-        if len(matched) >= 2 or (len(parts) == 1 and len(matched) == 1):
-            label = "含む" if m.group("verb").startswith("含") else "有する"
-            for c in matched:
-                _add_relation_unique(corrected, owner["text"], label, c["text"], "has")
-
-    # ------------------------------------------------------------
-    # 2. 「AのBに配置されたC」
-    #    例：放熱装置の主面に配置された取り付けフレーム
-    #    「主面」を独立ノードにするのではなく、C→A の配置関係にする。
-    # ------------------------------------------------------------
-    placement_pattern = re.compile(
-        r"(?P<owner>(?:前記|該)?[^、。\n]{1,50}?)の"
-        r"(?P<place>[^、。\n]{1,30}?)に配置(?:された|されている|される|され)"
-        r"(?:少なくとも\s*)?(?:[０-９0-9一二三四五六七八九十]+つの)?"
-        r"(?P<subject>[^、。\n]{1,50}?)(?=と、|と\s|、|。|を|は|が|\n|$)"
-    )
-    for m in placement_pattern.finditer(text):
-        owner = _component_by_surface(components, m.group("owner"))
-        subject = _component_by_surface(components, m.group("subject"))
-        if owner is None or subject is None or owner["text"] == subject["text"]:
-            continue
-        # 既存の「配置」を一律に消さず、明らかに「主面」等の中間位置語を
-        # source/targetにしている誤りだけを除去する。
-        owner_text = owner["text"]
-        subject_text = subject["text"]
-        corrected = _remove_relation_if(
-            corrected,
-            lambda r: (
-                r.get("relation", "").startswith("配置")
-                and r.get("source") not in {subject_text, owner_text}
-                and r.get("target") not in {subject_text, owner_text}
-            )
-        )
-        _add_relation_unique(corrected, subject_text, "配置", owner_text, "positional")
-
-    # ------------------------------------------------------------
-    # 3. 「Aは、Bと、Cとの間に位置する」
-    #    今回の誤りの中心。位置する主体は「A」であり、B/C側ではない。
-    #    Bが「正側端子、負側端子および出力端子」のような列挙なら全て拾う。
-    # ------------------------------------------------------------
-    between_pattern = re.compile(
-        r"(?P<subject>(?:前記|該)?[^、。\n]{1,70}?)(?:は|が)[、\s]*"
-        r"(?P<middle>[^。\n]{1,260}?)"
-        r"(?P<right>(?:前記|該)?[^、。\n]{1,60}?)との間に"
-        r"(?:位置する|位置している|位置される|設けられる|設けられた)"
-    )
-    for m in between_pattern.finditer(text):
-        subject = _component_by_surface(components, m.group("subject"))
-        right = _component_by_surface(components, m.group("right"))
-        if subject is None:
-            continue
-
-        # 「Xと、Yとの間に」の左側を、列挙語で分割して構成要素へ照合する。
-        middle = m.group("middle").strip(" 、，")
-        left_text = re.sub(
-            rf"(?:前記|該)?{re.escape(m.group('right').strip())}$", "", middle
-        ).strip(" 、，")
-        left_parts = [
-            x.strip(" 、，")
-            for x in re.split(r"、|，|及び|および|並びに|ならびに|と", left_text)
-            if x.strip(" 、，")
-        ]
-        left_components = []
-        for part in left_parts:
-            c = _component_by_surface(components, part)
-            if c is not None and c["text"] != subject["text"] and c not in left_components:
-                left_components.append(c)
-
-        targets = left_components[:]
-        if right is not None and right["text"] != subject["text"] and right not in targets:
-            targets.append(right)
-        if not targets:
-            continue
-
-        # この節については、GiNZAが逆向きに作った「間」関係を全て除去し、
-        # 文法上の主語（subject）からの関係だけを残す。
-        target_names = {c["text"] for c in targets}
-        corrected = _remove_relation_if(
-            corrected,
-            lambda r: (
-                "間" in r.get("relation", "")
-                and (
-                    r.get("source") in target_names
-                    or r.get("target") in target_names
-                    or r.get("source") != subject["text"]
-                )
-            )
-        )
-        for target in targets:
-            _add_relation_unique(
-                corrected, subject["text"], "間に位置する", target["text"], "positional"
-            )
-
-    # ------------------------------------------------------------
-    # 4. 「Aは、BによりCに対して位置決めされている」
-    #    「により」は手段なので、A→Cの位置決めを優先する。
-    # ------------------------------------------------------------
-    positioning_pattern = re.compile(
-        r"(?P<subject>(?:前記|該)?[^、。\n]{1,70}?)(?:は|が)[、\s]*"
-        r"(?:[^、。\n]{1,50}?)により"
-        r"(?P<target>(?:前記|該)?[^、。\n]{1,50}?)に対して位置決めされ(?:て|る|た)?"
-    )
-    for m in positioning_pattern.finditer(text):
-        subject = _component_by_surface(components, m.group("subject"))
-        target = _component_by_surface(components, m.group("target"))
-        if subject is not None and target is not None and subject["text"] != target["text"]:
-            _add_relation_unique(corrected, subject["text"], "位置決めされる", target["text"], "direct")
-
-    # ------------------------------------------------------------
-    # 5. 「AのB」だけで誤って生成された「間」関係を、今回の明確な
-    #    「Xは…との間に位置する」節以外には触らない。
-    #    ここでは新しい推測を行わない。
-    # ------------------------------------------------------------
-
-    # 数量語・位置語が誤って構成要素化されていた場合の最終防波堤。
-    bad_nodes = {"少なく", "少なくとも", "少ない", "多く", "多くとも", "主面"}
-    corrected = [
-        r for r in corrected
-        if r.get("source") not in bad_nodes and r.get("target") not in bad_nodes
-    ]
-
-    # 最終重複除去
-    unique = []
-    seen = set()
-    for r in corrected:
-        key = (r.get("source"), r.get("relation"), r.get("target"))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(r)
-    return unique
-
-
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
@@ -2457,19 +2162,12 @@ def _extract_raw_relations(text):
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
-    final_relations = _add_enumerated_containment_relations(text, final_relations)
     return components, final_relations, doc
 
 
 def analyze_claim(text):
-    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す。"""
+    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
     components, final_relations, doc = _extract_raw_relations(text)
-
-    # GiNZAの係り受けが長文特許で崩れた場合に、明確な特許定型構文だけを
-    # 表面構造から補正する。LLMは使用しない。
-    final_relations = _correct_patent_claim_relations(
-        _clean_claim_text(text), components, final_relations
-    )
     final_relations = _simplify_hierarchy(final_relations, doc, components)
     return components, final_relations
 
@@ -2725,75 +2423,14 @@ _DEEPSEA_PALETTE = [
 _DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
 
 
-def _containment_forest(final_relations):
-    """`type == "has"` だけから、描画専用の包含森林を作る。
-
-    SAOのグラフでは1つの要素に複数の「有する」辺が入る場合があるが、
-    Graphvizのclusterは1ノードを複数の箱に入れられない。そのため、ここでは
-    最初に得られた親を採用して「表示用の親」を一意にする。採用されなかった
-    有する辺は、後段で通常の補助辺として残すので情報は失わない。
+def build_graphviz(final_relations, title=None, theme="deepsea"):
     """
-    nodes = set()
-    has_edges = []
-    for r in final_relations:
-        nodes.add(r["source"])
-        nodes.add(r["target"])
-        if r.get("type") == "has" and r["source"] != r["target"]:
-            has_edges.append((r["source"], r["target"]))
+    analyze_claim()等が返した関係リストを、Graphvizのdotエンジンで
+    階層型に自動レイアウトしたグラフとして組み立てる。
 
-    # 同じ子に対する候補親を一旦すべて保持する。請求項の長文では
-    # 「装置→全要素」という粗い辺と「モジュール→端子」という具体的な辺が
-    # 共存しうるため、単に最初の辺を採るとフラットな図に逆戻りする。
-    candidates = {node: [] for node in nodes}
-    out_degree = {node: 0 for node in nodes}
-    has_targets = set()
-    for source, target in has_edges:
-        candidates[target].append(source)
-        out_degree[source] += 1
-        has_targets.add(target)
-
-    parent = {}
-    children = {node: [] for node in nodes}
-    # 他の包含関係の子になっている親ほど、全体装置より具体的な親である
-    # 可能性が高い。これを優先して「IPM→端子」より
-    # 「パワー半導体モジュール→端子」を選ぶ。
-    for target in sorted(
-        (node for node, sources in candidates.items() if sources),
-        key=lambda node: (len(candidates[node]), node),
-    ):
-        parent_options = sorted(
-            candidates[target],
-            key=lambda source: (source in has_targets, out_degree[source], source),
-            reverse=True,
-        )
-        source = parent_options[0]
-        # 自己参照と循環を避け、clusterに必要な木構造だけを採用する。
-        cursor = source
-        makes_cycle = False
-        while cursor in parent:
-            cursor = parent[cursor]
-            if cursor == target:
-                makes_cycle = True
-                break
-        if target not in parent and not makes_cycle:
-            parent[target] = source
-            children[source].append(target)
-
-    roots = [node for node in nodes if node not in parent]
-    return nodes, parent, children, roots
-
-
-def build_graphviz(final_relations, title=None, theme="deepsea", nested=True):
-    """関係をGraphvizで描画する。
-
-    ``nested=True``（既定）では、`type == "has"` の関係を実際の入れ子の
-    clusterとして描画する。一方、接続・配置・位置決め・属性などは親子では
-    ないため、clusterをまたぐ破線の補助辺として描く。この分離により、
-    「構成の内部関係」と「構成間の横断関係」を同一図内で区別できる。
-
-    Streamlitでは従来どおり ``st.graphviz_chart(build_graphviz(relations))``
-    として利用できる。旧来のフラット表示が必要なときだけ
-    ``nested=False`` を指定する。
+    戻り値は graphviz.Digraph オブジェクト。
+    Jupyter/Colabではそのまま表示でき、Streamlitでは
+    st.graphviz_chart(戻り値) でそのまま描画できる。
     """
     import graphviz
 
@@ -2805,84 +2442,49 @@ def build_graphviz(final_relations, title=None, theme="deepsea", nested=True):
 
     g = graphviz.Digraph(engine="dot")
     g.attr(
-        rankdir="LR", splines="spline", nodesep="0.35", ranksep="0.95",
-        compound="true", newrank="true", bgcolor="transparent",
+        rankdir="LR", splines="spline", nodesep="0.25", ranksep="0.85",
+        bgcolor="transparent",
     )
     if title:
         g.attr(label=title, labelloc="t", fontsize="20",
                fontname="IPAexGothic",
                fontcolor="#E8FBFF" if theme == "deepsea" else "#233044")
-    if len(G.nodes) == 0:
+
+    if len(G.nodes()) == 0:
         return g
 
-    node_styles, root = _assign_branch_colors(G)
+    node_styles, _root = _assign_branch_colors(G)
+
     palette = _DEEPSEA_PALETTE if theme == "deepsea" else _BRANCH_PALETTE
     root_style = _DEEPSEA_ROOT if theme == "deepsea" else _ROOT_STYLE
-    cluster_border = "#2F7891" if theme == "deepsea" else "#9BBBC8"
-    cross_edge = "#F0C96A" if theme == "deepsea" else "#A66D00"
 
-    def style_for(node):
-        style = node_styles.get(node)
-        if style is _ROOT_STYLE:
+    def _style_for(n):
+        s = node_styles.get(n)
+        if s is _ROOT_STYLE:
             return root_style
-        if style in _BRANCH_PALETTE:
-            return palette[_BRANCH_PALETTE.index(style)]
+        if s in _BRANCH_PALETTE:
+            return palette[_BRANCH_PALETTE.index(s)]
         return palette[0]
-
-    def node_id(node):
-        # 日本語ラベル・記号をDOTのIDに直接使わず、IDと表示名を分離する。
-        return "node_" + str(node_index[node])
 
     g.attr("node", shape="box", style="rounded,filled", fontname="IPAexGothic",
            fontsize="12", margin="0.18,0.1", penwidth="1.8")
-    g.attr("edge", fontname="IPAexGothic", fontsize="10", penwidth="1.5")
+    g.attr("edge", fontname="IPAexGothic", fontsize="10", penwidth="1.6")
 
-    nodes, parent, children, roots = _containment_forest(final_relations)
-    ordered_nodes = list(G.nodes())
-    node_index = {node: i for i, node in enumerate(ordered_nodes)}
+    added = set()
+    for n in G.nodes():
+        style = _style_for(n)
+        g.node(
+            n,
+            fillcolor=style["fill"],
+            color=style["border"],
+            fontcolor=style["font"],
+        )
+        added.add(n)
 
-    def add_node(container, node):
-        style = style_for(node)
-        container.node(node_id(node), label=node, fillcolor=style["fill"],
-                       color=style["border"], fontcolor=style["font"])
-
-    def add_cluster(container, node, ancestors=frozenset()):
-        # 子を持つ構成要素だけをclusterにする。葉は通常ノードのままにして、
-        # 無意味に箱を増やさない。
-        if not children.get(node) or node in ancestors:
-            add_node(container, node)
-            return
-        cluster = graphviz.Digraph(name="cluster_" + str(node_index[node]))
-        cluster.attr(label="包含：" + node, labelloc="t", labeljust="l",
-                     fontname="IPAexGothic", fontsize="11", fontcolor=cluster_border,
-                     color=cluster_border, penwidth="1.4", style="rounded,dashed",
-                     margin="14")
-        add_node(cluster, node)
-        for child in children[node]:
-            add_cluster(cluster, child, ancestors | {node})
-        container.subgraph(cluster)
-
-    if nested:
-        for top in roots:
-            add_cluster(g, top)
-    else:
-        for node in ordered_nodes:
-            add_node(g, node)
-
-    selected_has = {(source, target) for target, source in parent.items()}
-    for u, v, data in G.edges(data=True):
-        relation_type = data.get("type")
-        is_tree_edge = relation_type == "has" and (u, v) in selected_has
-        color = style_for(v)["border"] if is_tree_edge else cross_edge
-        edge_kwargs = {
-            "label": "→ " + data.get("relation", "関係"),
-            "color": color,
-            "fontcolor": color if theme == "deepsea" else "#445566",
-        }
-        if not is_tree_edge:
-            # 横断関係を階層配置の制約から外し、親子構造を崩さない。
-            edge_kwargs.update({"style": "dashed", "constraint": "false", "penwidth": "1.25"})
-        g.edge(node_id(u), node_id(v), **edge_kwargs)
+    for u, v, d in G.edges(data=True):
+        line_style = _style_for(v)
+        g.edge(u, v, label="→ " + d["relation"], color=line_style["border"],
+               fontcolor=line_style["border"] if theme == "deepsea" else "#445566")
 
     return g
 
