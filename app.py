@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import patent_pipeline_sao_preprocessed as pp
+import patent_pipeline as pp
 
 st.set_page_config(page_title='日本語特許SAO分析', page_icon='🪼', layout='wide')
 
