@@ -3949,6 +3949,165 @@ def evaluate_corpus_health(records, analyze_fn=None, progress_callback=None):
 
 
 # ============================================================
+# 正解SAO（ゴールドラベル）との比較
+# ============================================================
+# evaluate_corpus_health() は「構造として壊れていないか」しか見ないため、
+# 実際に意味的に正しいかどうかは分からない。そこで、代表的な請求項を
+# 手作業で読んで作った正解SAO（gold_sao.csv 等）と突き合わせ、
+# 本来の意味での適合率(precision)・再現率(recall)・F値を計算する。
+
+# 「接続され」「接続される」「接続した」のように、態・時制の違いだけで
+# 意味は同じ関係語を同一視するため、末尾の活用語尾を取り除いて
+# 「関係の芯」を取り出す。
+_VERB_TAIL_SUFFIXES = sorted(
+    [
+        "されている", "されており", "されていた", "される", "された", "され",
+        "している", "しており", "していた", "する", "した", "して", "し",
+        "られている", "られており", "られる", "られた", "られ",
+        "を有する", "を備える", "を含む",
+    ],
+    key=len,
+    reverse=True,
+)
+
+
+def _relation_core(text):
+    """関係テキストから活用語尾を取り除いた「芯」の部分を返す。"""
+    t = text.strip()
+    for suf in _VERB_TAIL_SUFFIXES:
+        if t.endswith(suf) and len(t) > len(suf):
+            return t[: -len(suf)]
+    return t
+
+
+def _relation_matches(gold_relation, extracted_relation):
+    """
+    2つの関係テキストが実質的に同じ関係を指しているとみなせるかどうか。
+    活用語尾を取り除いた「芯」同士が、どちらかの部分文字列になっていれば
+    一致とみなす（"接続" と "接続され" は一致、"検出" と "出力" は不一致）。
+    """
+    g = _relation_core(gold_relation)
+    e = _relation_core(extracted_relation)
+    if not g or not e:
+        return gold_relation == extracted_relation
+    return g in e or e in g
+
+
+def _node_matches(gold_node, extracted_node):
+    """
+    2つの構成要素名が実質的に同じ対象を指しているとみなせるかどうか。
+    前処理で行っている正規化（前記・該の除去）を適用したうえで、
+    完全一致、またはどちらかがどちらかを包含していれば一致とみなす
+    （"放熱装置の主面" と "主面" のような粒度の違いを許容するため）。
+    """
+    g = _normalize_component_text(gold_node.strip())
+    e = _normalize_component_text(extracted_node.strip())
+    if not g or not e:
+        return g == e
+    return g == e or g in e or e in g
+
+
+def _triple_matches(gold_triple, extracted_triple):
+    """
+    正解の1トリプルと、抽出された1トリプルが一致するとみなせるかどうか。
+    向き（source/target）はこちらの正解データの書き方と実装側の主語・目的語の
+    向きの流儀が食い違う場合があるため、順方向・逆方向どちらでも一致を認める
+    （構造として同じ2者間の関係を捉えられているかどうかを重視するため）。
+    """
+    gs, gr, gt = gold_triple
+    es, er, et = extracted_triple
+    if not _relation_matches(gr, er):
+        return False
+    forward = _node_matches(gs, es) and _node_matches(gt, et)
+    backward = _node_matches(gs, et) and _node_matches(gt, es)
+    return forward or backward
+
+
+def compare_with_gold(gold_by_claim, texts_by_claim, analyze_fn=None, progress_callback=None):
+    """
+    正解SAO（gold_by_claim: {claim_id: [(source, relation, target), ...]}）と、
+    実際にanalyze_fnで解析した結果を突き合わせて、請求項ごと・全体の
+    適合率(precision)・再現率(recall)・F値を計算する。
+
+    texts_by_claim: {claim_id: 請求項本文} （gold_by_claimと同じclaim_idで引く）
+    戻り値: (per_claim結果のリスト, 全体サマリーの辞書)
+    """
+    if analyze_fn is None:
+        analyze_fn = analyze_claim
+
+    per_claim = []
+    claim_ids = list(gold_by_claim.keys())
+    for idx, claim_id in enumerate(claim_ids):
+        gold_triples = gold_by_claim[claim_id]
+        text = texts_by_claim.get(claim_id, "")
+        row = {"claim_id": claim_id, "n_gold": len(gold_triples)}
+        if not text:
+            row.update({"error": "対応する請求項本文が見つかりません", "n_extracted": 0,
+                        "n_matched": 0, "precision": 0.0, "recall": 0.0, "f1": 0.0})
+            per_claim.append(row)
+            continue
+        try:
+            components, relations = analyze_fn(text)
+            extracted_triples = [(r["source"], r["relation"], r["target"]) for r in relations]
+
+            matched_gold = set()
+            matched_extracted = set()
+            for gi, g in enumerate(gold_triples):
+                for ei, e in enumerate(extracted_triples):
+                    if ei in matched_extracted:
+                        continue
+                    if _triple_matches(g, e):
+                        matched_gold.add(gi)
+                        matched_extracted.add(ei)
+                        break
+
+            n_gold = len(gold_triples)
+            n_extracted = len(extracted_triples)
+            n_matched = len(matched_gold)
+            precision = (n_matched / n_extracted) if n_extracted else 0.0
+            recall = (n_matched / n_gold) if n_gold else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+            row.update({
+                "n_extracted": n_extracted,
+                "n_matched": n_matched,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "error": None,
+                "missed_gold": [g for gi, g in enumerate(gold_triples) if gi not in matched_gold],
+                "extra_extracted": [e for ei, e in enumerate(extracted_triples) if ei not in matched_extracted],
+            })
+        except Exception as e:
+            row.update({"error": str(e), "n_extracted": 0, "n_matched": 0,
+                        "precision": 0.0, "recall": 0.0, "f1": 0.0})
+        per_claim.append(row)
+        if progress_callback:
+            progress_callback(idx + 1, len(claim_ids))
+
+    total_gold = sum(r["n_gold"] for r in per_claim)
+    total_extracted = sum(r["n_extracted"] for r in per_claim)
+    total_matched = sum(r["n_matched"] for r in per_claim)
+    overall_precision = (total_matched / total_extracted) if total_extracted else 0.0
+    overall_recall = (total_matched / total_gold) if total_gold else 0.0
+    overall_f1 = (
+        2 * overall_precision * overall_recall / (overall_precision + overall_recall)
+        if (overall_precision + overall_recall) else 0.0
+    )
+    summary = {
+        "n_claims": len(per_claim),
+        "total_gold": total_gold,
+        "total_extracted": total_extracted,
+        "total_matched": total_matched,
+        "precision": overall_precision,
+        "recall": overall_recall,
+        "f1": overall_f1,
+        "avg_f1_per_claim": (sum(r["f1"] for r in per_claim) / len(per_claim)) if per_claim else 0.0,
+    }
+    return per_claim, summary
+
+
+# ============================================================
 # 解析エントリポイント（LLM不使用：GiNZA + SudachiPy前処理のみ）
 # ============================================================
 # このパイプラインはLLMを一切使用しない。

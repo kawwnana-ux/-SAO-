@@ -32,6 +32,10 @@ if "eval_results" not in st.session_state:
     st.session_state.eval_results = None
 if "eval_summary" not in st.session_state:
     st.session_state.eval_summary = None
+if "gold_per_claim" not in st.session_state:
+    st.session_state.gold_per_claim = None
+if "gold_summary" not in st.session_state:
+    st.session_state.gold_summary = None
 
 
 # --- 背景画像をBase64に変換してCSSに埋め込む関数 ---
@@ -1044,3 +1048,102 @@ with tab6:
             file_name="claim_health_check_results.csv",
             mime="text/csv",
         )
+
+    st.divider()
+    st.markdown("### 🏅 正解SAO（手作業で作成した20件）との比較")
+    st.caption(
+        "532件全部の正解データは人手では作れないため、パターンの幅が"
+        "出るように選んだ代表20件について、実際に読んで正解のSAOトリプルを"
+        "手作業で作成しました。それと実際の抽出結果を突き合わせて、"
+        "適合率(precision)・再現率(recall)・F値を計算します。"
+    )
+
+    gold_csv_upload = st.file_uploader(
+        "📁 gold_sao.csv をアップロード", type=["csv"], key="gold_sao_upload"
+    )
+    gold_text_csv_upload = st.file_uploader(
+        "📁 gold_sample_claims.csv をアップロード（正解データに対応する請求項本文）",
+        type=["csv"],
+        key="gold_text_upload",
+    )
+
+    if st.button("🏅 正解SAOと比較する", type="primary", key="gold_compare_run"):
+        if gold_csv_upload is None or gold_text_csv_upload is None:
+            st.warning("gold_sao.csv と gold_sample_claims.csv の両方をアップロードしてください。")
+        else:
+            try:
+                gold_df = pd.read_csv(gold_csv_upload)
+                text_df = pd.read_csv(gold_text_csv_upload)
+
+                gold_by_claim = {}
+                for _, row in gold_df.iterrows():
+                    gold_by_claim.setdefault(row["claim_id"], []).append(
+                        (row["source"], row["relation"], row["target"])
+                    )
+                texts_by_claim = dict(zip(text_df["claim_id"], text_df["請求項本文"]))
+
+                gold_progress = st.progress(0, text="0/0件")
+
+                def _on_gold_progress(done, total):
+                    gold_progress.progress(done / total if total else 0, text=f"{done}/{total}件")
+
+                with st.spinner("解析＆正解データとの突き合わせ中..."):
+                    per_claim, gold_summary = pp.compare_with_gold(
+                        gold_by_claim, texts_by_claim, progress_callback=_on_gold_progress
+                    )
+                gold_progress.empty()
+
+                st.session_state.gold_per_claim = per_claim
+                st.session_state.gold_summary = gold_summary
+            except Exception as e:
+                st.error(f"比較中にエラーが発生しました: {e}")
+
+    if st.session_state.get("gold_summary") is not None:
+        gsum = st.session_state.gold_summary
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("適合率 (Precision)", f"{gsum['precision']*100:.1f}%")
+        g2.metric("再現率 (Recall)", f"{gsum['recall']*100:.1f}%")
+        g3.metric("F値", f"{gsum['f1']*100:.1f}%")
+        g4.metric("検証請求項数", f"{gsum['n_claims']}件")
+
+        if gsum["f1"] * 100 >= 90:
+            st.success(f"🎉 F値が目標の90%以上です（{gsum['f1']*100:.1f}%）。")
+        else:
+            st.warning(
+                f"⚠️ F値はまだ90%に届いていません（{gsum['f1']*100:.1f}%）。"
+                "下の請求項ごとの内訳で、どこで取りこぼしや誤抽出が"
+                "多いか確認してください。"
+            )
+
+        gold_rows = []
+        for r in st.session_state.gold_per_claim:
+            gold_rows.append({
+                "claim_id": r["claim_id"],
+                "正解数": r["n_gold"],
+                "抽出数": r["n_extracted"],
+                "一致数": r["n_matched"],
+                "precision": round(r["precision"], 3),
+                "recall": round(r["recall"], 3),
+                "f1": round(r["f1"], 3),
+                "error": r.get("error"),
+            })
+        gold_result_df = pd.DataFrame(gold_rows)
+        st.markdown("#### 請求項ごとの内訳")
+        st.dataframe(gold_result_df, use_container_width=True, hide_index=True)
+
+        claim_options = [r["claim_id"] for r in st.session_state.gold_per_claim]
+        picked = st.selectbox("取りこぼし・誤抽出を見る請求項を選択", claim_options, key="gold_pick_claim")
+        picked_row = next(r for r in st.session_state.gold_per_claim if r["claim_id"] == picked)
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            st.markdown("**❌ 取りこぼした正解（missed_gold）**")
+            st.dataframe(
+                pd.DataFrame(picked_row.get("missed_gold", []), columns=["source", "relation", "target"]),
+                use_container_width=True, hide_index=True,
+            )
+        with col_g2:
+            st.markdown("**➕ 正解にない抽出（extra_extracted）**")
+            st.dataframe(
+                pd.DataFrame(picked_row.get("extra_extracted", []), columns=["source", "relation", "target"]),
+                use_container_width=True, hide_index=True,
+            )
