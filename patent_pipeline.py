@@ -2332,7 +2332,177 @@ def _simplify_hierarchy(relations, doc=None, components=None):
 # ⑦ パイプライン本体：請求項テキスト → 構成要素・関係（単文形式）
 # ============================================================
 
-def _clean_claim_text(text):
+# ============================================================
+# 研究用前処理：読点挿入 → 係り受け解析 → 語順整序
+# ============================================================
+#
+# ここはユーザーがルールを追加・変更できるように独立させている。
+# 目的は「原文を書き換えて意味を変える」ことではなく、GiNZAが
+# 長い特許請求項を解析しやすい形に整えること。
+#
+# 処理順：
+#   1. SudachiPyによる表記ゆれ正規化
+#   2. 第1回GiNZA係り受け解析
+#   3. 係り受けを手掛かりにした安全な読点挿入
+#   4. 第2回GiNZA係り受け解析
+#   5. 係り受けを手掛かりにした限定的な語順整序
+#   6. 第3回GiNZA係り受け解析
+#   7. SAO抽出
+#
+# 「語順整序」は非常に強い処理なので、初期状態では安全なケースだけ
+# を対象にする。新しい規則は PREPROCESS_CONFIG に追加できる。
+
+PREPROCESS_CONFIG = {
+    "insert_comma": True,
+    "reorder": True,
+    "max_clause_chars": 45,
+    # 読点を入れてよい接続・請求項表現。
+    "comma_before_patterns": [
+        "前記",
+        "該",
+        "当該",
+        "ただし",
+    ],
+    # 一つの限定節が長くなった場合に、次の請求項構造の前で区切る。
+    "comma_before_predicates": [
+        "を備え",
+        "を有し",
+        "を含み",
+        "を具備し",
+    ],
+    # 語順整序の対象にする「後置修飾」の最小条件。
+    # 例：
+    #   「配置された前記フレーム」
+    # のような形を、解析上「前記フレーム」を先に確認できるようにする。
+    # 原文そのものを大きく入れ替える規則はここには入れない。
+    "reorder_postmodifier": True,
+}
+
+
+def _previous_boundary(text, pos):
+    """posより前にある直近の文境界位置を返す。"""
+    boundaries = [text.rfind(x, 0, pos) for x in ("、", "。", "\n", "；", ";")]
+    return max(boundaries) if boundaries else -1
+
+
+def insert_patent_commas(text, config=None):
+    """長い請求項に対して、特許構造を壊しにくい読点を補う。"""
+    cfg = config or PREPROCESS_CONFIG
+    if not cfg.get("insert_comma") or not text:
+        return text
+
+    out = text
+    max_len = int(cfg.get("max_clause_chars", 45))
+
+    # 「前記」「該」「当該」が長い節の途中に突然現れる場合だけ区切る。
+    # すでに読点直後なら何もしない。
+    for pat in cfg.get("comma_before_patterns", []):
+        pattern = re.compile(rf"(?<=[^、。\n])({re.escape(pat)})")
+        pieces = []
+        last = 0
+        for m in pattern.finditer(out):
+            boundary = _previous_boundary(out, m.start())
+            distance = m.start() - boundary - 1
+            if distance >= max_len and m.start() > 0 and out[m.start()-1] not in "、。\n":
+                pieces.append(out[last:m.start()])
+                pieces.append("、")
+                pieces.append(out[m.start():m.end()])
+                last = m.end()
+        if pieces:
+            pieces.append(out[last:])
+            out = "".join(pieces)
+
+    # 「長い節＋備え/有し/含み」の直前に読点がない場合だけ補う。
+    for pat in cfg.get("comma_before_predicates", []):
+        pattern = re.compile(rf"(?<=[^、。\n])({re.escape(pat)})")
+        out = pattern.sub(lambda m: ("、" + m.group(1))
+                          if (m.start() - _previous_boundary(out, m.start()) - 1) >= max_len
+                          else m.group(1), out)
+
+    # 連続した読点は1つにする。
+    out = re.sub(r"、{2,}", "、", out)
+    return out
+
+
+def _dependency_order_hint(doc):
+    """
+    GiNZAの係り受けから「後置修飾」を検出する。
+    現段階では文字列の大規模な入れ替えは行わず、後述の安全な
+    語順整序に利用するためのヒントだけを返す。
+    """
+    hints = []
+    for token in doc:
+        if token.head is token:
+            continue
+        if token.i < token.head.i:
+            continue
+        # 名詞句が後ろから前の名詞を修飾するケースを候補化。
+        if token.pos_ in {"NOUN", "PROPN"} and token.head.pos_ in {"NOUN", "PROPN"}:
+            if token.dep_ in {"compound", "nmod", "amod"}:
+                hints.append((token.i, token.head.i, token.text))
+    return hints
+
+
+def reorder_patent_sentence(text, doc, config=None):
+    """
+    係り受けを利用した限定的な語順整序。
+
+    特許文の語順を無理に変更するとSAOの正解そのものを壊すため、
+    初期版では「位置決め」「配置」「設置」などの技術関係表現について
+    語順変更を行わない。ここでは、GiNZAの解析結果を保存し、後続の
+    SAO補正が参照できる解析上の順序情報を返す。
+
+    戻り値は (text, hints) で、textは原則として同一である。
+    これにより研究では「語順整序をON/OFFして比較する」ことができる。
+    """
+    cfg = config or PREPROCESS_CONFIG
+    hints = _dependency_order_hint(doc)
+    if not cfg.get("reorder") or not cfg.get("reorder_postmodifier"):
+        return text, hints
+
+    # 安全性優先：現段階では原文の文字列順を変更しない。
+    # hintsをSAO補正側に渡すことで、将来的に個別規則を追加できる。
+    return text, hints
+
+
+def preprocess_for_sao(text, config=None):
+    """
+    SAO抽出用の前処理を一括実行する。
+
+    戻り値：
+      {
+        "original": 原文,
+        "normalized": SudachiPy正規化後,
+        "punctuated": 読点挿入後,
+        "reordered": 語順整序後,
+        "doc_initial": 第1回係り受け解析,
+        "doc": 最終係り受け解析,
+        "order_hints": 語順整序ヒント
+      }
+    """
+    cfg = config or PREPROCESS_CONFIG
+    original = text or ""
+    normalized = _clean_claim_text_base(original)
+
+    doc_initial = nlp(normalized)
+    punctuated = insert_patent_commas(normalized, cfg)
+    doc_after_comma = nlp(punctuated)
+    reordered, order_hints = reorder_patent_sentence(punctuated, doc_after_comma, cfg)
+    doc_final = nlp(reordered)
+
+    return {
+        "original": original,
+        "normalized": normalized,
+        "punctuated": punctuated,
+        "reordered": reordered,
+        "doc_initial": doc_initial,
+        "doc_after_comma": doc_after_comma,
+        "doc": doc_final,
+        "order_hints": order_hints,
+    }
+
+
+def _clean_claim_text_base(text):
     """
     請求項テキストの前処理。
     ① 前後の余分な空白を取り除く
@@ -2355,15 +2525,19 @@ def _clean_claim_text(text):
     return text
 
 
+def _clean_claim_text(text):
+    """既存API互換用。SudachiPy等の基本前処理だけを返す。"""
+    return _clean_claim_text_base(text)
+
+
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
-    生の抽出結果を返す。1つの完全な請求項ではなく、従属請求項の
-    追加限定文のような「断片」を解析するときに使う
-    （断片だけを見て孤立ノードを無理に根に繋げてしまうのを防ぐため）。
+    生の抽出結果を返す。
     """
-    text = _clean_claim_text(text)
-    doc = nlp(text)
+    prep = preprocess_for_sao(text)
+    text = prep["reordered"]
+    doc = prep["doc"]
     components = extract_patent_components_general(doc)
     relation_words = extract_relation_words_general(doc)
 
