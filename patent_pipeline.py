@@ -1058,184 +1058,6 @@ def extract_positional_relations(doc, components, relation_words):
     return relations
 
 
-
-def extract_patent_special_relations(doc, components):
-    """
-    特許請求項でGiNZAが分割・取り違えしやすい特殊構文を補正する。
-
-    対応する代表例：
-      1) 「Ｘは、Ｙに対して位置決めされている」
-         -> Ｘ --位置決めされる--> Ｙ
-      2) 「Ｘは、ＡとＢとの間に位置する」
-         -> Ｘ --位置する--> ＡとＢとの間
-
-    「位置決め」をGiNZAが「位置」＋「決め」に分割した場合でも、
-    表記上のまとまりを優先して1つの技術関係として復元する。
-    """
-    relations = []
-
-    def component_before(index):
-        candidates = [c for c in components if c["end"] < index]
-        return max(candidates, key=lambda c: c["end"]) if candidates else None
-
-    def component_after(index):
-        candidates = [c for c in components if c["start"] > index]
-        return min(candidates, key=lambda c: c["start"]) if candidates else None
-
-    # --------------------------------------------------------
-    # 1) 「位置決めされている／位置決めされており」
-    # --------------------------------------------------------
-    for i, token in enumerate(doc):
-        if token.text not in ("位置", "位置決め"):
-            continue
-
-        # Sudachi/GiNZAが「位置」「決め」に分割したケースを許容
-        is_positioning = token.text == "位置"
-        end_i = i
-        if i + 1 < len(doc) and doc[i + 1].text in ("決め", "決定"):
-            is_positioning = True
-            end_i = i + 1
-        if not is_positioning:
-            continue
-
-        # 「位置決め」の直後に受身の助動詞が続くケースを中心に採用。
-        following = [doc[j].text for j in range(end_i + 1, min(end_i + 4, len(doc)))]
-        passive_like = any(x in ("れる", "られる", "れ", "られ", "て", "た") for x in following)
-        if not passive_like:
-            continue
-
-        # 「に対して」を位置決め対象として探す
-        taishite_i = None
-        for j in range(end_i - 1, max(-1, end_i - 8), -1):
-            if doc[j].text == "対して":
-                taishite_i = j
-                break
-            if doc[j].text == "に" and j + 1 < len(doc) and doc[j + 1].text in ("対し", "対して"):
-                taishite_i = j
-                break
-
-        if taishite_i is None:
-            # 係り受け上「対し」が分割される場合に備える
-            for j in range(max(0, i - 10), i):
-                if doc[j].text in ("対し", "対して"):
-                    taishite_i = j
-                    break
-        if taishite_i is None:
-            continue
-
-        # 「Ｘは…位置決めされる」のＸは、位置決め語の直前の
-        # 構成要素ではなく、「は」で明示された主語を優先する。
-        source = None
-        for j in range(i - 1, -1, -1):
-            if doc[j].text == "。":
-                break
-            if doc[j].text == "は" and doc[j].dep_ == "case":
-                if j > 0 and doc[j - 1].pos_ == "ADP":
-                    continue
-                head = doc[j].head
-                source = find_component_by_token(components, head.i) or find_referenced_component(components, head)
-                if source is not None:
-                    break
-        if source is None:
-            source = component_before(i)
-
-        target = component_after(taishite_i)
-        if source is None or target is None or source["text"] == target["text"]:
-            continue
-
-        relations.append({
-            "source": source["text"],
-            "relation": "位置決めされる",
-            "target": target["text"],
-            "type": "direct",
-        })
-
-    # --------------------------------------------------------
-    # 2) 「Ｘは、ＡとＢとの間に位置する」
-    # --------------------------------------------------------
-    for verb in doc:
-        if verb.lemma_ != "位置する" or verb.pos_ != "VERB":
-            continue
-
-        # 「間」がこの動詞に係っているか確認
-        between = None
-        for child in verb.children:
-            if child.text == "間" and child.dep_ in ("obl", "nmod", "advmod"):
-                between = child
-                break
-        if between is None:
-            continue
-
-        # 「Ｘは」のXを、動詞より前の裸の「は」から特定
-        source = None
-        for j in range(verb.i - 1, -1, -1):
-            if doc[j].text == "。":
-                break
-            if doc[j].text != "は" or doc[j].dep_ != "case":
-                continue
-            if j > 0 and doc[j - 1].pos_ == "ADP":
-                # 「には」の「は」は主題ではない
-                continue
-            head = doc[j].head
-            source = find_component_by_token(components, head.i) or find_referenced_component(components, head)
-            if source is not None:
-                break
-        if source is None:
-            continue
-
-        # 「間」の前にある対象列を、構造関係のOとしてまとめる。
-        # 例：正側端子、負側端子および出力端子と、放熱装置との間
-        target_tokens = []
-        first_after_source = source["end"] + 1
-        for j in range(first_after_source, between.i):
-            t = doc[j]
-            if t.text in ("前記", "該"):
-                continue
-            if t.text in ("、", ",", "，"):
-                continue
-            target_tokens.append(t.text)
-
-        # 先頭・末尾の助詞的なノイズを軽く除去
-        while target_tokens and target_tokens[0] in ("と", "および", "及び"):
-            target_tokens.pop(0)
-        target_text = "".join(target_tokens).strip()
-        if not target_text:
-            continue
-
-        relations.append({
-            "source": source["text"],
-            "relation": "間に位置する",
-            "target": target_text,
-            "type": "positional",
-        })
-
-    # 重複除去
-    unique = []
-    seen = set()
-    for r in relations:
-        key = (r["source"], r["relation"], r["target"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-    return unique
-
-
-def _is_special_between_position_clause(doc, verb):
-    """「Ｘは…ＡとＢとの間に位置する」の特殊補正対象か判定する。"""
-    if verb.lemma_ != "位置する" or verb.pos_ != "VERB":
-        return False
-    has_between = any(c.text == "間" and c.dep_ in ("obl", "nmod", "advmod") for c in verb.children)
-    if not has_between:
-        return False
-    for j in range(verb.i - 1, -1, -1):
-        if doc[j].text == "。":
-            break
-        if doc[j].text == "は" and doc[j].dep_ == "case":
-            if j > 0 and doc[j - 1].pos_ == "ADP":
-                continue
-            return True
-    return False
-
 # ============================================================
 # ④ 直接関係の抽出（「Aに接続されたB」等）
 # ============================================================
@@ -1786,11 +1608,6 @@ def extract_direct_relations(doc, components):
     for verb in doc:
         if verb.pos_ != "VERB":
             continue
-        # 「位置決め」の「決め」が独立した動詞としてGiNZAに分割された場合、
-        # 汎用直接関係抽出で「決め」を拾うと無関係な文末ノードへ
-        # 誤接続するため、専用の位置決め補正に任せる。
-        if verb.text in ("決め", "決定") and verb.i > 0 and doc[verb.i - 1].text in ("位置", "位置を"):
-            continue
         if verb.lemma_ in HAS_LEMMAS:
             # 「有する」「備える」「具備する」は extract_has_relations /
             # extract_has_location_relations / extract_positional_relations の
@@ -2332,177 +2149,7 @@ def _simplify_hierarchy(relations, doc=None, components=None):
 # ⑦ パイプライン本体：請求項テキスト → 構成要素・関係（単文形式）
 # ============================================================
 
-# ============================================================
-# 研究用前処理：読点挿入 → 係り受け解析 → 語順整序
-# ============================================================
-#
-# ここはユーザーがルールを追加・変更できるように独立させている。
-# 目的は「原文を書き換えて意味を変える」ことではなく、GiNZAが
-# 長い特許請求項を解析しやすい形に整えること。
-#
-# 処理順：
-#   1. SudachiPyによる表記ゆれ正規化
-#   2. 第1回GiNZA係り受け解析
-#   3. 係り受けを手掛かりにした安全な読点挿入
-#   4. 第2回GiNZA係り受け解析
-#   5. 係り受けを手掛かりにした限定的な語順整序
-#   6. 第3回GiNZA係り受け解析
-#   7. SAO抽出
-#
-# 「語順整序」は非常に強い処理なので、初期状態では安全なケースだけ
-# を対象にする。新しい規則は PREPROCESS_CONFIG に追加できる。
-
-PREPROCESS_CONFIG = {
-    "insert_comma": True,
-    "reorder": True,
-    "max_clause_chars": 45,
-    # 読点を入れてよい接続・請求項表現。
-    "comma_before_patterns": [
-        "前記",
-        "該",
-        "当該",
-        "ただし",
-    ],
-    # 一つの限定節が長くなった場合に、次の請求項構造の前で区切る。
-    "comma_before_predicates": [
-        "を備え",
-        "を有し",
-        "を含み",
-        "を具備し",
-    ],
-    # 語順整序の対象にする「後置修飾」の最小条件。
-    # 例：
-    #   「配置された前記フレーム」
-    # のような形を、解析上「前記フレーム」を先に確認できるようにする。
-    # 原文そのものを大きく入れ替える規則はここには入れない。
-    "reorder_postmodifier": True,
-}
-
-
-def _previous_boundary(text, pos):
-    """posより前にある直近の文境界位置を返す。"""
-    boundaries = [text.rfind(x, 0, pos) for x in ("、", "。", "\n", "；", ";")]
-    return max(boundaries) if boundaries else -1
-
-
-def insert_patent_commas(text, config=None):
-    """長い請求項に対して、特許構造を壊しにくい読点を補う。"""
-    cfg = config or PREPROCESS_CONFIG
-    if not cfg.get("insert_comma") or not text:
-        return text
-
-    out = text
-    max_len = int(cfg.get("max_clause_chars", 45))
-
-    # 「前記」「該」「当該」が長い節の途中に突然現れる場合だけ区切る。
-    # すでに読点直後なら何もしない。
-    for pat in cfg.get("comma_before_patterns", []):
-        pattern = re.compile(rf"(?<=[^、。\n])({re.escape(pat)})")
-        pieces = []
-        last = 0
-        for m in pattern.finditer(out):
-            boundary = _previous_boundary(out, m.start())
-            distance = m.start() - boundary - 1
-            if distance >= max_len and m.start() > 0 and out[m.start()-1] not in "、。\n":
-                pieces.append(out[last:m.start()])
-                pieces.append("、")
-                pieces.append(out[m.start():m.end()])
-                last = m.end()
-        if pieces:
-            pieces.append(out[last:])
-            out = "".join(pieces)
-
-    # 「長い節＋備え/有し/含み」の直前に読点がない場合だけ補う。
-    for pat in cfg.get("comma_before_predicates", []):
-        pattern = re.compile(rf"(?<=[^、。\n])({re.escape(pat)})")
-        out = pattern.sub(lambda m: ("、" + m.group(1))
-                          if (m.start() - _previous_boundary(out, m.start()) - 1) >= max_len
-                          else m.group(1), out)
-
-    # 連続した読点は1つにする。
-    out = re.sub(r"、{2,}", "、", out)
-    return out
-
-
-def _dependency_order_hint(doc):
-    """
-    GiNZAの係り受けから「後置修飾」を検出する。
-    現段階では文字列の大規模な入れ替えは行わず、後述の安全な
-    語順整序に利用するためのヒントだけを返す。
-    """
-    hints = []
-    for token in doc:
-        if token.head is token:
-            continue
-        if token.i < token.head.i:
-            continue
-        # 名詞句が後ろから前の名詞を修飾するケースを候補化。
-        if token.pos_ in {"NOUN", "PROPN"} and token.head.pos_ in {"NOUN", "PROPN"}:
-            if token.dep_ in {"compound", "nmod", "amod"}:
-                hints.append((token.i, token.head.i, token.text))
-    return hints
-
-
-def reorder_patent_sentence(text, doc, config=None):
-    """
-    係り受けを利用した限定的な語順整序。
-
-    特許文の語順を無理に変更するとSAOの正解そのものを壊すため、
-    初期版では「位置決め」「配置」「設置」などの技術関係表現について
-    語順変更を行わない。ここでは、GiNZAの解析結果を保存し、後続の
-    SAO補正が参照できる解析上の順序情報を返す。
-
-    戻り値は (text, hints) で、textは原則として同一である。
-    これにより研究では「語順整序をON/OFFして比較する」ことができる。
-    """
-    cfg = config or PREPROCESS_CONFIG
-    hints = _dependency_order_hint(doc)
-    if not cfg.get("reorder") or not cfg.get("reorder_postmodifier"):
-        return text, hints
-
-    # 安全性優先：現段階では原文の文字列順を変更しない。
-    # hintsをSAO補正側に渡すことで、将来的に個別規則を追加できる。
-    return text, hints
-
-
-def preprocess_for_sao(text, config=None):
-    """
-    SAO抽出用の前処理を一括実行する。
-
-    戻り値：
-      {
-        "original": 原文,
-        "normalized": SudachiPy正規化後,
-        "punctuated": 読点挿入後,
-        "reordered": 語順整序後,
-        "doc_initial": 第1回係り受け解析,
-        "doc": 最終係り受け解析,
-        "order_hints": 語順整序ヒント
-      }
-    """
-    cfg = config or PREPROCESS_CONFIG
-    original = text or ""
-    normalized = _clean_claim_text_base(original)
-
-    doc_initial = nlp(normalized)
-    punctuated = insert_patent_commas(normalized, cfg)
-    doc_after_comma = nlp(punctuated)
-    reordered, order_hints = reorder_patent_sentence(punctuated, doc_after_comma, cfg)
-    doc_final = nlp(reordered)
-
-    return {
-        "original": original,
-        "normalized": normalized,
-        "punctuated": punctuated,
-        "reordered": reordered,
-        "doc_initial": doc_initial,
-        "doc_after_comma": doc_after_comma,
-        "doc": doc_final,
-        "order_hints": order_hints,
-    }
-
-
-def _clean_claim_text_base(text):
+def _clean_claim_text(text):
     """
     請求項テキストの前処理。
     ① 前後の余分な空白を取り除く
@@ -2525,33 +2172,19 @@ def _clean_claim_text_base(text):
     return text
 
 
-def _clean_claim_text(text):
-    """既存API互換用。SudachiPy等の基本前処理だけを返す。"""
-    return _clean_claim_text_base(text)
-
-
 def _extract_raw_relations(text):
     """
     「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
-    生の抽出結果を返す。
+    生の抽出結果を返す。1つの完全な請求項ではなく、従属請求項の
+    追加限定文のような「断片」を解析するときに使う
+    （断片だけを見て孤立ノードを無理に根に繋げてしまうのを防ぐため）。
     """
-    prep = preprocess_for_sao(text)
-    text = prep["reordered"]
-    doc = prep["doc"]
+    text = _clean_claim_text(text)
+    doc = nlp(text)
     components = extract_patent_components_general(doc)
     relation_words = extract_relation_words_general(doc)
 
-    special = extract_patent_special_relations(doc, components)
-
     positional = extract_positional_relations(doc, components, relation_words)
-    # 「Ｘは…ＡとＢとの間に位置する」は専用補正で処理するため、
-    # 汎用の位置語抽出が端子側から逆向きの関係を作るのを防ぐ。
-    positional = [
-        r for r in positional
-        if not (r.get("relation") == "間に位置する" and
-                any(_is_special_between_position_clause(doc, v)
-                    for v in doc if v.lemma_ == "位置する"))
-    ]
     location = extract_has_location_relations(doc, components)
     installation = extract_installation_relations(doc, components)
     contact = extract_contact_relations(doc, components)
@@ -2565,7 +2198,7 @@ def _extract_raw_relations(text):
     has = extract_has_relations(doc, components)
 
     final_relations = combine_all_relations(
-        positional + location + installation + boundary + special,
+        positional + location + installation + boundary,
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
