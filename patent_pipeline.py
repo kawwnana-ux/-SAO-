@@ -5,6 +5,24 @@ import ginza
 import ja_ginza
 import networkx as nx
 import matplotlib
+
+# ============================================================
+# デバッグトレース機構
+# ============================================================
+# extract_direct_relations等、分岐が複雑な関数の「どの分岐を通って
+# 何を選んだか」を、実行時にオン/オフできる形で記録する。
+# GiNZAが無い環境では動作確認ができないため、実データで挙動を追う
+# 必要が出た時に使う(app.py側のデバッグ表示から利用する想定)。
+DEBUG_MODE = False
+DEBUG_TRACE = []
+
+
+def _debug_log(**kwargs):
+    """DEBUG_MODEがTrueの時だけ、DEBUG_TRACEに1件記録する。"""
+    if DEBUG_MODE:
+        DEBUG_TRACE.append(kwargs)
+
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
@@ -553,6 +571,60 @@ def extract_relation_words_general(doc):
 # 共通ヘルパー
 # ============================================================
 
+# ============================================================
+# 節（クレーム内の「、」で区切られる意味的なまとまり）単位の分割
+# ============================================================
+# 「決め」「間に位置する」等が、文末の無関係なタイトル名詞に誤って
+# 結びつく問題への対応。原因は、1つの請求項全体を1本の係り受け木として
+# 扱っているため、遠く離れた節同士がacl/advclの連鎖で繋がってしまう
+# ことにある(532件評価＋実際のdepダンプで確認済み)。
+#
+# テキストを事前に「、」で分割するのではなく(それだと「Ａ、Ｂおよび Ｃ」
+# のような列挙まで壊れてしまう)、既存の係り受け解析結果をそのまま使い、
+# 動詞(acl/advcl)を境界として事後的に節ブロックへ分ける。
+
+def _is_clause_boundary_verb(token):
+    """
+    この動詞トークンが、独立した「節」の境界とみなせるかどうかを判定する。
+
+    「位置決めされる」のように、複合動詞が2つのVERBトークンに分かれて
+    おり、片方(例：「位置」)が自身の引数(nsubj/obj/obl等)を一切持たない
+    場合は、単なる複合動詞の片割れとみなし、節の境界としては扱わない
+    （実際のdepダンプで確認：「位置」(100)はacl/advcl先の子を持たない）。
+    """
+    if token.pos_ != "VERB":
+        return False
+    if token.dep_ not in ("acl", "advcl"):
+        return False
+    meaningful_deps = {"nsubj", "obj", "iobj", "obl", "nmod", "advcl", "acl"}
+    return any(c.dep_ in meaningful_deps for c in token.children)
+
+
+def split_into_clause_blocks(doc):
+    """
+    請求項全体のdocを、acl/advclの動詞(_is_clause_boundary_verbがTrueの
+    もの)を境界として、複数の「節ブロック」(start, end)のトークン範囲
+    リストに分割する。
+
+    各ブロックは「直前の境界動詞の次のトークン」から「この境界動詞自身」
+    までの範囲。テキストを再分割・再解析するのではなく、既存の係り受け
+    情報をそのまま使うため、列挙(「Ａ、Ｂおよび Ｃ」)のような、動詞を
+    挟まない「、」はブロックの境界にならない。
+
+    戻り値: [(start, end), ...] のリスト（トークンindex、両端含む）
+    """
+    boundary_indices = sorted(t.i for t in doc if _is_clause_boundary_verb(t))
+    blocks = []
+    prev_end = -1
+    for idx in boundary_indices:
+        if idx > prev_end:
+            blocks.append((prev_end + 1, idx))
+            prev_end = idx
+    if prev_end < len(doc) - 1:
+        blocks.append((prev_end + 1, len(doc) - 1))
+    return blocks
+
+
 def find_component_by_token(components, token_index):
     for c in components:
         if c["start"] <= token_index <= c["end"]:
@@ -1046,36 +1118,6 @@ def extract_positional_relations(doc, components, relation_words):
         if verb.pos_ != "VERB":
             continue
 
-        # 位置語が述語の明示主語を持つ構文では、位置語のnmodを
-        # sourceとして扱わず、明示主語をsourceにする。
-        # 例：Xは AとBとの間に V → X → 間にV → AとBとの間
-        # これにより長距離係り受けで文末の発明名称へ飛ぶ誤抽出を防ぐ。
-        explicit_source = _find_explicit_subject(verb, components)
-        structural_nmods = [c for c in relation_token.children if c.dep_ == "nmod"]
-
-        if explicit_source is not None and len(structural_nmods) >= 1:
-            related = []
-            for child in structural_nmods:
-                for c in collect_enumerated_components(child, components):
-                    if c not in related:
-                        related.append(c)
-            related.sort(key=lambda c: c["start"])
-
-            if len(related) >= 2:
-                right = related[-1]
-                left_items = [c for c in related[:-1] if c["text"] != explicit_source["text"] and c["text"] != right["text"]]
-                if left_items:
-                    label = relation["relation_word"] + "に" + _predicate_phrase(verb)
-                    for left in left_items:
-                        target_text = f"{left['text']}と{right['text']}との{relation['relation_word']}"
-                        relations.append({
-                            "source": explicit_source["text"],
-                            "relation": label,
-                            "target": target_text,
-                            "type": "positional",
-                        })
-                    continue
-
         if verb.lemma_ in HAS_LEMMAS:
             # 「Ａ間に、Ｂを有し」のように「有する」が使われている場合は、
             # 文全体の主語（根っこ）ではなく、「有する」の直接の目的語
@@ -1122,32 +1164,6 @@ def extract_positional_relations(doc, components, relation_words):
 # ============================================================
 # ④ 直接関係の抽出（「Aに接続されたB」等）
 # ============================================================
-
-def _predicate_phrase(verb):
-    """複合述語を、依存関係＋直前の複合語から一般的に復元する。"""
-    parts = []
-
-    # GiNZAが明示的にcompound/fixedと判定した前方要素。
-    for c in verb.children:
-        if c.dep_ in ("compound", "fixed") and c.i < verb.i:
-            parts.append(c)
-
-    # 「位置 + 決め」のように複合動詞側の依存ラベルが崩れた場合の
-    # ローカル補完。直前の名詞/動詞だけを対象にし、格助詞や句読点を
-    # またいで遡らないので、別の構成要素を巻き込まない。
-    if not parts and verb.i > 0:
-        prev = verb.doc[verb.i - 1]
-        if prev.pos_ in ("NOUN", "PROPN", "VERB") and prev.dep_ in ("compound", "fixed", "nmod"):
-            parts.append(prev)
-
-    parts.sort(key=lambda t: t.i)
-    text = "".join(t.text for t in parts) + verb.text
-    aux = "".join(
-        c.text for c in sorted(verb.children, key=lambda t: t.i)
-        if c.pos_ == "AUX" and c.i > verb.i
-    )
-    return text + aux
-
 
 def _is_passive(verb):
     """動詞が受身形（〜られた／〜れた）かどうかを判定する"""
@@ -1730,15 +1746,10 @@ def extract_direct_relations(doc, components):
 
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
-        if _is_passive(verb):
-            # 受身の対象が「に対して／に対する」で明示されている場合は、
-            # GiNZAが付けたheadよりも明示された対象を優先する。
-            # これにより、長い請求項の末尾にある別の構成要素へ
-            # 誤って係るケースを防ぐ。
-            explicit_target = _find_taishite_target(verb, components)
-            if explicit_target is not None:
-                head_component = explicit_target
-                used_fallback = False
+        if head_component is None and _is_passive(verb):
+            # 動詞連鎖の途中で係り先が別の動詞になっている受身動詞は、
+            # 延々と遡るフォールバックの前に「に対して」の対象を確認する。
+            head_component = _find_taishite_target(verb, components)
         if head_component is None:
             # 係り先が構成要素でない場合（別の動詞に連なっている等）は、
             # さらに上まで遡って構成要素を探す
@@ -1746,6 +1757,14 @@ def extract_direct_relations(doc, components):
             head_component = fallback[0] if fallback else None
         if head_component is None:
             continue
+        _debug_log(
+            func="extract_direct_relations",
+            stage="head_component決定",
+            verb_i=verb.i, verb_text=verb.text, verb_lemma=verb.lemma_,
+            is_passive=_is_passive(verb),
+            used_fallback=used_fallback,
+            head_component=head_component["text"] if head_component else None,
+        )
 
         if _is_passive(verb):
             # 受身：headが受け手（target）。「に」で係る語などが動作主（source）。
@@ -1761,6 +1780,15 @@ def extract_direct_relations(doc, components):
                     find_previous_component_by_word(components, child)
                     or find_referenced_component(components, child)
                 )
+                _debug_log(
+                    func="extract_direct_relations",
+                    stage="受身分岐:子トークン処理",
+                    verb_i=verb.i, verb_text=verb.text,
+                    child_i=child.i, child_text=child.text, child_dep=child.dep_,
+                    role=role,
+                    counterpart=counterpart["text"] if counterpart else None,
+                    head_component=head_component["text"],
+                )
                 if counterpart is None or counterpart["text"] == head_component["text"]:
                     continue
                 if role == "location":
@@ -1770,16 +1798,24 @@ def extract_direct_relations(doc, components):
                     # 向きの位置関係として登録する（格フレーム法）。
                     # ここで単に読み飛ばすと、場所しか係り先がない受身文
                     # （「〜に配置され、」等）の関係が丸ごと失われてしまう。
+                    _debug_log(
+                        func="extract_direct_relations", stage="受身分岐:location採用",
+                        verb_text=verb.text, source=head_component["text"], target=counterpart["text"],
+                    )
                     relations.append({
                         "source": head_component["text"],
-                        "relation": _predicate_phrase(verb),
+                        "relation": verb.text,
                         "target": counterpart["text"],
                         "type": "direct",
                     })
                     continue
+                _debug_log(
+                    func="extract_direct_relations", stage="受身分岐:通常採用",
+                    verb_text=verb.text, source=counterpart["text"], target=head_component["text"],
+                )
                 relations.append({
                     "source": counterpart["text"],
-                    "relation": _predicate_phrase(verb),
+                    "relation": verb.text,
                     "target": head_component["text"],
                     "type": "direct",
                 })
@@ -1873,6 +1909,14 @@ def extract_direct_relations(doc, components):
                         if tool is not None:
                             effective_source = tool
                         break
+
+            _debug_log(
+                func="extract_direct_relations", stage="能動分岐:effective_source確定",
+                verb_i=verb.i, verb_text=verb.text,
+                head_is_claim_title=head_is_claim_title, used_fallback=used_fallback,
+                head_component=head_component["text"],
+                effective_source=effective_source["text"] if effective_source else None,
+            )
 
             for child in verb.children:
                 if child.dep_ != "obj":
@@ -2037,15 +2081,6 @@ def extract_has_relations(doc, components):
         targets = []
         owner = None
 
-        # 「Xは … Yを有する」の所有者は、まず同一節の直前にある
-        # 明示主題Xを優先する。GiNZAが長距離係り受けで別の構成要素を
-        # nsubj/headとして返した場合でも、格助詞「は」と文内位置から
-        # 所有者を復元する。特定の単語には依存しない。
-        nearest_topic = _find_nearest_topic_before_text(doc, components, verb)
-        if obj_comp is not None and nearest_topic is not None:
-            owner = nearest_topic
-            targets = [obj_comp]
-
         # 「Ａと、Ｂと、Ｃと、…を有する（備える）」のような並列列挙が
         # 2件以上見つかる場合は、それを最優先で使う（「は」探しに
         # 惑わされないようにするため。特に超長文で、無関係な節の
@@ -2068,9 +2103,7 @@ def extract_has_relations(doc, components):
             if verb.i - nearest_end > 15:
                 early_list_targets = []
 
-        if owner is not None and targets:
-            pass
-        elif subj_token is not None:
+        if subj_token is not None:
             owner = (
                 find_component_by_token(components, subj_token.i)
                 or find_referenced_component(components, subj_token)
@@ -2165,305 +2198,6 @@ def extract_has_relations(doc, components):
 # ============================================================
 # ⑥ 全関係を統合
 # ============================================================
-
-
-# ============================================================
-# ⑥ 特許定型構文の補正
-# ============================================================
-# GiNZAの係り受けだけでは、長い請求項の「位置決めされている」
-# 「A、BおよびCと、Dとの間に位置する」のような定型構文で、
-# 係り先が文末の発明名称へ飛ぶことがある。
-#
-# ここではGiNZAの結果を捨てるのではなく、原文に明示されている
-# 定型構文を優先してSAOの向きだけを補正する。
-# LLMは使用しない。
-
-def _find_component_phrase(components, phrase):
-    """原文中の句から、最も対応しやすい構成要素を返す。"""
-    if not phrase:
-        return None
-    p = _normalize_component_text(re.sub(r"\s+", "", phrase))
-    candidates = []
-    for c in components:
-        ct = _normalize_component_text(re.sub(r"\s+", "", c["text"]))
-        if not ct:
-            continue
-        if ct == p:
-            return c
-        if ct in p or p in ct:
-            candidates.append(c)
-    if not candidates:
-        return None
-    # 長い構成要素を優先。短い語（「装置」など）が長い技術用語に
-    # 吸われるのを防ぐ。
-    return max(candidates, key=lambda c: len(c["text"]))
-
-
-def _find_component_before_wa(components, text, end_pos):
-    """
-    text[:end_pos] の範囲で「構成要素＋は」を探し、最後に出現する
-    構成要素を返す。
-    """
-    best = None
-    best_pos = -1
-    prefix = text[:end_pos]
-    for c in components:
-        ct = re.sub(r"\s+", "", _normalize_component_text(c["text"]))
-        if not ct:
-            continue
-        # 「前記」は構成要素名から除去済みなので、原文側の「前記」は任意。
-        pattern = re.compile(
-            r"(?:前記|該)?"
-            + re.escape(ct)
-            + r"\s*は(?:、|,|，)?"
-        )
-        for m in pattern.finditer(prefix):
-            if m.start() > best_pos:
-                best = c
-                best_pos = m.start()
-    return best
-
-
-def _case_chain_text(token):
-    """token に接続する格助詞・固定語を文法的にまとめて返す。"""
-    parts = []
-    for child in token.children:
-        if child.dep_ in ("case", "fixed"):
-            parts.append(child.text)
-            for gc in child.children:
-                if gc.dep_ in ("case", "fixed"):
-                    parts.append(gc.text)
-    return "".join(parts)
-
-
-def _is_targeting_obl(token):
-    """
-    「Xに対して」「Xに向けて」のように、受動述語の相手・対象を示す
-    格要素を、特定の技術用語ではなく格助詞の構造から判定する。
-    """
-    if token.dep_ != "obl":
-        return False
-    case_text = _case_chain_text(token)
-    return any(marker in case_text for marker in ("に対", "に向", "に対し"))
-
-
-def _passive_predicate_text(verb):
-    """動詞＋助動詞から、SAO用の受動述語ラベルを組み立てる。"""
-    texts = [verb.text]
-    for child in sorted(verb.children, key=lambda c: c.i):
-        if child.pos_ == "AUX" and child.i > verb.i:
-            texts.append(child.text)
-    label = "".join(texts)
-    # 活用形に依存しすぎないSAOラベルへ正規化
-    if any(c.pos_ == "AUX" and c.lemma_ in ("れる", "られる") for c in verb.children):
-        lemma = verb.lemma_
-        if lemma.endswith("する"):
-            return lemma[:-2] + "される"
-        return lemma + "される"
-    return label
-
-
-def _find_explicit_subject(verb, components):
-    """述語節の明示的なnsubjを探す。"""
-    for child in verb.children:
-        if child.dep_ == "nsubj":
-            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
-            if comp is not None:
-                return comp
-    return None
-
-
-def _find_component_from_nmod(token, components):
-    """位置関係語などのnmod子から構成要素を取得する。"""
-    comp = find_component_by_token(components, token.i) or find_referenced_component(components, token)
-    if comp is not None:
-        return comp
-    for child in token.children:
-        if child.dep_ in ("nmod", "compound"):
-            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
-            if comp is not None:
-                return comp
-    return None
-
-
-def _find_subject_component_before_predicate(verb, components):
-    """
-    nsubjがGiNZAで取りこぼされた場合だけ、同一節の直前から「は／が」の
-    明示主語を探す。語彙ではなく格助詞と構成要素の位置だけを使う。
-    """
-    subject = _find_explicit_subject(verb, components)
-    if subject is not None:
-        return subject
-
-    for i in range(verb.i - 1, -1, -1):
-        t = verb.doc[i]
-        if t.text == "。":
-            break
-        if t.dep_ == "case" and t.text in ("は", "が") and t.head.pos_ in ("NOUN", "PROPN"):
-            comp = find_component_by_token(components, t.head.i) or find_referenced_component(components, t.head)
-            if comp is not None:
-                return comp
-    return None
-
-
-def extract_patent_pattern_corrections(text, components, doc=None):
-    """
-    特許請求項でGiNZAの長距離係り受けが壊れやすい構造を、
-    技術用語・部品名を条件にせず、格・依存関係・名詞句構造から補正する。
-
-    対応するのは次の「構文」であり、特定の単語列ではない。
-
-      1. 明示主語 + 対象格要素 + 受動述語
-         Xは Yに対して V-される
-         -> X → Vされる → Y
-
-      2. 明示主語 + 列挙 + 位置関係語 + 述語
-         Xは A、BおよびCと、Dとの[位置関係語]に Vする
-         -> X → Vする → AとDとの[位置関係語]
-         -> X → Vする → BとDとの[位置関係語]
-         -> X → Vする → CとDとの[位置関係語]
-
-    具体的な装置名・部品名・技術用語は一切条件にしない。
-    """
-    if doc is None:
-        doc = nlp(_clean_claim_text(text))
-
-    relations = []
-    explicit_pairs = []
-    correction_contexts = []
-
-    # --------------------------------------------------------
-    # 1) 「Xは Yに対して V-される」型
-    # --------------------------------------------------------
-    for verb in doc:
-        if verb.pos_ != "VERB" or not _is_passive(verb):
-            continue
-
-        source = _find_subject_component_before_predicate(verb, components)
-        if source is None:
-            continue
-
-        target = None
-        for child in verb.children:
-            if _is_targeting_obl(child):
-                target = (
-                    find_component_by_token(components, child.i)
-                    or find_referenced_component(components, child)
-                    or find_previous_component_by_word(components, child)
-                )
-                if target is not None:
-                    break
-
-        if target is None or source["text"] == target["text"]:
-            continue
-
-        relation = _passive_predicate_text(verb)
-        relations.append({
-            "source": source["text"],
-            "relation": relation,
-            "target": target["text"],
-            "type": "direct",
-        })
-        explicit_pairs.append((source["text"], target["text"], relation))
-        correction_contexts.append({
-            "verb_i": verb.i,
-            "source": source["text"],
-            "raw_predicate": verb.text,
-        })
-
-    # --------------------------------------------------------
-    # 2) 「Xは A、B…と、Dとの位置関係語に V」型
-    # --------------------------------------------------------
-    # relation_words は既存の汎用「上・下・間・内部…」検出結果を利用する。
-    # したがってここでも「間」などの特定語を直接条件にしない。
-    relation_words = extract_relation_words_general(doc)
-    for rw in relation_words:
-        relation_token = doc[rw["relation_index"]]
-        verb = relation_token.head
-        if verb.pos_ != "VERB":
-            continue
-
-        source = _find_explicit_subject(verb, components)
-        if source is None:
-            continue
-
-        # relation語に係る構成要素を、nmod＋列挙構造から集める。
-        nmod_children = [c for c in relation_token.children if c.dep_ == "nmod"]
-        if not nmod_children:
-            continue
-
-        # 位置関係語の右側に相当する構成要素をまず決める。
-        right_candidates = []
-        for child in nmod_children:
-            comp = _find_component_from_nmod(child, components)
-            if comp is not None:
-                right_candidates.append(comp)
-
-        if not right_candidates:
-            continue
-
-        # 「AとBとの間」のような並列では、同じnmod連鎖を再帰的に展開する。
-        all_related = []
-        for child in nmod_children:
-            for comp in collect_enumerated_components(child, components):
-                if comp not in all_related:
-                    all_related.append(comp)
-
-        if len(all_related) < 2:
-            continue
-
-        all_related.sort(key=lambda c: c["start"])
-        right = all_related[-1]
-        left_items = [c for c in all_related[:-1] if c["text"] not in (source["text"], right["text"])]
-        if not left_items:
-            continue
-
-        relation_label = rw["relation_word"] + "に" + verb.text
-        for left in left_items:
-            target_text = f"{left['text']}と{right['text']}との{rw['relation_word']}"
-            relations.append({
-                "source": source["text"],
-                "relation": verb.text,
-                "target": target_text,
-                "type": "positional",
-            })
-
-        correction_contexts.append({
-            "verb_i": verb.i,
-            "source": source["text"],
-            "relation_i": relation_token.i,
-        })
-
-    return relations, explicit_pairs, correction_contexts
-
-
-def correct_patent_pattern_relations(text, components, relations, doc=None):
-    """
-    文法構造に基づく補正を「追加型」で適用する。
-
-    重要：既存のGiNZA由来SAOはここでは削除しない。
-    補正候補を追加した後、完全に同一の三つ組だけを重複除去する。
-    これにより、補正ルールを追加したことで既存SAO数が減ることを防ぐ。
-    """
-    if doc is None:
-        doc = nlp(_clean_claim_text(text))
-
-    corrections, _, _ = extract_patent_pattern_corrections(
-        text, components, doc
-    )
-    if not corrections:
-        return relations
-
-    combined = list(relations) + list(corrections)
-    unique = []
-    seen = set()
-    for r in combined:
-        key = (r["source"], r["relation"], r["target"])
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(r)
-    return unique
 
 def combine_all_relations(positional, direct, has):
     all_relations = list(positional) + list(direct) + list(has)
@@ -2854,13 +2588,6 @@ def _extract_raw_relations(text):
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
-
-    # GiNZAの係り受けだけでは誤向きになりやすい特許定型構文を、
-    # 原文に明示されたパターンに限って最後に補正する。
-    final_relations = correct_patent_pattern_relations(
-        text, components, final_relations
-    )
-
     return components, final_relations, doc
 
 

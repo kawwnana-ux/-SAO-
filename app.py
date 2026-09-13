@@ -180,20 +180,35 @@ with tab1:
         help="GiNZAが各語をどの品詞・係り受けラベルで解析したかを表で確認できます。"
              "抽出ルールがうまく動かない時の原因調査に使います。",
     )
+    show_relation_trace = st.checkbox(
+        "🧭 デバッグ: 関係抽出の分岐トレースを表示する（開発用）",
+        key="single_show_trace",
+        help="extract_direct_relations等が、どの分岐を通ってsource/targetを"
+             "決めたかを1行ずつ記録します。抽出結果が想定と違う時の原因調査に使います。",
+    )
 
     if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
             st.session_state.single_debug_tokens = None
+            st.session_state.single_debug_trace = None
         else:
             with st.spinner("解析中..."):
                 try:
+                    if show_relation_trace:
+                        pp.DEBUG_MODE = True
+                        pp.DEBUG_TRACE.clear()
                     components, relations = pp.analyze_claim_ginza(text)
                     st.session_state.single_result = {
                         "components": components,
                         "relations": relations,
                     }
+                    if show_relation_trace:
+                        st.session_state.single_debug_trace = list(pp.DEBUG_TRACE)
+                        pp.DEBUG_MODE = False
+                    else:
+                        st.session_state.single_debug_trace = None
                     if show_debug:
                         debug_doc = pp.nlp(pp._clean_claim_text(text))
                         st.session_state.single_debug_tokens = [
@@ -214,6 +229,22 @@ with tab1:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
                     st.session_state.single_debug_tokens = None
+                    st.session_state.single_debug_trace = None
+                finally:
+                    pp.DEBUG_MODE = False
+
+    # 関係抽出の分岐トレースを表示
+    if st.session_state.get("single_debug_trace"):
+        with st.expander("🧭 関係抽出の分岐トレース（デバッグ）", expanded=True):
+            st.caption(
+                "extract_direct_relations等が、どの動詞についてどの分岐を通り、"
+                "source/targetとして何を選んだかの記録です。上から実行順です。"
+            )
+            st.dataframe(
+                st.session_state.single_debug_trace,
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # デバッグ情報を表示（結果の有無に関わらず、取得できていれば出す）
     if st.session_state.get("single_debug_tokens"):
