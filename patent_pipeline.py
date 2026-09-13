@@ -234,7 +234,10 @@ HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
 # 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため"}
+# 「工程」「方法」クレームの解析で頻出する、実体を指さない一般語。
+# これらを構成要素として拾ってしまうと、「手」「それぞれ」「各」のような
+# ノイズノードが大量発生する（532件評価で確認された誤検出パターン）。
+GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "それぞれ", "各", "手"}
 
 # 「Ｘの一部」「Ｘの全体」のように、単独では何の一部・全体か分からず、
 # 必ず「Ｘの」を伴って初めて意味を持つ部分・全体を表す語。
@@ -1407,9 +1410,30 @@ def extract_attribute_relations(doc, components):
 
         value_text = number_token.text + (unit_token.text if unit_token is not None else "") + token.text
 
+        # 「銅板の硬度は４５Ｈｖ以上である」のような文で、正解データは
+        #   (銅板, の, 銅板の硬度)
+        #   (銅板の硬度, 以上である, ４５Ｈｖ)
+        # の2トリプルに分解している（532件評価で判明）。
+        # 以前は (owner, attribute_name, value_text) の1トリプルだけを
+        # 生成しており、属性名を関係ラベルとして扱う設計だったため、
+        # 正解データのスキーマと一致せず再現率を落としていた。
+        # ここでは正解データのスキーマに合わせ、「owner+の+attribute_name」を
+        # 主語とする2トリプルに変更する。
+        compound_name = (
+            attribute_name if attribute_name.startswith(owner["text"])
+            else owner["text"] + "の" + attribute_name
+        )
+        predicate_text = token.text + "である"
+
         relations.append({
             "source": owner["text"],
-            "relation": attribute_name,
+            "relation": "の",
+            "target": compound_name,
+            "type": "attribute_of",
+        })
+        relations.append({
+            "source": compound_name,
+            "relation": predicate_text,
             "target": value_text,
             "type": "attribute",
         })
@@ -2122,6 +2146,126 @@ def add_english_order(components=None, relations=None):
     return components, relations
 
 
+# ============================================================
+# 工程/方法クレーム 専用の抽出パス
+# ============================================================
+# 532件評価で判明した最大の誤り要因への対応。
+# 「〜する工程と、〜する工程とを有する方法」のような製造方法クレームは、
+# 「Ａを備えるＢ」という部分-全体構造を前提にした装置クレーム向けの
+# 抽出関数（位置関係・接触関係・直接関係等）にそのまま通すと、
+# 動詞連鎖の途中の語（「真空中」「それぞれ」「各」等）を構成要素と
+# 誤認し、"手 表面に持った 各"のような無意味なトリプルを大量生成する
+# ことが確認された。そこで、工程/方法クレームだと判定した場合は、
+# 装置クレーム向けの抽出関数を使わず、この専用パスに切り替える。
+
+def _is_process_claim(doc, components):
+    """
+    請求項が「〜する方法」のような製造方法／工程クレームかどうかを判定する。
+    末尾の構成要素（＝発明の名称に相当することが多い）が「方法」で
+    終わっている場合、または「工程」を含む構成要素が2つ以上ある場合に
+    工程/方法クレームとみなす。
+    """
+    last_i = len(doc) - 1
+    while last_i > 0 and doc[last_i].pos_ == "PUNCT":
+        last_i -= 1
+    title_comp = find_component_by_token(components, last_i)
+    if title_comp is not None and title_comp["text"].endswith("方法"):
+        return True
+    step_like = [c for c in components if c["text"].endswith("工程")]
+    return len(step_like) >= 2
+
+
+def extract_process_step_relations(doc, components):
+    """
+    工程/方法クレーム向けのSAO抽出。
+
+    「Ａを＜動詞＞する工程」という形の「工程」ノード（NOUN、text.endswith("工程")）
+    を1つずつ見つけ、
+      ① 発明の名称（＝末尾の構成要素、多くは「〜方法」）から各工程への
+         "有する" 関係
+      ② その工程を修飾する動詞（dep_=="acl"）のnsubj/objから
+         (対象, 動作, 目的語) のSAOトリプル
+    を生成する。②で主語・目的語のどちらかしか取れない場合は、
+    もう一方の代わりに工程自体の構成要素名を使う
+    （「真空中」のような無関係な語をノードにしてしまうより、
+     多少大づかみでも「工程」を主語/目的語として使う方が安全なため）。
+
+    主語・目的語のどちらも構成要素として見つからない場合は、
+    ノイズになりやすいので関係を生成しない。
+    """
+    relations = []
+
+    last_i = len(doc) - 1
+    while last_i > 0 and doc[last_i].pos_ == "PUNCT":
+        last_i -= 1
+    title_comp = find_component_by_token(components, last_i)
+
+    step_tokens = [
+        t for t in doc
+        if t.pos_ in ("NOUN", "PROPN") and t.text.endswith("工程")
+    ]
+
+    seen_title_links = set()
+    for step_token in step_tokens:
+        step_comp = find_component_by_token(components, step_token.i)
+        step_label = step_comp["text"] if step_comp is not None else step_token.text
+
+        # ① 発明の名称 --有する--> 工程
+        if title_comp is not None and title_comp["text"] != step_label:
+            key = (title_comp["text"], step_label)
+            if key not in seen_title_links:
+                seen_title_links.add(key)
+                relations.append({
+                    "source": title_comp["text"],
+                    "relation": "有する",
+                    "target": step_label,
+                    "type": "process_step",
+                })
+
+        # ② 工程の中身（修飾する動詞のnsubj/obj）
+        step_verb = None
+        for child in step_token.children:
+            if child.dep_ == "acl" and child.pos_ == "VERB":
+                step_verb = child
+                break
+        if step_verb is None:
+            continue
+
+        subj_token = None
+        obj_token = None
+        for child in step_verb.children:
+            if child.dep_ == "nsubj" and subj_token is None:
+                subj_token = child
+            elif child.dep_ in ("obj", "iobj") and obj_token is None:
+                obj_token = child
+
+        subj_comp = None
+        if subj_token is not None:
+            subj_comp = (find_component_by_token(components, subj_token.i)
+                         or find_referenced_component(components, subj_token))
+        obj_comp = None
+        if obj_token is not None:
+            obj_comp = (find_component_by_token(components, obj_token.i)
+                        or find_referenced_component(components, obj_token))
+
+        if subj_comp is None and obj_comp is None:
+            continue  # 対象を特定できない＝ノイズ源になるので生成しない
+
+        source_text = subj_comp["text"] if subj_comp is not None else step_label
+        target_text = obj_comp["text"] if obj_comp is not None else step_label
+        if source_text == target_text:
+            continue
+
+        relations.append({
+            "source": source_text,
+            "relation": step_verb.lemma_,
+            "target": target_text,
+            "type": "process_step",
+        })
+
+    return relations
+
+
 def _simplify_hierarchy(relations, doc=None, components=None):
     """
     根（root）から全ノードへ直接「有する」で繋ぐのではなく、
@@ -2261,10 +2405,20 @@ def _extract_raw_relations(text):
     生の抽出結果を返す。1つの完全な請求項ではなく、従属請求項の
     追加限定文のような「断片」を解析するときに使う
     （断片だけを見て孤立ノードを無理に根に繋げてしまうのを防ぐため）。
+
+    工程/方法クレーム（_is_process_claim）と判定した場合は、装置クレーム
+    向けの抽出関数（位置関係・接触関係・直接関係等）を使わず、
+    extract_process_step_relations による専用パスに切り替える
+    （理由は extract_process_step_relations のdocstring参照）。
     """
     text = _clean_claim_text(text)
     doc = nlp(text)
     components = extract_patent_components_general(doc)
+
+    if _is_process_claim(doc, components):
+        final_relations = extract_process_step_relations(doc, components)
+        return components, final_relations, doc
+
     relation_words = extract_relation_words_general(doc)
 
     positional = extract_positional_relations(doc, components, relation_words)
