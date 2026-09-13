@@ -2094,6 +2094,339 @@ def extract_has_relations(doc, components):
 # ⑥ 全関係を統合
 # ============================================================
 
+
+# ============================================================
+# ⑥ 特許定型構文の補正
+# ============================================================
+# GiNZAの係り受けだけでは、長い請求項の「位置決めされている」
+# 「A、BおよびCと、Dとの間に位置する」のような定型構文で、
+# 係り先が文末の発明名称へ飛ぶことがある。
+#
+# ここではGiNZAの結果を捨てるのではなく、原文に明示されている
+# 定型構文を優先してSAOの向きだけを補正する。
+# LLMは使用しない。
+
+def _find_component_phrase(components, phrase):
+    """原文中の句から、最も対応しやすい構成要素を返す。"""
+    if not phrase:
+        return None
+    p = _normalize_component_text(re.sub(r"\s+", "", phrase))
+    candidates = []
+    for c in components:
+        ct = _normalize_component_text(re.sub(r"\s+", "", c["text"]))
+        if not ct:
+            continue
+        if ct == p:
+            return c
+        if ct in p or p in ct:
+            candidates.append(c)
+    if not candidates:
+        return None
+    # 長い構成要素を優先。短い語（「装置」など）が長い技術用語に
+    # 吸われるのを防ぐ。
+    return max(candidates, key=lambda c: len(c["text"]))
+
+
+def _find_component_before_wa(components, text, end_pos):
+    """
+    text[:end_pos] の範囲で「構成要素＋は」を探し、最後に出現する
+    構成要素を返す。
+    """
+    best = None
+    best_pos = -1
+    prefix = text[:end_pos]
+    for c in components:
+        ct = re.sub(r"\s+", "", _normalize_component_text(c["text"]))
+        if not ct:
+            continue
+        # 「前記」は構成要素名から除去済みなので、原文側の「前記」は任意。
+        pattern = re.compile(
+            r"(?:前記|該)?"
+            + re.escape(ct)
+            + r"\s*は(?:、|,|，)?"
+        )
+        for m in pattern.finditer(prefix):
+            if m.start() > best_pos:
+                best = c
+                best_pos = m.start()
+    return best
+
+
+def _case_chain_text(token):
+    """token に接続する格助詞・固定語を文法的にまとめて返す。"""
+    parts = []
+    for child in token.children:
+        if child.dep_ in ("case", "fixed"):
+            parts.append(child.text)
+            for gc in child.children:
+                if gc.dep_ in ("case", "fixed"):
+                    parts.append(gc.text)
+    return "".join(parts)
+
+
+def _is_targeting_obl(token):
+    """
+    「Xに対して」「Xに向けて」のように、受動述語の相手・対象を示す
+    格要素を、特定の技術用語ではなく格助詞の構造から判定する。
+    """
+    if token.dep_ != "obl":
+        return False
+    case_text = _case_chain_text(token)
+    return any(marker in case_text for marker in ("に対", "に向", "に対し"))
+
+
+def _passive_predicate_text(verb):
+    """動詞＋助動詞から、SAO用の受動述語ラベルを組み立てる。"""
+    texts = [verb.text]
+    for child in sorted(verb.children, key=lambda c: c.i):
+        if child.pos_ == "AUX" and child.i > verb.i:
+            texts.append(child.text)
+    label = "".join(texts)
+    # 活用形に依存しすぎないSAOラベルへ正規化
+    if any(c.pos_ == "AUX" and c.lemma_ in ("れる", "られる") for c in verb.children):
+        lemma = verb.lemma_
+        if lemma.endswith("する"):
+            return lemma[:-2] + "される"
+        return lemma + "される"
+    return label
+
+
+def _find_explicit_subject(verb, components):
+    """述語節の明示的なnsubjを探す。"""
+    for child in verb.children:
+        if child.dep_ == "nsubj":
+            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
+            if comp is not None:
+                return comp
+    return None
+
+
+def _find_component_from_nmod(token, components):
+    """位置関係語などのnmod子から構成要素を取得する。"""
+    comp = find_component_by_token(components, token.i) or find_referenced_component(components, token)
+    if comp is not None:
+        return comp
+    for child in token.children:
+        if child.dep_ in ("nmod", "compound"):
+            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
+            if comp is not None:
+                return comp
+    return None
+
+
+def _find_subject_component_before_predicate(verb, components):
+    """
+    nsubjがGiNZAで取りこぼされた場合だけ、同一節の直前から「は／が」の
+    明示主語を探す。語彙ではなく格助詞と構成要素の位置だけを使う。
+    """
+    subject = _find_explicit_subject(verb, components)
+    if subject is not None:
+        return subject
+
+    for i in range(verb.i - 1, -1, -1):
+        t = verb.doc[i]
+        if t.text == "。":
+            break
+        if t.dep_ == "case" and t.text in ("は", "が") and t.head.pos_ in ("NOUN", "PROPN"):
+            comp = find_component_by_token(components, t.head.i) or find_referenced_component(components, t.head)
+            if comp is not None:
+                return comp
+    return None
+
+
+def extract_patent_pattern_corrections(text, components, doc=None):
+    """
+    特許請求項でGiNZAの長距離係り受けが壊れやすい構造を、
+    技術用語・部品名を条件にせず、格・依存関係・名詞句構造から補正する。
+
+    対応するのは次の「構文」であり、特定の単語列ではない。
+
+      1. 明示主語 + 対象格要素 + 受動述語
+         Xは Yに対して V-される
+         -> X → Vされる → Y
+
+      2. 明示主語 + 列挙 + 位置関係語 + 述語
+         Xは A、BおよびCと、Dとの[位置関係語]に Vする
+         -> X → Vする → AとDとの[位置関係語]
+         -> X → Vする → BとDとの[位置関係語]
+         -> X → Vする → CとDとの[位置関係語]
+
+    具体的な装置名・部品名・技術用語は一切条件にしない。
+    """
+    if doc is None:
+        doc = nlp(_clean_claim_text(text))
+
+    relations = []
+    explicit_pairs = []
+    correction_contexts = []
+
+    # --------------------------------------------------------
+    # 1) 「Xは Yに対して V-される」型
+    # --------------------------------------------------------
+    for verb in doc:
+        if verb.pos_ != "VERB" or not _is_passive(verb):
+            continue
+
+        source = _find_subject_component_before_predicate(verb, components)
+        if source is None:
+            continue
+
+        target = None
+        for child in verb.children:
+            if _is_targeting_obl(child):
+                target = (
+                    find_component_by_token(components, child.i)
+                    or find_referenced_component(components, child)
+                    or find_previous_component_by_word(components, child)
+                )
+                if target is not None:
+                    break
+
+        if target is None or source["text"] == target["text"]:
+            continue
+
+        relation = _passive_predicate_text(verb)
+        relations.append({
+            "source": source["text"],
+            "relation": relation,
+            "target": target["text"],
+            "type": "direct",
+        })
+        explicit_pairs.append((source["text"], target["text"], relation))
+        correction_contexts.append({
+            "verb_i": verb.i,
+            "source": source["text"],
+            "raw_predicate": verb.text,
+        })
+
+    # --------------------------------------------------------
+    # 2) 「Xは A、B…と、Dとの位置関係語に V」型
+    # --------------------------------------------------------
+    # relation_words は既存の汎用「上・下・間・内部…」検出結果を利用する。
+    # したがってここでも「間」などの特定語を直接条件にしない。
+    relation_words = extract_relation_words_general(doc)
+    for rw in relation_words:
+        relation_token = doc[rw["relation_index"]]
+        verb = relation_token.head
+        if verb.pos_ != "VERB":
+            continue
+
+        source = _find_explicit_subject(verb, components)
+        if source is None:
+            continue
+
+        # relation語に係る構成要素を、nmod＋列挙構造から集める。
+        nmod_children = [c for c in relation_token.children if c.dep_ == "nmod"]
+        if not nmod_children:
+            continue
+
+        # 位置関係語の右側に相当する構成要素をまず決める。
+        right_candidates = []
+        for child in nmod_children:
+            comp = _find_component_from_nmod(child, components)
+            if comp is not None:
+                right_candidates.append(comp)
+
+        if not right_candidates:
+            continue
+
+        # 「AとBとの間」のような並列では、同じnmod連鎖を再帰的に展開する。
+        all_related = []
+        for child in nmod_children:
+            for comp in collect_enumerated_components(child, components):
+                if comp not in all_related:
+                    all_related.append(comp)
+
+        if len(all_related) < 2:
+            continue
+
+        all_related.sort(key=lambda c: c["start"])
+        right = all_related[-1]
+        left_items = [c for c in all_related[:-1] if c["text"] not in (source["text"], right["text"])]
+        if not left_items:
+            continue
+
+        relation_label = rw["relation_word"] + "に" + verb.text
+        for left in left_items:
+            target_text = f"{left['text']}と{right['text']}との{rw['relation_word']}"
+            relations.append({
+                "source": source["text"],
+                "relation": verb.text,
+                "target": target_text,
+                "type": "positional",
+            })
+
+        correction_contexts.append({
+            "verb_i": verb.i,
+            "source": source["text"],
+            "relation_i": relation_token.i,
+        })
+
+    return relations, explicit_pairs, correction_contexts
+
+
+def correct_patent_pattern_relations(text, components, relations, doc=None):
+    """文法構造に基づく補正。具体的な技術用語には依存しない。"""
+    if doc is None:
+        doc = nlp(_clean_claim_text(text))
+
+    corrections, explicit_pairs, contexts = extract_patent_pattern_corrections(
+        text, components, doc
+    )
+    if not corrections:
+        return relations
+
+    corrected = []
+    for r in relations:
+        remove = False
+
+        # 明示的な「X→受動述語→Y」が得られた場合、同じ述語の
+        # GiNZA由来の別向き接続を除去する。
+        for source_text, target_text, relation in explicit_pairs:
+            if (r["source"], r["target"]) == (source_text, target_text):
+                continue
+            # 特定の述語名をハードコードせず、実際に検出した受動述語の
+            # 表層形と一致するGiNZA由来の関係だけを対象にする。
+            for ctx in contexts:
+                if (
+                    ctx.get("source") == source_text
+                    and ctx.get("raw_predicate")
+                    and ctx["raw_predicate"] == r.get("relation")
+                ):
+                    remove = True
+                    break
+            if remove:
+                break
+
+        if not remove:
+            for ctx in contexts:
+                if r["source"] == ctx["source"] and r.get("type") == "direct":
+                    # 同一主語から同一節で生成された誤った直結関係を、
+                    # 明示構文の正しい関係以外は除外する。
+                    if not any(
+                        r["source"] == s and r["target"] == t
+                        for s, t, _ in explicit_pairs
+                    ):
+                        # relation_iを持つ位置構文の場合は直接関係を壊さない。
+                        if "relation_i" not in ctx:
+                            remove = True
+                            break
+
+        if not remove:
+            corrected.append(r)
+
+    corrected.extend(corrections)
+
+    unique = []
+    seen = set()
+    for r in corrected:
+        key = (r["source"], r["relation"], r["target"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    return unique
+
 def combine_all_relations(positional, direct, has):
     all_relations = list(positional) + list(direct) + list(has)
     unique = []
@@ -2483,6 +2816,13 @@ def _extract_raw_relations(text):
         direct + contact + capability + composition + attribute + copula + comparison,
         has,
     )
+
+    # GiNZAの係り受けだけでは誤向きになりやすい特許定型構文を、
+    # 原文に明示されたパターンに限って最後に補正する。
+    final_relations = correct_patent_pattern_relations(
+        text, components, final_relations
+    )
+
     return components, final_relations, doc
 
 
