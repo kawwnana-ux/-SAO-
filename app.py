@@ -174,10 +174,18 @@ with tab1:
         key="single_text",
     )
 
+    show_debug = st.checkbox(
+        "🔍 デバッグ: 形態素・係り受け情報を表示する（開発用）",
+        key="single_show_debug",
+        help="GiNZAが各語をどの品詞・係り受けラベルで解析したかを表で確認できます。"
+             "抽出ルールがうまく動かない時の原因調査に使います。",
+    )
+
     if st.button("✨ 解析する", type="primary", key="single_run"):
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
             st.session_state.single_result = None
+            st.session_state.single_debug_tokens = None
         else:
             with st.spinner("解析中..."):
                 try:
@@ -186,9 +194,39 @@ with tab1:
                         "components": components,
                         "relations": relations,
                     }
+                    if show_debug:
+                        debug_doc = pp.nlp(pp._clean_claim_text(text))
+                        st.session_state.single_debug_tokens = [
+                            {
+                                "i": t.i,
+                                "表層形": t.text,
+                                "品詞": t.pos_,
+                                "係り受け": t.dep_,
+                                "係り先i": t.head.i,
+                                "係り先": t.head.text,
+                                "原形": t.lemma_,
+                            }
+                            for t in debug_doc
+                        ]
+                    else:
+                        st.session_state.single_debug_tokens = None
                 except Exception as e:
                     st.error(f"解析中にエラーが発生しました: {e}")
                     st.session_state.single_result = None
+                    st.session_state.single_debug_tokens = None
+
+    # デバッグ情報を表示（結果の有無に関わらず、取得できていれば出す）
+    if st.session_state.get("single_debug_tokens"):
+        with st.expander("🔍 形態素・係り受け情報（デバッグ）", expanded=True):
+            st.caption(
+                "各語の品詞(pos_)・係り受けラベル(dep_)・係り先(head)・原形(lemma_)の一覧です。"
+                "抽出ルールが期待通りに動かない時、どの語がどこに係っているかをここで確認できます。"
+            )
+            st.dataframe(
+                st.session_state.single_debug_tokens,
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # 結果を表示
     if st.session_state.single_result is not None:
