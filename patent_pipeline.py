@@ -601,6 +601,24 @@ def _has_enum_marker(token, markers=_ENUM_MARKERS):
     return any(c.dep_ == "case" and c.text in markers for c in token.children)
 
 
+def _followed_by_comma(token):
+    """tokenの直後に読点「、」が(punctの子として)付いているか。
+    「Ａ、Ｂおよび Ｃ」のようなコンマ区切り列挙で、Ａ・Ｂを検出するのに使う。"""
+    for child in token.children:
+        if child.dep_ == "punct" and child.text == "、":
+            return True
+    return False
+
+
+def _has_cc_child(token):
+    """tokenに等位接続の助詞(および／かつ／又は等、dep_=="cc")が子として付いているか。
+    「Ｂおよび Ｃ」のＣ側(＝cc「および」を直接の子に持つ語)を検出するのに使う。"""
+    for child in token.children:
+        if child.dep_ == "cc":
+            return True
+    return False
+
+
 def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
     """
     「ＡとＢとの間」「Ａ及びＢ及びＣ」「Ａ、Ｂ及びＣ」のように、
@@ -614,13 +632,14 @@ def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
     取りこぼしていた。この関数はnmodの連鎖を、列挙マーカーが
     付いている限り奥まで辿ることでその問題に対応する。
 
-    ※実験的変更(未検証): 「Ａ、Ｂおよび Ｃ」のようにコンマ区切り＋
-    「および」が最後の項目にだけ付く列挙は、GiNZAのUD係り受けでは
-    nmodではなくconj(並列関係)で繋がることが多いと考えられる。
-    このコードベースはこれまでconjを使ったことが一度もなく実データでの
-    確認ができていないため、動作を見て問題があれば戻せるようにこの
-    部分だけ独立させてある。conj側はマーカーの有無を問わず常に辿り、
-    nmod側は従来通りマーカーがある場合のみ辿る。
+    列挙マーカーの付き方には、実データで確認した限り複数パターンある：
+      ①「ＡとＢと」のように、各項目自身に格助詞「と」等がcaseとして付く
+        （_has_enum_marker、元々のロジック）
+      ②「Ａ、Ｂおよび Ｃ」のようにコンマ区切りで、最後の項目(Ｃ)にだけ
+        「および」がcc(等位接続)として付き、その手前の項目(Ｂ)は
+        直後に読点「、」がpunctとして付く形で連なる
+        （_has_cc_child / _followed_by_comma、532件評価で確認）
+    どちらの形でも辿れるよう、OR条件で両方チェックする。
 
     戻り値はテキスト上の出現順（開始位置）に並べ替えて返す。
     """
@@ -641,10 +660,8 @@ def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
                 # 付いていない場合(コンマ区切りのみ等)でも列挙の一員として扱う
                 stack.append(child)
             elif child.dep_ == "nmod":
-                # 列挙マーカーが付いている場合、または、まだこの経路で
-                # 構成要素が1つも見つかっていない場合（＝間に修飾語を
-                # 挟んでいるだけの可能性がある場合）はさらに奥まで辿る。
-                if _has_enum_marker(child, markers) or comp is None:
+                if (_has_enum_marker(child, markers) or comp is None
+                        or _followed_by_comma(child) or _has_cc_child(t)):
                     stack.append(child)
     results.sort(key=lambda c: c["start"])
     return results
