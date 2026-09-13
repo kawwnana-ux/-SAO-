@@ -1931,6 +1931,20 @@ def extract_has_relations(doc, components):
 
         head_component = find_component_by_token(components, verb.head.i)
 
+        # この動詞自身の目的語(obj)を先に解決しておく。「スイッチング機能を
+        # 有する…パワー半導体モジュール」のような連体修飾節では、目的語
+        # (スイッチング機能)が明確に存在するにもかかわらず、離れた場所に
+        # ある無関係な列挙（別の「を備え」文の列挙項目）を誤って目的語と
+        # みなしてしまうことがある(532件評価で確認)。以下の列挙優先分岐
+        # ・head_component分岐では、objが実際にその列挙の一員である場合
+        # だけ列挙を使うようにし、そうでなければobj自身を優先する。
+        obj_comp = None
+        if obj_token is not None:
+            obj_comp = (
+                find_component_by_token(components, obj_token.i)
+                or find_referenced_component(components, obj_token)
+            )
+
         targets = []
         owner = None
 
@@ -1968,7 +1982,9 @@ def extract_has_relations(doc, components):
                 )
                 if t is not None:
                     targets.append(t)
-        elif len(early_list_targets) >= 2 and (head_component is not None or root_component is not None):
+        elif (len(early_list_targets) >= 2
+              and (head_component is not None or root_component is not None)
+              and (obj_comp is None or obj_comp in early_list_targets)):
             owner = head_component if head_component is not None else root_component
             targets = [c for c in early_list_targets if c["text"] != owner["text"]]
         elif _find_nearest_topic_before_text(doc, components, verb) is not None:
@@ -1998,14 +2014,14 @@ def extract_has_relations(doc, components):
             # 目的語だけの場合）は、動詞自身の目的語（obj）だけを使う
             # （以前は「それより前の構成要素を全部」という広すぎる
             #  フォールバックになっており、無関係な語まで拾っていた）。
-            if all_list_targets:
+            # ここでも、objが実際にその列挙の一員でない場合は列挙を
+            # 使わずobj自身を優先する(上のearly_list_targets分岐と同じ理由)。
+            if all_list_targets and (obj_comp is None or obj_comp in all_list_targets):
                 targets = all_list_targets
+            elif obj_comp is not None:
+                targets = [obj_comp]
             else:
-                t = (
-                    find_component_by_token(components, obj_token.i)
-                    or find_referenced_component(components, obj_token)
-                ) if obj_token is not None else None
-                targets = [t] if t is not None else []
+                targets = []
         else:
             owner = root_component
             if owner is not None:
