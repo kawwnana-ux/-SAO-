@@ -2039,6 +2039,89 @@ def combine_all_relations(positional, direct, has):
     return unique
 
 
+# ============================================================
+# STEP 8'：英語語順（S-A-O）への正規化
+# ============================================================
+# SAO（Subject-Action-Object）という枠組み自体が英語のS-V-O語順を
+# 前提としているため、日本語の「AのB」（Bが主要語、Aが連体修飾）
+# という語順を、英語のポスト修飾語順「B of A」に相当するhead-first
+# 表記へ正規化するステップ。
+#
+# 既存の "text"/"source"/"target" 等のキーは一切変更せず、
+# "text_en"/"source_en"/"target_en" として追加するだけなので、
+# analyze_claim() 等の戻り値をそのまま使っている既存コード
+# （app.py・compare_with_gold等）には影響しない。
+
+def _split_no_chain_segments(doc, start, end):
+    """
+    トークン範囲[start, end]を格助詞「の」(dep_=="case")の位置で
+    区切り、区切られた各セグメントの表層テキストを出現順のリストで返す。
+    「の」が見つからなければ、範囲全体を1つのセグメントとして返す。
+    例：「第一の部材のベースプレート」→ ["第一の部材", "ベースプレート"]
+    """
+    if start < 0 or end < 0 or end < start:
+        return []
+    segments = []
+    seg_start = start
+    for i in range(start, end + 1):
+        tok = doc[i]
+        if tok.text == "の" and tok.dep_ == "case" and i > seg_start:
+            segments.append("".join(t.text for t in doc[seg_start:i]))
+            seg_start = i + 1
+    tail = "".join(t.text for t in doc[seg_start:end + 1])
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def text_to_english_order(text):
+    """
+    構成要素名や関係のsource/targetの文字列（例:「装置の接続部」）を
+    単体でGiNZAに通し、「の」の位置で分割してhead-first
+    （「接続部 of 装置」）の形に変換する。
+    「の」を含まない場合や解析に失敗した場合は元のテキストをそのまま返す。
+
+    注意：単純な線形の「AのBのC」→「C of B of A」のパターンを
+    正しく変換することを優先しており、並列・入れ子構造（「AとBとの間」等）
+    が絡む複雑な構文は今後ルールを追加して拡張する想定。
+    """
+    if not text or "の" not in text:
+        return text
+    try:
+        doc = nlp(text)
+    except Exception:
+        return text
+    segments = _split_no_chain_segments(doc, 0, len(doc) - 1)
+    if len(segments) <= 1:
+        return text
+    return " of ".join(reversed(segments))
+
+
+def annotate_relations_english_order(relations):
+    """
+    relationsの各要素に source_en / target_en を付与する（STEP8'）。
+    既に付いている場合は上書きしない（従属請求項の合成結果のように、
+    一部が既にanalyze_claim()経由で付与済みのケースに対応するため）。
+    """
+    for r in relations:
+        r.setdefault("source_en", text_to_english_order(r["source"]))
+        r.setdefault("target_en", text_to_english_order(r["target"]))
+    return relations
+
+
+def add_english_order(components=None, relations=None):
+    """
+    componentsに "text_en" を、relationsに "source_en"/"target_en" を
+    付与する（STEP8'）。どちらか一方だけを渡してもよい。
+    """
+    if components:
+        for comp in components:
+            comp.setdefault("text_en", text_to_english_order(comp["text"]))
+    if relations:
+        annotate_relations_english_order(relations)
+    return components, relations
+
+
 def _simplify_hierarchy(relations, doc=None, components=None):
     """
     根（root）から全ノードへ直接「有する」で繋ぐのではなく、
@@ -2206,9 +2289,14 @@ def _extract_raw_relations(text):
 
 
 def analyze_claim(text):
-    """単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す"""
+    """
+    単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す。
+    STEP8'（英語語順正規化）により、各構成要素に "text_en"、各関係に
+    "source_en" / "target_en" が追加で付与される（既存キーはそのまま）。
+    """
     components, final_relations, doc = _extract_raw_relations(text)
     final_relations = _simplify_hierarchy(final_relations, doc, components)
+    add_english_order(components, final_relations)
     return components, final_relations
 
 
@@ -2915,6 +3003,8 @@ def analyze_claim_with_bullets(text, include_internal_detail=False):
             continue
         seen.add(key)
         unique_relations.append(r)
+
+    add_english_order(components, unique_relations)  # STEP8'
 
     return components, unique_relations
 
@@ -3780,6 +3870,7 @@ def analyze_dependent_claim(claim_number, claim_texts, prefer_parent=None):
     # （独立請求項由来の「有する」エッジが十分にあるので、
     #  正しい根はそこから見つかる）
     final_relations = _simplify_hierarchy(unique_relations)
+    annotate_relations_english_order(final_relations)  # STEP8'
 
     full_text = resolve_dependent_claim(claim_number, claim_texts, prefer_parent=prefer_parent)
     return (None, final_relations), full_text
