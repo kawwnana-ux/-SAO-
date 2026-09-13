@@ -614,6 +614,14 @@ def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
     取りこぼしていた。この関数はnmodの連鎖を、列挙マーカーが
     付いている限り奥まで辿ることでその問題に対応する。
 
+    ※実験的変更(未検証): 「Ａ、Ｂおよび Ｃ」のようにコンマ区切り＋
+    「および」が最後の項目にだけ付く列挙は、GiNZAのUD係り受けでは
+    nmodではなくconj(並列関係)で繋がることが多いと考えられる。
+    このコードベースはこれまでconjを使ったことが一度もなく実データでの
+    確認ができていないため、動作を見て問題があれば戻せるようにこの
+    部分だけ独立させてある。conj側はマーカーの有無を問わず常に辿り、
+    nmod側は従来通りマーカーがある場合のみ辿る。
+
     戻り値はテキスト上の出現順（開始位置）に並べ替えて返す。
     """
     results = []
@@ -628,13 +636,16 @@ def collect_enumerated_components(token, components, markers=_ENUM_MARKERS):
         if comp is not None and comp not in results:
             results.append(comp)
         for child in t.children:
-            if child.dep_ != "nmod":
-                continue
-            # 列挙マーカーが付いている場合、または、まだこの経路で
-            # 構成要素が1つも見つかっていない場合（＝間に修飾語を
-            # 挟んでいるだけの可能性がある場合）はさらに奥まで辿る。
-            if _has_enum_marker(child, markers) or comp is None:
+            if child.dep_ == "conj":
+                # 並列関係は、マーカー(と/及び等)が直接の子として
+                # 付いていない場合(コンマ区切りのみ等)でも列挙の一員として扱う
                 stack.append(child)
+            elif child.dep_ == "nmod":
+                # 列挙マーカーが付いている場合、または、まだこの経路で
+                # 構成要素が1つも見つかっていない場合（＝間に修飾語を
+                # 挟んでいるだけの可能性がある場合）はさらに奥まで辿る。
+                if _has_enum_marker(child, markers) or comp is None:
+                    stack.append(child)
     results.sort(key=lambda c: c["start"])
     return results
 
