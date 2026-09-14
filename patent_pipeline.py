@@ -2761,9 +2761,48 @@ def analyze_claim(text):
     ))
 
     # ⑥ 今は既存の表示を壊さない
-    add_english_order(components, final_relations)
+    # ⑥ Local LLMの結果を
+    #    Graphvizで使える形式に戻す
+    llm_relations = []
 
-    return components, final_relations
+    for rel in local_sao:
+        if not isinstance(rel, dict):
+            continue
+
+        source = str(
+            rel.get("source", rel.get("subject", ""))
+        ).strip()
+
+        relation = str(
+            rel.get("relation", "")
+        ).strip()
+
+        target = str(
+            rel.get("target", rel.get("object", ""))
+        ).strip()
+
+        if not source or not relation or not target:
+            continue
+
+        llm_relations.append({
+            "source": source,
+            "relation": relation,
+            "target": target,
+            "type": "LLM補正",
+        })
+
+    # LLMが何も返さなかった場合はGiNZA結果を使用
+    if not llm_relations:
+        llm_relations = final_relations
+
+    # ⑦ 英語順情報を追加
+    add_english_order(
+        components,
+        llm_relations
+    )
+
+    # ⑧ GraphvizにはLLM補正後SAOを返す
+    return components, llm_relations
 # ============================================================
 # ⑧ 自動レイアウト（マインドマップ風：左→右の階層配置）
 # ============================================================
