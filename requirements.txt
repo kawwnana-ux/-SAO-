@@ -13,3 +13,4 @@ sentence-transformers
 japanize-matplotlib
 openpyxl
 graphviz
+ollama
