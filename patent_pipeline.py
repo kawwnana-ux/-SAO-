@@ -2582,46 +2582,89 @@ def _clean_claim_text(text):
 
 
 def _extract_raw_relations(text):
-    """
-    「有する」木構造の階層整理（_simplify_hierarchy）をかける前の、
-    生の抽出結果を返す。1つの完全な請求項ではなく、従属請求項の
-    追加限定文のような「断片」を解析するときに使う
-    （断片だけを見て孤立ノードを無理に根に繋げてしまうのを防ぐため）。
-
-    工程/方法クレーム（_is_process_claim）と判定した場合は、装置クレーム
-    向けの抽出関数（位置関係・接触関係・直接関係等）を使わず、
-    extract_process_step_relations による専用パスに切り替える
-    （理由は extract_process_step_relations のdocstring参照）。
-    """
-    text = _clean_claim_text(text)
     doc = nlp(text)
+
     components = extract_patent_components_general(doc)
 
     if _is_process_claim(doc, components):
-        final_relations = extract_process_step_relations(doc, components)
+        final_relations = extract_process_step_relations(
+            doc,
+            components
+        )
         return components, final_relations, doc
 
     relation_words = extract_relation_words_general(doc)
 
-    positional = extract_positional_relations(doc, components, relation_words)
-    location = extract_has_location_relations(doc, components)
-    installation = extract_installation_relations(doc, components)
-    contact = extract_contact_relations(doc, components)
-    boundary = extract_boundary_relations(doc, components)
-    capability = extract_capability_relations(doc, components)
-    composition = extract_composition_relations(doc, components)
-    attribute = extract_attribute_relations(doc, components)
-    copula = extract_copula_relations(doc, components)
-    comparison = extract_comparison_relations(doc, components)
-    direct = extract_direct_relations(doc, components)
-    has = extract_has_relations(doc, components)
+    positional = extract_positional_relations(
+        doc,
+        components,
+        relation_words
+    )
+
+    location = extract_has_location_relations(
+        doc,
+        components
+    )
+
+    installation = extract_installation_relations(
+        doc,
+        components
+    )
+
+    contact = extract_contact_relations(
+        doc,
+        components
+    )
+
+    boundary = extract_boundary_relations(
+        doc,
+        components
+    )
+
+    capability = extract_capability_relations(
+        doc,
+        components
+    )
+
+    composition = extract_composition_relations(
+        doc,
+        components
+    )
+
+    attribute = extract_attribute_relations(
+        doc,
+        components
+    )
+
+    copula = extract_copula_relations(
+        doc,
+        components
+    )
+
+    comparison = extract_comparison_relations(
+        doc,
+        components
+    )
+
+    direct = extract_direct_relations(
+        doc,
+        components
+    )
+
+    has = extract_has_relations(
+        doc,
+        components
+    )
 
     final_relations = combine_all_relations(
         positional + location + installation + boundary,
-        direct + contact + capability + composition + attribute + copula + comparison,
+        direct + contact + capability + composition
+        + attribute + copula + comparison,
         has,
     )
+
     return components, final_relations, doc
+    
 def extract_sao_with_local_llm(claim, ginza_sao):
     """
     GiNZAが抽出したSAO候補をローカルLLMに渡し、
