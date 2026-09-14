@@ -95,14 +95,29 @@ print("GiNZAの読み込みに成功しました！ モデル:", model_path)
 # 日本語フォント
 # ============================================================
 
-FONT_PATH = "/tmp/NotoSansJP-Regular.ttf"
-if not os.path.exists(FONT_PATH):
-    os.system(
-        f'curl -sL -o {FONT_PATH} '
-        '"https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"'
-    )
-#fm.fontManager.addfont(FONT_PATH)
-FONT_PROP = fm.FontProperties(fname=FONT_PATH)
+# ============================================================
+# 日本語フォント設定
+# Windows / Streamlit Cloud 両対応
+# ============================================================
+
+FONT_PROP = fm.FontProperties()
+
+try:
+    # Windowsに入っている日本語フォントを使用
+    windows_fonts = [
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+    ]
+
+    for font_path in windows_fonts:
+        if os.path.exists(font_path):
+            FONT_PROP = fm.FontProperties(fname=font_path)
+            break
+
+except Exception:
+    # フォントが見つからなくても解析自体は継続
+    FONT_PROP = fm.FontProperties()
 
 # ============================================================
 # SudachiPyによる前処理（表記ゆれの正規化）
