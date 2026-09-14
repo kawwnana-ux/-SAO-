@@ -4545,3 +4545,69 @@ def llm_available():
 
 
 print("GiNZA + SudachiPy前処理によるSAO解析を有効化しました。（LLM不使用）")
+
+import ollama
+import json
+import re
+
+
+def extract_sao_with_local_llm(claim, ginza_sao=None):
+
+    prompt = f"""
+あなたは日本語特許請求項のSAO構造を抽出する専門システムです。
+
+SAOとは、
+S = Subject（主体・技術要素）
+A = Action / Relation（動作・関係）
+O = Object（対象・技術要素）
+です。
+
+以下の特許請求項から、技術的に意味のあるSAOだけを抽出してください。
+
+【特許請求項】
+{claim}
+
+【GiNZAによるSAO候補】
+{json.dumps(ginza_sao or [], ensure_ascii=False)}
+
+注意：
+- 「少なくとも」「主に」「さらに」などの副詞・機能語を技術ノードにしない
+- 「前記」は、それが指す技術要素に置き換える
+- 技術的な部品・構成要素をSubject/Objectとして優先する
+- 「備える」「有する」「接続する」「設けられる」などの関係をActionとして扱う
+- 同じ内容のSAOを重複して出さない
+- 技術的に意味のないSAOは削除する
+
+必ず次のJSON形式だけで回答してください。
+
+[
+  {{
+    "subject": "主体",
+    "action": "関係",
+    "object": "対象"
+  }}
+]
+"""
+
+    response = ollama.chat(
+        model="qwen2.5:7b",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    text = response["message"]["content"]
+
+    # JSON部分だけ取り出す
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+
+    if not match:
+        return []
+
+    try:
+        return json.loads(match.group())
+    except json.JSONDecodeError:
+        return []
