@@ -164,9 +164,10 @@ with tab1:
     st.subheader("📝 請求項を入力してください")
 
     st.info(
-        "🔧 SudachiPy（前処理）＋GiNZA（係り受け解析）＋ルールベース補正のみでSAO構造を抽出します。"
-        "LLMは使用しません。"
+        "🔧 SudachiPy（前処理）＋GiNZA（係り受け解析）＋OllamaによるSAO補正で"
+        "SAO構造を抽出・可視化します。"
     )
+
     text = st.text_area(
         "請求項テキスト",
         height=220,
@@ -177,41 +178,94 @@ with tab1:
     show_debug = st.checkbox(
         "🔍 デバッグ: 形態素・係り受け情報を表示する（開発用）",
         key="single_show_debug",
-        help="GiNZAが各語をどの品詞・係り受けラベルで解析したかを表で確認できます。"
-             "抽出ルールがうまく動かない時の原因調査に使います。",
+        help=(
+            "GiNZAが各語をどの品詞・係り受けラベルで解析したかを表で確認できます。"
+            "抽出ルールがうまく動かない時の原因調査に使います。"
+        ),
     )
+
     show_relation_trace = st.checkbox(
         "🧭 デバッグ: 関係抽出の分岐トレースを表示する（開発用）",
         key="single_show_trace",
-        help="extract_direct_relations等が、どの分岐を通ってsource/targetを"
-             "決めたかを1行ずつ記録します。抽出結果が想定と違う時の原因調査に使います。",
+        help=(
+            "extract_direct_relations等が、どの分岐を通ってsource/targetを"
+            "決めたかを1行ずつ記録します。抽出結果が想定と違う時の原因調査に使います。"
+        ),
     )
 
     if st.button("✨ 解析する", type="primary", key="single_run"):
+
         if not text.strip():
             st.warning("請求項テキストを入力してください。")
+
             st.session_state.single_result = None
             st.session_state.single_debug_tokens = None
             st.session_state.single_debug_trace = None
+
         else:
-            with st.spinner("解析中..."):
+
+            with st.spinner("GiNZA＋Ollamaで解析中..."):
+
                 try:
+
+                    # --------------------------------------------
+                    # デバッグ設定
+                    # --------------------------------------------
                     if show_relation_trace:
                         pp.DEBUG_MODE = True
                         pp.DEBUG_TRACE.clear()
-                    components, relations = pp.analyze_claim_ginza(text)
+
+                    # --------------------------------------------
+                    # SAO解析
+                    #
+                    # ここが重要
+                    # analyze_claim_ginza() ではなく
+                    # analyze_claim() を使用する
+                    #
+                    # analyze_claim()
+                    #   ↓
+                    # GiNZA
+                    #   ↓
+                    # SAO候補
+                    #   ↓
+                    # Ollama
+                    #   ↓
+                    # SAO補正
+                    # --------------------------------------------
+                    components, relations = pp.analyze_claim(text)
+
+                    # --------------------------------------------
+                    # 解析結果を保存
+                    # --------------------------------------------
                     st.session_state.single_result = {
                         "components": components,
                         "relations": relations,
                     }
+
+                    # --------------------------------------------
+                    # 関係抽出トレース
+                    # --------------------------------------------
                     if show_relation_trace:
-                        st.session_state.single_debug_trace = list(pp.DEBUG_TRACE)
-                        pp.DEBUG_MODE = False
+
+                        st.session_state.single_debug_trace = list(
+                            pp.DEBUG_TRACE
+                        )
+
                     else:
+
                         st.session_state.single_debug_trace = None
+
+                    # --------------------------------------------
+                    # GiNZAの形態素・係り受け情報
+                    # --------------------------------------------
                     if show_debug:
-                        debug_doc = pp.nlp(pp._clean_claim_text(text))
+
+                        debug_doc = pp.nlp(
+                            pp._clean_claim_text(text)
+                        )
+
                         st.session_state.single_debug_tokens = [
+
                             {
                                 "i": t.i,
                                 "表層形": t.text,
@@ -221,66 +275,147 @@ with tab1:
                                 "係り先": t.head.text,
                                 "原形": t.lemma_,
                             }
+
                             for t in debug_doc
                         ]
+
                     else:
+
                         st.session_state.single_debug_tokens = None
+
                 except Exception as e:
-                    st.error(f"解析中にエラーが発生しました: {e}")
+
+                    st.error(
+                        f"解析中にエラーが発生しました: {e}"
+                    )
+
                     st.session_state.single_result = None
                     st.session_state.single_debug_tokens = None
                     st.session_state.single_debug_trace = None
+
                 finally:
+
                     pp.DEBUG_MODE = False
 
-    # 関係抽出の分岐トレースを表示
+    # ============================================================
+    # 関係抽出の分岐トレース
+    # ============================================================
+
     if st.session_state.get("single_debug_trace"):
-        with st.expander("🧭 関係抽出の分岐トレース（デバッグ）", expanded=True):
+
+        with st.expander(
+            "🧭 関係抽出の分岐トレース（デバッグ）",
+            expanded=True
+        ):
+
             st.caption(
                 "extract_direct_relations等が、どの動詞についてどの分岐を通り、"
                 "source/targetとして何を選んだかの記録です。上から実行順です。"
             )
+
             st.dataframe(
                 st.session_state.single_debug_trace,
                 use_container_width=True,
                 hide_index=True,
             )
 
-    # デバッグ情報を表示（結果の有無に関わらず、取得できていれば出す）
+    # ============================================================
+    # 形態素・係り受け情報
+    # ============================================================
+
     if st.session_state.get("single_debug_tokens"):
-        with st.expander("🔍 形態素・係り受け情報（デバッグ）", expanded=True):
+
+        with st.expander(
+            "🔍 形態素・係り受け情報（デバッグ）",
+            expanded=True
+        ):
+
             st.caption(
-                "各語の品詞(pos_)・係り受けラベル(dep_)・係り先(head)・原形(lemma_)の一覧です。"
-                "抽出ルールが期待通りに動かない時、どの語がどこに係っているかをここで確認できます。"
+                "各語の品詞(pos_)・係り受けラベル(dep_)・係り先(head)・"
+                "原形(lemma_)の一覧です。"
             )
+
             st.dataframe(
                 st.session_state.single_debug_tokens,
                 use_container_width=True,
                 hide_index=True,
             )
 
+    # ============================================================
     # 結果を表示
+    # ============================================================
+
     if st.session_state.single_result is not None:
+
         relations = st.session_state.single_result["relations"]
 
         if not relations:
-            st.info("関係が抽出できませんでした。文の書き方を見直してみてください。")
+
+            st.info(
+                "関係が抽出できませんでした。"
+                "文の書き方を見直してみてください。"
+            )
+
         else:
-            st.success(f"🎉 {len(relations)} 件の関係を抽出しました！")
+
+            st.success(
+                f"🎉 Ollama補正後のSAOを {len(relations)} 件取得しました！"
+            )
 
             col1, col2 = st.columns([3, 2])
 
-            with col1:
-                st.markdown("#### 🪸 構成要素間の関係図")
-                graph = pp.build_graphviz(relations, title="構成要素間関係", theme="deepsea")
-                st.graphviz_chart(graph, use_container_width=True)
+            # ====================================================
+            # 左：SAOグラフ
+            # ====================================================
 
-                st.markdown("#### 🐙 クレームの広さ・狭さ")
-                narrowness, breadth, scope_detail = pp.compute_claim_scope_score(relations)
+            with col1:
+
+                st.markdown(
+                    "#### 🪸 Ollama補正後の構成要素間関係図"
+                )
+
+                # --------------------------------------------
+                # relations はOllama補正後のSAO
+                # --------------------------------------------
+                graph = pp.build_graphviz(
+                    relations,
+                    title="Ollama補正後の構成要素間関係",
+                    theme="deepsea",
+                )
+
+                st.graphviz_chart(
+                    graph,
+                    use_container_width=True
+                )
+
+                # =================================================
+                # クレームの広さ・狭さ
+                # =================================================
+
+                st.markdown(
+                    "#### 🐙 クレームの広さ・狭さ"
+                )
+
+                narrowness, breadth, scope_detail = (
+                    pp.compute_claim_scope_score(relations)
+                )
+
                 scope_cols = st.columns(2)
-                scope_cols[0].metric("広さスコア（大きいほど抽象的）", f"{breadth:.3f}")
-                scope_cols[1].metric("狭さスコア（大きいほど限定的）", f"{narrowness:.3f}")
-                with st.expander("広さ・狭さの内訳を見る"):
+
+                scope_cols[0].metric(
+                    "広さスコア（大きいほど抽象的）",
+                    f"{breadth:.3f}"
+                )
+
+                scope_cols[1].metric(
+                    "狭さスコア（大きいほど限定的）",
+                    f"{narrowness:.3f}"
+                )
+
+                with st.expander(
+                    "広さ・狭さの内訳を見る"
+                ):
+
                     st.write(
                         f"- 構成要素数: {scope_detail['構成要素数']}\n"
                         f"- 関係の総数: {scope_detail['関係の総数']}\n"
@@ -288,28 +423,36 @@ with tab1:
                         f"- 「有する」階層の深さ: {scope_detail['階層の深さ']}\n"
                         f"- 関係密度(関係数/構成要素数): {scope_detail['関係密度']}"
                     )
+
                     st.caption(
-                        "※ このスコアは絶対的な尺度ではなく、他の請求項と相対的に比べるための指標です"
-                        "（例：独立項と従属項の比較、改良前後のクレーム案の比較など）。"
+                        "※ このスコアは絶対的な尺度ではなく、"
+                        "他の請求項と相対的に比べるための指標です。"
                     )
 
+            # ====================================================
+            # 右：SAO一覧
+            # ====================================================
+
             with col2:
-                st.markdown("#### 📋 抽出された関係（SAOトリプル）")
+
+                st.markdown(
+                    "#### 📋 Ollama補正後のSAOトリプル"
+                )
+
                 st.dataframe(
                     [
                         {
-                            "主語": r["source"],
-                            "関係": r["relation"],
-                            "目的語": r["target"],
-                            "種類": r["type"],
+                            "主語": r.get("source", ""),
+                            "関係": r.get("relation", ""),
+                            "目的語": r.get("target", ""),
+                            "種類": r.get("type", ""),
                         }
+
                         for r in relations
                     ],
                     use_container_width=True,
                     hide_index=True,
                 )
-
-
 # ============================================================
 # タブ②：2つの請求項を比較して類似度診断する
 # ============================================================
