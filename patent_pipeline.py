@@ -7,7 +7,7 @@ import networkx as nx
 import matplotlib
 import ollama
 import json
-import re
+
 
 # ============================================================
 # デバッグトレース機構
