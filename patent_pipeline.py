@@ -101,7 +101,7 @@ if not os.path.exists(FONT_PATH):
         f'curl -sL -o {FONT_PATH} '
         '"https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"'
     )
-fm.fontManager.addfont(FONT_PATH)
+#fm.fontManager.addfont(FONT_PATH)
 FONT_PROP = fm.FontProperties(fname=FONT_PATH)
 
 # ============================================================
