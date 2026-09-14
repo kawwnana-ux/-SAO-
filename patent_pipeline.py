@@ -5,6 +5,9 @@ import ginza
 import ja_ginza
 import networkx as nx
 import matplotlib
+import ollama
+import json
+import re
 
 # ============================================================
 # デバッグトレース機構
@@ -2604,20 +2607,148 @@ def _extract_raw_relations(text):
         has,
     )
     return components, final_relations, doc
+def extract_sao_with_local_llm(claim, ginza_sao):
+    """
+    GiNZAが抽出したSAO候補をローカルLLMに渡し、
+    特許請求項として妥当なSAOに整理する。
+    """
 
+    prompt = f"""
+あなたは日本語特許請求項のSAO構造を抽出する専門家です。
+
+SAO：
+S = Subject（主体・技術要素）
+A = Action / Relation（動作・関係）
+O = Object（対象・技術要素）
+
+【特許請求項】
+{claim}
+
+【GiNZAが抽出したSAO候補】
+{json.dumps(ginza_sao, ensure_ascii=False, indent=2)}
+
+以下のルールに従ってSAOを修正してください。
+
+1. 技術的な部品・構成要素をSubject/Objectにする。
+2. 「少なくとも」「主に」「さらに」「前記」などを
+   独立した技術要素にしない。
+3. 「前記○○」は、対応する既出の技術要素を参照する。
+4. 「備える」「有する」「接続する」「設けられる」
+   などをRelationとして扱う。
+5. 明らかに誤ったGiNZAの係り受けは修正する。
+6. 同じSAOは重複させない。
+7. 技術的意味のない関係は削除する。
+8. 請求項に書かれていない関係を勝手に追加しない。
+
+必ずJSONのみを出力してください。
+
+[
+  {{
+    "subject": "主体",
+    "relation": "関係",
+    "object": "対象"
+  }}
+]
+"""
+
+    try:
+        response = ollama.chat(
+            model="qwen2.5:7b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+        )
+
+        result = response["message"]["content"]
+
+        match = re.search(r"\[.*\]", result, re.DOTALL)
+
+        if not match:
+            return []
+
+        sao = json.loads(match.group())
+
+        # 最低限の形式チェック
+        valid = []
+
+        for item in sao:
+            if not isinstance(item, dict):
+                continue
+
+            if not all(
+                key in item
+                for key in ["subject", "relation", "object"]
+            ):
+                continue
+
+            if not all(
+                isinstance(item[key], str) and item[key].strip()
+                for key in ["subject", "relation", "object"]
+            ):
+                continue
+
+            valid.append(item)
+
+        return valid
+
+    except Exception as e:
+        print("Local LLM error:", e)
+        return []
 
 def analyze_claim(text):
     """
-    単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す。
-    STEP8'（英語語順正規化）により、各構成要素に "text_en"、各関係に
-    "source_en" / "target_en" が追加で付与される（既存キーはそのまま）。
+    請求項をGiNZAで解析し、
+    そのSAO候補をローカルLLMで補正する。
     """
+
+    # ① GiNZA＋既存ルール
     components, final_relations, doc = _extract_raw_relations(text)
-    final_relations = _simplify_hierarchy(final_relations, doc, components)
+
+    # ② 既存の階層整理
+    final_relations = _simplify_hierarchy(
+        final_relations,
+        doc,
+        components
+    )
+
+    # ③ GiNZAの結果をSAO形式に変換
+    ginza_sao = []
+
+    for rel in final_relations:
+        ginza_sao.append({
+            "subject": rel["source"],
+            "relation": rel["relation"],
+            "object": rel["target"]
+        })
+
+    # ④ ローカルLLMで補正
+    local_sao = extract_sao_with_local_llm(
+        text,
+        ginza_sao
+    )
+
+    # ⑤ 今は確認用
+    print("===== GiNZA SAO =====")
+    print(json.dumps(
+        ginza_sao,
+        ensure_ascii=False,
+        indent=2
+    ))
+
+    print("===== Local LLM SAO =====")
+    print(json.dumps(
+        local_sao,
+        ensure_ascii=False,
+        indent=2
+    ))
+
+    # ⑥ 今は既存の表示を壊さない
     add_english_order(components, final_relations)
+
     return components, final_relations
-
-
 # ============================================================
 # ⑧ 自動レイアウト（マインドマップ風：左→右の階層配置）
 # ============================================================
@@ -4546,68 +4677,6 @@ def llm_available():
 
 print("GiNZA + SudachiPy前処理によるSAO解析を有効化しました。（LLM不使用）")
 
-import ollama
-import json
-import re
-
-
-def extract_sao_with_local_llm(claim, ginza_sao=None):
-
-    prompt = f"""
-あなたは日本語特許請求項のSAO構造を抽出する専門システムです。
-
-SAOとは、
-S = Subject（主体・技術要素）
-A = Action / Relation（動作・関係）
-O = Object（対象・技術要素）
-です。
-
-以下の特許請求項から、技術的に意味のあるSAOだけを抽出してください。
-
-【特許請求項】
-{claim}
-
-【GiNZAによるSAO候補】
-{json.dumps(ginza_sao or [], ensure_ascii=False)}
-
-注意：
-- 「少なくとも」「主に」「さらに」などの副詞・機能語を技術ノードにしない
-- 「前記」は、それが指す技術要素に置き換える
-- 技術的な部品・構成要素をSubject/Objectとして優先する
-- 「備える」「有する」「接続する」「設けられる」などの関係をActionとして扱う
-- 同じ内容のSAOを重複して出さない
-- 技術的に意味のないSAOは削除する
-
-必ず次のJSON形式だけで回答してください。
-
-[
-  {{
-    "subject": "主体",
-    "action": "関係",
-    "object": "対象"
-  }}
-]
-"""
-
-    response = ollama.chat(
-        model="qwen2.5:7b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-
-    text = response["message"]["content"]
-
-    # JSON部分だけ取り出す
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-
-    if not match:
-        return []
-
-    try:
         return json.loads(match.group())
     except json.JSONDecodeError:
         return []
