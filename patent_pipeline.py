@@ -1746,10 +1746,19 @@ def extract_direct_relations(doc, components):
 
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
-        if head_component is None and _is_passive(verb):
-            # 動詞連鎖の途中で係り先が別の動詞になっている受身動詞は、
-            # 延々と遡るフォールバックの前に「に対して」の対象を確認する。
-            head_component = _find_taishite_target(verb, components)
+        if _is_passive(verb):
+            # 「に対して」で明示的に対象が示されている場合は、それを最優先で
+            # 使う。head_componentが直接見つかっている場合でも、その直接の
+            # 係り先が「決め」→「モジュール」(請求項タイトル)のように、
+            # 複数の節をまたいだ末に辿り着いた無関係に近いノードである
+            # ケースがあるため、「に対して」の方が優先度が高い
+            # （532件評価・実データのdepダンプで確認：「決め」はacl経由で
+            #  請求項タイトルに直接繋がっているためhead_componentが直接
+            #  見つかってしまい、_find_taishite_targetが従来呼ばれていなかった）。
+            taishite_target = _find_taishite_target(verb, components)
+            if taishite_target is not None:
+                head_component = taishite_target
+                used_fallback = False
         if head_component is None:
             # 係り先が構成要素でない場合（別の動詞に連なっている等）は、
             # さらに上まで遡って構成要素を探す
@@ -1774,6 +1783,12 @@ def extract_direct_relations(doc, components):
                 if child.text == "場合":
                     # 「場合」は条件節の目印であって、動作主ではないので除外する
                     # （GiNZAが超長文でここに主語を誤って結びつけることがある）
+                    continue
+                if _is_instrumental_obl(child):
+                    # 「Ａにより」「Ａを用いて」のような手段・道具は、
+                    # 動作主(counterpart)ではないので対象から外す
+                    # （実データで確認：「開口部により」が誤って
+                    #  独立した関係の主語として扱われていた）。
                     continue
                 role = case_frame_role(verb, child)
                 counterpart = (
