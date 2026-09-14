@@ -14,3 +14,4 @@ japanize-matplotlib
 openpyxl
 graphviz
 ollama
+patent_pipeline
