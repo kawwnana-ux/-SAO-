@@ -981,7 +981,12 @@ def _merged_modifier_name(token, components):
         if not has_no:
             continue
         child_comp = find_component_by_token(components, child.i)
-        prefix = (child_comp["text"] if child_comp is not None else child.text) + "の"
+        candidate = child_comp["text"] if child_comp is not None else child.text
+        if candidate == base or base.startswith(candidate):
+            # 「一部」の所属先コンポーネントが既に「取り付けフレームの一部」
+            # のようにマージ済みの場合、二重に前置きしない
+            break
+        prefix = candidate + "の"
         break
 
     return prefix + base
@@ -1112,6 +1117,43 @@ def extract_boundary_relations(doc, components):
     return relations
 
 
+def _find_nsubj_target_for_verb(doc, components, verb):
+    """
+    「前記取り付けフレームの一部は、Ａと、Ｂとの間に位置する」のように、
+    位置関係の動詞（位置する等）が名詞を修飾する連体修飾節（acl）として
+    使われている場合、GiNZAの長文解析でこの動詞自身の主語（「一部」）が、
+    動詞にではなく、その動詞が係る先のさらに遠い名詞（節全体が最終的に
+    かかる請求項全体の名前など）に直接の子（nsubj）として誤って
+    結びついてしまうことがある（extract_has_relationsのsubj_token選択で
+    対応した問題と同じ系統のバグ）。
+
+    obj（目的語）が見つからない場合のフォールバックとして、まず動詞自身、
+    次に動詞の係り先（head）の直接の子からnsubjを探し、動詞に一番近い
+    ものを主語として採用する。所有格プレフィックス（「取り付けフレームの」
+    等）も含めた名前を使う。
+    """
+    candidates = []
+    seen_idx = set()
+    for child in verb.children:
+        if child.dep_ == "nsubj" and child.i not in seen_idx:
+            candidates.append(child)
+            seen_idx.add(child.i)
+    if verb.head is not None and verb.head.i != verb.i:
+        for child in verb.head.children:
+            if child.dep_ == "nsubj" and child.i not in seen_idx:
+                candidates.append(child)
+                seen_idx.add(child.i)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: abs(c.i - verb.i))
+    chosen = candidates[0]
+    comp = find_component_by_token(components, chosen.i) or find_referenced_component(components, chosen)
+    if comp is None:
+        return None
+    merged_text = _merged_modifier_name(chosen, components)
+    return {"text": merged_text}
+
+
 def extract_positional_relations(doc, components, relation_words):
     relations = []
     for relation in relation_words:
@@ -1136,7 +1178,34 @@ def extract_positional_relations(doc, components, relation_words):
         if verb.pos_ != "VERB":
             continue
 
-        if verb.lemma_ in HAS_LEMMAS:
+        # 「ＡとＢとの間に」のように、「間」の基準となる複数の対象のうち
+        # 一方（Ａ）が「間」自身の子（nmod）ではなく、動詞の別のobl引数
+        # として並列に現れることがある（「Ａと、Ｂとの間に」で、Ａ側が
+        # 動詞に直接係り、Ｂ側だけが「間」に係る場合）。そのような「と」
+        # 付きの並列obl引数も基準側（source）として拾う。また、
+        # 「Ａ、ＢおよびＣと」のように列挙されている場合は、nmodで
+        # 連なる連鎖（Ｃ→Ｂ→Ａ）を辿って全項目を拾う。
+        for sibling in verb.children:
+            if sibling.i == relation_token.i or sibling.dep_ != "obl":
+                continue
+            if not any(gc.dep_ == "case" and gc.text == "と" for gc in sibling.children):
+                continue
+            chain_token = sibling
+            visited_chain = set()
+            while chain_token is not None and chain_token.i not in visited_chain:
+                visited_chain.add(chain_token.i)
+                c = find_referenced_component(components, chain_token)
+                if c is not None and c not in source_components:
+                    source_components.append(c)
+                next_token = None
+                for gc in chain_token.children:
+                    if gc.dep_ == "nmod":
+                        next_token = gc
+                        break
+                chain_token = next_token
+
+        is_has_branch = verb.lemma_ in HAS_LEMMAS
+        if is_has_branch:
             # 「Ａ間に、Ｂを有し」のように「有する」が使われている場合は、
             # 文全体の主語（根っこ）ではなく、「有する」の直接の目的語
             # （＝実際にそこに存在するもの）を関係先にする。
@@ -1157,9 +1226,14 @@ def extract_positional_relations(doc, components, relation_words):
                         target_components.append(t)
                     break
             if not target_components:
-                # 動詞自身に直接の目的語(obj)がない場合（受身形など）だけ、
-                # 従来通り動詞連鎖を遡って構成要素を探す
-                target_components = find_target_component_from_verb(components, verb)
+                # 動詞自身に直接の目的語(obj)がない場合、まず動詞（またはその
+                # 係り先）のnsubjを探す。見つからない場合だけ、従来通り
+                # 動詞連鎖を遡って構成要素を探す。
+                nsubj_target = _find_nsubj_target_for_verb(doc, components, verb)
+                if nsubj_target is not None:
+                    target_components = [nsubj_target]
+                else:
+                    target_components = find_target_component_from_verb(components, verb)
             aux_texts = "".join(
                 c.text for c in sorted(verb.children, key=lambda c: c.i)
                 if c.pos_ == "AUX" and c.i > verb.i
@@ -1170,12 +1244,25 @@ def extract_positional_relations(doc, components, relation_words):
             for source in source_components:
                 if source["text"] == target["text"]:
                     continue
-                relations.append({
-                    "source": source["text"],
-                    "relation": label,
-                    "target": target["text"],
-                    "type": "positional",
-                })
+                if is_has_branch:
+                    relations.append({
+                        "source": source["text"],
+                        "relation": label,
+                        "target": target["text"],
+                        "type": "positional",
+                    })
+                else:
+                    # 「ＡとＢとの間にＣが設けられる／位置する」等は、
+                    # 意味的には「Ｃ（配置される主体）が、Ａ・Ｂ（基準・
+                    # 境界となる相手）に対して間に位置する」であり、
+                    # ＳＡＯとして素直に読めば source=Ｃ（配置される側）、
+                    # target=Ａ・Ｂ（基準側）である。
+                    relations.append({
+                        "source": target["text"],
+                        "relation": label,
+                        "target": source["text"],
+                        "type": "positional",
+                    })
     return relations
 
 
@@ -2087,11 +2174,18 @@ def extract_has_relations(doc, components):
         if verb.lemma_ not in HAS_LEMMAS or verb.pos_ != "VERB":
             continue
 
-        subj_token = None
+        # 「〜は、…備え、…含み、前記取り付けフレームは、開口部を有し」のような
+        # 長文では、GiNZAが「有し」に対してnsubjを複数（離れた節の主語＋
+        # 本来のローカルな主語）結びつけてしまうことがある。単純に最初に
+        # 見つかったものを採るとインデックスが小さい方＝より遠い主語を
+        # 誤って選んでしまうため、動詞に一番近いnsubjを優先する。
+        subj_candidates = [c for c in verb.children if c.dep_ == "nsubj"]
+        subj_token = (
+            min(subj_candidates, key=lambda c: abs(c.i - verb.i))
+            if subj_candidates else None
+        )
         obj_token = None
         for child in verb.children:
-            if child.dep_ == "nsubj" and subj_token is None:
-                subj_token = child
             if child.dep_ == "obj" and obj_token is None:
                 obj_token = child
 
@@ -2539,6 +2633,27 @@ def _simplify_hierarchy(relations, doc=None, components=None):
     for r in simplified:
         incoming2.setdefault(r["target"], []).append(r)
 
+    # 「取り付けフレームの一部」のように、名前に「の」を含み、その所有者
+    # （「取り付けフレーム」）が既にグラフ内で根や他ノードと繋がっている
+    # 場合は、"誰からも指されていない孤立ノード"として根に直接繋ぎ直す
+    # 必要はない（既に所有者経由で間接的に繋がっているとみなせる）。
+    # これをしないと、「Ａの一部」のような入れ子表現がpositional関係の
+    # sourceになるたびに、根から二重に「有する」で繋がってしまう。
+    known_nodes = set()
+    for r in simplified:
+        known_nodes.add(r["source"])
+        known_nodes.add(r["target"])
+
+    def _has_connected_genitive_owner(node_text):
+        idx = node_text.find("の")
+        while idx != -1:
+            owner_candidate = node_text[:idx]
+            if owner_candidate and owner_candidate != node_text and owner_candidate in known_nodes:
+                if owner_candidate == root or owner_candidate in incoming2:
+                    return True
+            idx = node_text.find("の", idx + 1)
+        return False
+
     extra = []
     added = set()
     for r in simplified:
@@ -2548,6 +2663,8 @@ def _simplify_hierarchy(relations, doc=None, components=None):
         if s == root or s in added:
             continue
         if s not in incoming2:
+            if _has_connected_genitive_owner(s):
+                continue
             extra.append({"source": root, "relation": "有する", "target": s, "type": "has"})
             added.add(s)
 
@@ -2668,11 +2785,16 @@ def _extract_raw_relations(text):
 def extract_sao_with_local_llm(claim, ginza_sao):
     """
     GiNZAが抽出したSAO候補をローカルLLMに渡し、
-    特許請求項として妥当なSAOに整理する。
+    「抜け（見落とし）」がないかだけを確認してもらう。
+
+    GiNZA候補は既に高精度に調整済みなので、ここではLLMに
+    削除・書き換えの権限を与えない（削る役ではなく足す役）。
+    小型ローカルLLMは複雑な列挙構文などで不安定なため、
+    GiNZAが既に正しく取れている関係を上書き・消去させないことが重要。
     """
 
     prompt = f"""
-あなたは日本語特許請求項のSAO構造を抽出する専門家です。
+あなたは日本語特許請求項のSAO構造をチェックする専門家です。
 
 SAO：
 S = Subject（主体・技術要素）
@@ -2682,21 +2804,26 @@ O = Object（対象・技術要素）
 【特許請求項】
 {claim}
 
-【GiNZAが抽出したSAO候補】
+【GiNZAが抽出したSAO候補（これは正しいものとして扱ってください）】
 {json.dumps(ginza_sao, ensure_ascii=False, indent=2)}
 
-以下のルールに従ってSAOを修正してください。
+あなたの役割は「削除・修正」ではなく「見落としの補完」だけです。
 
-1. 技術的な部品・構成要素をSubject/Objectにする。
-2. 「少なくとも」「主に」「さらに」「前記」などを
-   独立した技術要素にしない。
-3. 「前記○○」は、対応する既出の技術要素を参照する。
-4. 「備える」「有する」「接続する」「設けられる」
-   などをRelationとして扱う。
-5. 明らかに誤ったGiNZAの係り受けは修正する。
+1. GiNZA候補にある関係は、内容が明らかな誤り（実際には存在しない関係）
+   でない限り、削除・変更せずそのまま出力に含める。
+2. 請求項本文を読んで、GiNZA候補に含まれていない関係のうち、
+   本文に明記されている技術的な関係があれば追加する。
+3. 1つのSubjectが複数のObjectと関係する場合
+   （例：「Ａ、ＢおよびＣとの間に位置する」のような列挙）は、
+   Objectごとに1件ずつ、別々のSAOとして出力する。
+   まとめて1件にしたり、一部のObjectだけを残したりしない。
+4. 「少なくとも」「主に」「さらに」「前記」などを
+   単独のSubject/Objectにしない。
+5. 「前記○○」は、対応する既出の技術要素名に置き換える。
 6. 同じSAOは重複させない。
-7. 技術的意味のない関係は削除する。
-8. 請求項に書かれていない関係を勝手に追加しない。
+7. 請求項に書かれていない関係を勝手に作らない（ハルシネーション禁止）。
+8. 出力は「GiNZA候補＋あなたが追加した関係」の全件とする。
+   一部だけを出力する（間引く）のは禁止。
 
 必ずJSONのみを出力してください。
 
@@ -2756,10 +2883,24 @@ O = Object（対象・技術要素）
         print("Local LLM error:", e)
         return []
 
+def _normalize_for_dedup(s):
+    """LLM補完とGiNZA結果の重複判定用に、空白だけ除去した比較キーを作る。"""
+    return re.sub(r"[\s　]", "", str(s))
+
+
 def analyze_claim(text):
     """
-    請求項をGiNZAで解析し、
-    そのSAO候補をローカルLLMで補正する。
+    請求項をGiNZAで解析し、そのSAO候補をローカルLLMで「補完」する。
+
+    設計方針（重要）：
+    GiNZAルールベースの抽出結果は、これまでの精度検証・回帰テストで
+    磨き込んだ「信頼できる基準」として扱い、絶対に上書き・削除しない。
+    ローカルLLM（Ollama）は、GiNZAが見落とした関係を追加するためだけに使う。
+    小型ローカルLLMは複雑な列挙構文などで不安定（関係を削ったり、
+    複数Objectのうち一部しか返さなかったりする）ため、
+    以前の実装（LLM出力で全置換）ではGiNZAで正しく取れていた関係まで
+    失われてしまっていた。この実装ではGiNZA結果を必ず全件保持し、
+    LLMの提案のうちGiNZA結果と重複しないものだけを追加する。
     """
 
     # ① GiNZA＋既存ルール
@@ -2772,41 +2913,33 @@ def analyze_claim(text):
         components
     )
 
-    # ③ GiNZAの結果をSAO形式に変換
-    ginza_sao = []
-
-    for rel in final_relations:
-        ginza_sao.append({
+    # ③ GiNZAの結果をSAO形式に変換（LLMへのプロンプト用）
+    ginza_sao = [
+        {
             "subject": rel["source"],
             "relation": rel["relation"],
-            "object": rel["target"]
-        })
+            "object": rel["target"],
+        }
+        for rel in final_relations
+    ]
 
-    # ④ ローカルLLMで補正
+    # ④ ローカルLLMで「追加候補」を取得
+    #    （失敗・接続不可・空応答の場合は空リストが返る＝GiNZA結果のみになる）
     local_sao = extract_sao_with_local_llm(
         text,
         ginza_sao
     )
 
-    # ⑤ 今は確認用
-    print("===== GiNZA SAO =====")
-    print(json.dumps(
-        ginza_sao,
-        ensure_ascii=False,
-        indent=2
-    ))
+    # ⑤ GiNZA結果はそのまま全件保持しつつ、
+    #    LLMが提案した中でGiNZA結果と重複しないものだけを追加する
+    merged_relations = list(final_relations)
 
-    print("===== Local LLM SAO =====")
-    print(json.dumps(
-        local_sao,
-        ensure_ascii=False,
-        indent=2
-    ))
+    existing_keys = {
+        (_normalize_for_dedup(r["source"]), _normalize_for_dedup(r["target"]))
+        for r in final_relations
+    }
 
-    # ⑥ 今は既存の表示を壊さない
-    # ⑥ Local LLMの結果を
-    #    Graphvizで使える形式に戻す
-    llm_relations = []
+    added_count = 0
 
     for rel in local_sao:
         if not isinstance(rel, dict):
@@ -2827,25 +2960,46 @@ def analyze_claim(text):
         if not source or not relation or not target:
             continue
 
-        llm_relations.append({
+        key = (_normalize_for_dedup(source), _normalize_for_dedup(target))
+
+        if key in existing_keys:
+            # GiNZAで既に同じsource-target関係が取れている
+            # → LLM側の表現でGiNZA結果を上書きしない
+            continue
+
+        merged_relations.append({
             "source": source,
             "relation": relation,
             "target": target,
-            "type": "LLM補正",
+            "type": "LLM補完",
         })
+        existing_keys.add(key)
+        added_count += 1
 
-    # LLMが何も返さなかった場合はGiNZA結果を使用
-    if not llm_relations:
-        llm_relations = final_relations
+    if DEBUG_MODE:
+        print(f"===== GiNZA SAO: {len(final_relations)}件 =====")
+        print(json.dumps(ginza_sao, ensure_ascii=False, indent=2))
+        print(f"===== LLM補完で追加された件数: {added_count}件 =====")
 
-    # ⑦ 英語順情報を追加
+    # ⑥ 英語順情報を追加
     add_english_order(
         components,
-        llm_relations
+        merged_relations
     )
 
-    # ⑧ GraphvizにはLLM補正後SAOを返す
-    return components, llm_relations
+    # ⑦ GiNZA結果（保証済み）＋LLMによる補完 を返す
+    return components, merged_relations
+
+
+def analyze_claim_ginza_only(text):
+    """
+    Ollama補完を一切使わず、GiNZAルールベースのみでSAOを抽出する。
+    Ollamaが未起動・不安定な環境での比較用、および
+    厳格F1評価等、再現性が必要な場面で使用する。
+    """
+    components, final_relations, doc = _extract_raw_relations(text)
+    final_relations = _simplify_hierarchy(final_relations, doc, components)
+    return components, final_relations
 # ============================================================
 # ⑧ 自動レイアウト（マインドマップ風：左→右の階層配置）
 # ============================================================
@@ -4755,9 +4909,11 @@ def compare_with_gold(gold_by_claim, texts_by_claim, analyze_fn=None, progress_c
 # を行い、既存アプリ（app.py）互換のエイリアスを用意する。
 # ============================================================
 
-# 明示的にGiNZAだけで解析したい場合（analyze_claim と同じ実体）。
-analyze_claim_ginza = analyze_claim
-analyze_claim_with_ginza = analyze_claim
+# 明示的にGiNZAだけで解析したい場合（Ollamaを使わない、再現性のある結果）。
+# 以前はここが誤って analyze_claim（Ollama補完あり）のエイリアスになっていたため、
+# 「LLM不使用」のはずのタブ2（請求項比較）まで意図せずOllamaを呼び出していた。
+analyze_claim_ginza = analyze_claim_ginza_only
+analyze_claim_with_ginza = analyze_claim_ginza_only
 
 # 以前はLLMとのハイブリッド解析用の名前だったが、
 # 現在はLLMを使用しないため analyze_claim（GiNZAのみ）のエイリアスとする。
