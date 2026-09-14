@@ -4677,6 +4677,3 @@ def llm_available():
 
 print("GiNZA + SudachiPy前処理によるSAO解析を有効化しました。（LLM不使用）")
 
-        return json.loads(match.group())
-    except json.JSONDecodeError:
-        return []
