@@ -30,7 +30,46 @@ import re
 
 import spacy
 
-nlp = spacy.load("en_core_web_sm")
+# ------------------------------------------------------------------
+# nlp（en_core_web_sm）の遅延読み込み
+# ------------------------------------------------------------------
+# このモジュールはtranslate_sao.pyからモジュールレベルで
+# `import en_relation_rules as err` されるが、実際にnlp（英語モデル）が
+# 必要になるのは、本モジュールのextract_relations_from_english
+# （英訳経由のSAO抽出。現在は analyze_claim_llm_direct 方式に置き換えられた
+# 旧方式）が呼ばれたときだけである。以前はここで即座に
+# `spacy.load("en_core_web_sm")` していたため、en_core_web_smが
+# インストールされていない環境（Streamlit Community Cloud等、公開デモ用
+# のクラウド環境にはインストールしていない）では、
+# `import translate_sao` の時点で即座にOSError（モデル未検出）となり、
+# analyze_claim_llm_direct（英語モデルを一切使わない方式）しか使わない
+# アプリまで起動できなくなってしまっていた。
+# nlpを遅延読み込みにすることで、実際にextract_relations_from_englishを
+# 呼ぶまではen_core_web_smを読み込まないようにし、この問題を回避する。
+# 呼び出し側（`err.nlp(text)`）から見た挙動は変わらない。
+_nlp_instance = None
+
+
+def _load_nlp():
+    global _nlp_instance
+    if _nlp_instance is None:
+        _nlp_instance = spacy.load("en_core_web_sm")
+    return _nlp_instance
+
+
+class _LazyNLP:
+    """spacy.load("en_core_web_sm")の遅延ラッパー。
+    nlp(text)としての呼び出しも、nlp.pipe(...)等の属性アクセスも、
+    実際に使われた時点で初めてモデルを読み込む。"""
+
+    def __call__(self, *args, **kwargs):
+        return _load_nlp()(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(_load_nlp(), name)
+
+
+nlp = _LazyNLP()
 
 TAG_RE = re.compile(r"^C\d+$")
 

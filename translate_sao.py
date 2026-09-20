@@ -789,17 +789,41 @@ def _filter_invalid_targets(relations):
 # 532件全体の再実行で確認することとし、デフォルト
 # （filter_redundant_root_ownership=False）では一切変更を加えないため、
 # 実験1〜6のbaseline再現性には影響しない。
+#
+# 【実験7実測後の追記（実験7b）】532件中268件分の実測結果で検証したところ、
+# claim_title_ginza|有するのTPが997→699（-298件）、FPが301→97（-204件）と、
+# 除去されたFPよりも除去された「正しい」関係（TP）の方が多く、Recallを
+# マクロで3pt以上悪化させる、当初のシミュレーションに反する結果となった。
+# 原因を実例（特開2023-128709等）で追跡したところ、_HAS_SYNONYMS_FOR_DEDUP
+# に「の」を含めていたことが over-trigger の主因と判明した：「の」は
+# 属性・部分参照（例：「主端子の一部」）を表す構文であり、「有する／備える」
+# のような所有関係とは意味的に別物であるにもかかわらず、たまたま同じ
+# targetを指す無関係な「の」関係が1件でも存在するだけで、
+# targets_with_other_owner に登録され、タイトルの正当な所有関係が
+# 「二重所有」と誤判定されて除去されてしまっていた（単体再現テスト済み、
+# test_filter_redundant_root_ownership.py参照）。この設計は532件全件での
+# 事前シミュレーション（word-list版・real-title版いずれも）では検出できて
+# おらず、実際の関係集合でしか顕在化しない失敗モードだった。
+# 対策として、「他のsourceが既に所有している」と判定するための関係語集合
+# から「の」を除外し、真の所有関係を表す語（有する／備える／具備する／
+# 含む／含める）のみに限定する。
 def _filter_redundant_root_ownership(relations, title_text):
     """title_textを主体とする「有する」系関係のうち、同じtargetをtitle_text
     以外のsourceからの「有する」系関係で既に他の構成要素が所有している
     ものを、クレームタイトルによる二重所有（過大包摂）とみなして除去する。
+
+    「他のsourceによる所有」の判定には、真の所有・包含関係を表す語
+    （_OWNERSHIP_RELATIONS_FOR_DEDUP）のみを用いる。「の」による属性・
+    部分参照は所有関係ではないため対象外とする（実験7の実測で、これを
+    含めるとタイトルの正当な所有関係まで誤って除去されることが判明した
+    ため、実験7bで除外した）。
 
     title_textがNone（クレームタイトルに相当する構成要素が検出できな
     かった場合）は何もしない。
     """
     if not title_text:
         return relations
-    has_synonyms = _HAS_SYNONYMS_FOR_DEDUP
+    has_synonyms = _OWNERSHIP_RELATIONS_FOR_DEDUP
     targets_with_other_owner = {
         r["target"] for r in relations
         if r["relation"] in has_synonyms and r["source"] != title_text
@@ -814,7 +838,10 @@ def _filter_redundant_root_ownership(relations, title_text):
     ]
 
 
-_HAS_SYNONYMS_FOR_DEDUP = {"有する", "備える", "具備する", "含む", "含める", "の"}
+# 【実験7b】真の所有・包含関係のみ（「の」による属性・部分参照は含めない）。
+_OWNERSHIP_RELATIONS_FOR_DEDUP = {"有する", "備える", "具備する", "含む", "含める"}
+# 後方互換のため旧名も残す（実験7の値と同一の意味では使わないこと）。
+_HAS_SYNONYMS_FOR_DEDUP = _OWNERSHIP_RELATIONS_FOR_DEDUP
 
 _VERIFY_PROMPT_SYSTEM = (
     "あなたは特許請求項の構造解析の検証者です。与えられた関係の候補一覧について、"
