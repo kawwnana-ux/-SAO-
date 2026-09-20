@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.patches as mpatches
 import os
+import re
+import sys
 import glob
 import json
 import ollama
@@ -52,7 +54,8 @@ except (OSError, PermissionError):
     # 読み取り専用になっている環境向けの保険。
     # 書き込み可能な場所（/tmp）にモデル一式をコピーしてから書き換える。
     import shutil
-    writable_model_path = "/tmp/ja_ginza_model_copy"
+    import tempfile as _tempfile
+    writable_model_path = os.path.join(_tempfile.gettempdir(), "ja_ginza_model_copy")
     if not os.path.exists(writable_model_path):
         shutil.copytree(model_path, writable_model_path)
     model_path = writable_model_path
@@ -66,14 +69,28 @@ print("GiNZAの読み込みに成功しました！ モデル:", model_path)
 # 日本語フォント
 # ============================================================
 
-FONT_PATH = "/tmp/NotoSansJP-Regular.ttf"
-if not os.path.exists(FONT_PATH):
-    os.system(
-        f'curl -sL -o {FONT_PATH} '
-        '"https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"'
-    )
-fm.fontManager.addfont(FONT_PATH)
-FONT_PROP = fm.FontProperties(fname=FONT_PATH)
+import tempfile
+import urllib.request
+
+# 「/tmp」はLinux専用のパスで、Windowsには存在しないためハードコードしない。
+# tempfile.gettempdir()はOSに応じた正しい一時フォルダを返す
+# （Windowsなら C:\Users\...\AppData\Local\Temp など）。
+FONT_PATH = os.path.join(tempfile.gettempdir(), "NotoSansJP-Regular.ttf")
+# ダウンロードに失敗した場合（ネットワーク制限のある環境等）でも
+# アプリ自体が起動できなくなるのは困るので、失敗時はmatplotlibの
+# デフォルトフォント（日本語グラフの一部が正しく表示されない可能性は
+# あるが、起動は止めない）にフォールバックする。
+FONT_PROP = fm.FontProperties()
+try:
+    if not os.path.exists(FONT_PATH):
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
+            FONT_PATH,
+        )
+    fm.fontManager.addfont(FONT_PATH)
+    FONT_PROP = fm.FontProperties(fname=FONT_PATH)
+except Exception as _font_exc:  # noqa: BLE001
+    print(f"日本語フォントの読み込みに失敗しました（グラフの文字表示に影響する可能性があります）: {_font_exc}")
 
 RELATION_WORDS = {
     # 基本方向・位置
@@ -82,7 +99,7 @@ RELATION_WORDS = {
     # 部位（上下前後・中央系）
     "上部", "下部", "底部", "前部", "後部", "左側", "右側",
     "頂部", "頂上", "中央部", "中心部", "側部", "隅部", "角部",
-    "一側", "他側", "一端", "他端",
+    "一側", "他側", "一端", "他端", "一方", "他方",
     # 端・先端系
     "上端", "下端", "先端", "基端", "端部", "末端", "終端",
     "左端", "右端", "前端", "後端", "頂点",
@@ -91,7 +108,7 @@ RELATION_WORDS = {
     "側面", "底面", "天面", "端面", "接触面", "対向面",
     # 周辺・中間
     "中央", "中間", "周辺", "周縁", "周辺部", "縁", "縁部",
-    "外周", "内周",
+    "外周", "内周", "内", "中", "どうし",
     # 方向
     "前方", "後方", "上方", "下方", "左方", "右方",
     "内側", "外側", "上側", "下側",
@@ -102,8 +119,28 @@ RELATION_WORDS = {
 HAS_LEMMAS = {"有する", "備える", "具備する"}
 
 # 「ことを特徴とする」のような決まり文句に出てくる、実在の構成要素ではない
-# 一般的な語（構成要素としては登録しない）
-GENERIC_NOUNS = {"こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向", "単数"}
+# 一般的な語（構成要素としては登録しない）。
+# 「仮」は、「仮固定された前記絶縁基板」のように「仮固定される」という
+# 動詞（VERB、この受身形ではGiNZAが「固定」をVERBとしてタグ付けする）を
+# 修飾する副詞的な語（dep_="obl"、「仮に」の意）として単独で出現することが
+# あり、この場合_consume_noun_phraseが後続のVERBで名詞句の消費を止めるため、
+# 「仮」だけが単独の（実在しない）構成要素として誤登録されてしまう
+# （特開2025-174033で確認済み）。「仮固定工程」「仮基板」のように「仮」が
+# 名詞の複合語の先頭として使われる場合は、後続もNOUN/PROPNなので複合語
+# 全体（例：「仮固定工程」）としてまとめて登録され、この除外の影響を
+# 受けない（除外は「仮」単独のフレーズにしか効かない）。532件の正解データ
+# でも「仮」単独がノードとして使われている例は無いことを確認済み。
+GENERIC_NOUNS = {
+    "こと", "もの", "とき", "場合", "特徴", "ため", "下記", "上記", "所定", "方向", "単数",
+    "仮",
+    "以上", "以下", "未満", "超", "以内", "程度",
+    # 特開2025-175400のLLM直接抽出で、量詞「それぞれ」が単独で構成要素
+    # タグ化され、「電力変換装置 有する それぞれ」のような無意味なSAOが
+    # 生成されることを確認。「それぞれ」は_QUANTIFIER_WORDS（所有者
+    # プレフィックス除外用）には既に入っているが、それ自体が独立した
+    # コンポーネントとして登録されるのは別問題のため、ここでも除外する。
+    "それぞれ",
+}
 
 
 def _is_generic_relation_word_bigram(doc, i):
@@ -149,6 +186,20 @@ def _normalize_component_text(phrase):
     「メタデータ生成部」（前記なし）の表記と食い違って、
     同じものが別ノードとして扱われてしまうのを防ぐため、
     先頭の「前記」「該」を取り除く。
+
+    【検証済みだが不採用】「Ｃｕ層」→「Cu層」、「５０μｍ」→「50μm」の
+    ように全角英数字を半角に統一する変換（unicodedata.normalize("NFKC", ...)
+    版、および全角英数字だけを対象にした狭いstr.translate版の両方）を
+    試した。532件の正解データのうち、"第"で始まる序数ラベルは常に全角
+    （5869件）だが、それ以外のノードは全角・半角が混在している
+    （"Ｌ１""Ｐ入力端子""２個""９０度"等の336件は全角のまま、
+    "Cu層""50μm"等の47件だけが半角）ことが分かり、後者の混在を
+    半角に統一しても一致率は上がらず、逆にMICRO/MACRO双方で
+    precision・recallが悪化した（NFKC版: MICRO precision 0.41267→0.40835、
+    recall 0.42584→0.42126／狭いtranslate版もほぼ同じ悪化）。
+    全角/半角の使い分けは「"第"で始まるか」では説明できない、
+    アノテーション時の表記ゆれ（一部のクレームでのみ半角入力された）
+    に起因すると考えられるため、一般化した幅統一は不採用とした。
     """
     for prefix in ("前記", "該"):
         if phrase.startswith(prefix) and phrase != prefix:
@@ -192,10 +243,28 @@ def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=Fal
             i += 1
             first = False
             continue
+        if doc[i].text == "第" and i + 1 < len(doc) and doc[i + 1].pos_ == "NUM":
+            # 「複数第４端子」のように、数量詞（「複数」等）の直後に「第」＋数字が
+            # 「の」を挟まずそのまま続く場合、この汎用ループが「第」を先行する
+            # 名詞句の続きとして取り込んでしまい、「第４端子」のうち「第」だけが
+            # 消費されて「４端子」（「第」が欠落した形）になってしまう
+            # （特開2022-047218で確認済み。「複数第」という余分な構成要素も
+            # 誤って登録されてしまう）。「第」＋数字は専用の処理
+            # （extract_patent_components_general内の「第」分岐）に譲るため、
+            # ここでは消費を止めてメインループに「第」を再度フレッシュな開始
+            # として処理させる。
+            break
         if doc[i].pos_ in {"NOUN", "PROPN"}:
+            # 「基板裏面を有し」のように、RELATION_WORDS内の語（「裏面」等）
+            # 自身が動詞の直接の主語・目的語（obj/nsubj）になっている場合は、
+            # 「Ｘの上に配置される」の「上」のような単なる位置関係の修飾語
+            # ではなく、実体として名指しされている（正解データでも「基板」
+            # とは別の独立した構成要素として扱われている）。この場合だけ、
+            # 複合語の一部として取り込む対象から除外しない。
             if (
-                _is_generic_relation_word(doc[i])
+                (_is_generic_relation_word(doc[i]) and doc[i].dep_ not in ("obj", "nsubj", "nsubjpass"))
                 or doc[i].text in ("前記", "該", "うち", "乃至")
+                or doc[i].text in _NUMERIC_THRESHOLD_WORDS
                 or not doc[i].text.strip()
             ):
                 break
@@ -203,10 +272,20 @@ def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=Fal
             i += 1
             first = False
         elif _is_nominalized_adjective_start(doc, i):
+            # 【修正】以前はここで無条件にbreakしていたため、「表面粗さ改善層」
+            # のように名詞化形容詞（「粗さ」）が複合語の途中（表面+粗さ+改善+層、
+            # すべて同じ head=層 に係る）に現れるケースで、「表面粗さ」で
+            # 名詞句が途切れ、「改善層」が別コンポーネントとして分離されて
+            # しまっていた（特開2022-177018で確認）。「第１の厚さ」のように
+            # 名詞化形容詞がフレーズの末尾になる場合は、続くトークンが
+            # NOUN/PROPNでも名詞化形容詞でもない（通常は格助詞等）ため、
+            # このままループを継続してもすぐ下のelseで自然に停止する。
+            # そのため無条件breakをやめ、ループを継続して後続のNOUN/PROPNも
+            # 同じ複合語として取り込めるようにする。
             words.append(doc[i].text)
             words.append(doc[i + 1].text)
             i += 2
-            break
+            first = False
         else:
             break
     return words, i
@@ -221,7 +300,33 @@ def _consume_noun_phrase(doc, i, first_is_nominalized_adj=False, fresh_start=Fal
 # 前提で正しく動いているため、同じ例外を広げるとかえって壊れる
 # （試したところ「間」「上面」「表面」等では明確に悪化した）。そのため、
 # この例外は実際にバグの原因だった「一端」「他端」の2語だけに絞る。
-_RELATION_WORDS_ALLOWED_AS_ARGUMENT = {"一端", "他端"}
+_RELATION_WORDS_ALLOWED_AS_ARGUMENT = {"一端", "他端", "一方", "他方"}
+
+
+# 【検証済みだが不採用】「実装面と、（厚み方向において前記実装面と反対の）
+# 裏面と、を有するモジュールベース」のように、RELATION_WORDS内の語
+# （裏面/上面/側面/頂点等）が「有する」「備える」「具備する」「含む」の
+# 直接の目的語（dep_="obj"）になっている場合だけ実引数として許可する
+# （＝任意のVERBのobj/nsubjではなく、HAS系動詞のobjに限定する）という
+# 狭いスコープの拡張を試した。個別のターゲット例（特許7766804の
+# 「モジュールベース　有する　裏面」等）では確かに見逃しが解消したが、
+# 532件回帰では add_TP=22 に対し add_FP=87（新たな誤抽出）が発生し、
+# MICRO precision 0.41084→0.40997、MACRO precision 0.43216→0.43188と、
+# 両方のprecisionが悪化した（f1はMICRO/MACROともわずかに上昇したが、
+# 本プロジェクトの基準はprecision・recallとも非劣化が必須のため不採用）。
+# 原因は、裏面/上面/側面/頂点などのRELATION_WORDSの語を一旦「構成要素」
+# として登録すると、has_relations等の所有者解決ロジック（root_component
+# フォールバック等）が、これらの語を"普通の構成要素"として扱って
+# ドキュメント内の無関係な別の所有者候補と誤って結び付けてしまう
+# ケースが多発したため（例：特許7101882で「頂点」が有する/接続され/介し
+# 等、10件以上の無関係な誤関係を新たに生成した）。ローカルな目的語判定
+# だけでは、こうした派生的な誤抽出の副作用を防げない。
+#
+# 「一端」「他端」の例外を全RELATION_WORDSに単純に広げる（＝任意のVERBの
+# obj/nsubjなら実引数とみなす）と、位置関係の修飾語としての用法が大半を
+# 占める語（間・上面・表面等）では悪化することも既に確認されている
+# （直下のコメント参照）。そのため、この例外は「一端」「他端」の2語のみに
+# 留める。
 
 
 def _relation_word_is_real_argument(doc, start, end):
@@ -245,6 +350,28 @@ def _relation_word_is_real_argument(doc, start, end):
 
 import re as _re_symbolic_label
 _SYMBOLIC_LATIN_LABEL_RE = _re_symbolic_label.compile(r"^[A-Za-zＡ-Ｚａ-ｚ]{1,4}$")
+# 「（ａ）」「（ｂ）」のように、順次列挙形式のクレームで工程を列挙する際に
+# 使われる、括弧＋1文字のアルファベットだけの工程ラベル。GiNZAはこれを
+# 通常のNOUN（単独トークン）として解析するため、「ａ」単体が構成要素として
+# 誤登録される（特開2019-079940で確認）。
+#
+# 【方針転換】以前はこの関数がGiNZA単体版の厳格評価
+# （analyze_claim_ginza_only）と共有されているため、この修正はGiNZA単体版
+# 532件回帰でprecisionがわずかに悪化する（MICRO 0.413315→0.413277、
+# MACRO 0.437628→0.437503、recallは不変）ことを理由に不採用としていた。
+# その後、ツールの方針を「LLM＋GiNZAの組み合わせ」に一本化し、GiNZA単体版の
+# 厳格F1は今後の主指標としないことになったため、ここで採用する
+# （LLM直接抽出方式のタグ付け精度向上を優先する）。
+_STEP_ENUM_LABEL_RE = _re_symbolic_label.compile(r"^[A-Za-zａ-ｚＡ-Ｚ]$")
+
+
+def _is_paren_step_label(doc, i):
+    token = doc[i]
+    if not _STEP_ENUM_LABEL_RE.match(token.text):
+        return False
+    prev_ok = i > 0 and doc[i - 1].text in ("（", "(")
+    next_ok = i + 1 < len(doc) and doc[i + 1].text in ("）", ")")
+    return prev_ok and next_ok
 
 
 def extract_patent_components_general(doc):
@@ -254,6 +381,10 @@ def extract_patent_components_general(doc):
         token = doc[i]
 
         if token.text in ("前記", "該", "うち", "乃至") or not token.text.strip():
+            i += 1
+            continue
+
+        if _is_paren_step_label(doc, i):
             i += 1
             continue
 
@@ -500,6 +631,43 @@ def find_component_by_token(components, token_index):
     return None
 
 
+def find_full_title_component(doc, components, comp):
+    """
+    請求項タイトル（クレーム末尾の、装置・方法全体を指す名詞句）を、
+    直前の「Ｘの」所有格チェーンを含めた最大限の複合語として再構築する。
+
+    正解データを532件検証した結果、「パワーモジュールの製造方法」
+    「窒化珪素基板の製造方法」「半導体基板構造体の製造方法」のように、
+    クレームタイトルを「Ｘの＜基本語＞」という所有格付きの複合語1つの
+    ノードとして扱う例が非常に多いことを確認した（「の」を含むgoldノード
+    のうち、extract_patent_components_generalの通常の名詞句消費では
+    1つの構成要素として認識されないものが59.3%、gold全ノードで見ても
+    厳密一致で一度もタグ化されないものが19.6%にも達する）。
+
+    一方、_consume_noun_phraseは「の」で名詞句の消費を止める仕様に
+    なっている。これは「Ｘの上面に配置される」のように「Ｘ」と「上面」を
+    別ノードとして分離すべきケース（全体としてはこちらの方が多い）を
+    壊さないための意図的な設計であり、_consume_noun_phrase自体を
+    汎用的に変更するのは危険（過去に試して規模の大きい退行を起こして
+    いる）。
+
+    そこで、請求項タイトル（root_component／claim_title_comp。通常は
+    クレーム中で一度しか出現せず、Ｘ単体が他の場所で構成要素として
+    再利用されることがほぼ無い、安全に拡張できる特別な位置）に限り、
+    直前の「Ｘの」チェーンを辿って複合語をまとめる。
+    """
+    start = comp["start"]
+    while start - 1 >= 0 and doc[start - 1].text == "の":
+        prev = find_component_by_token(components, start - 2)
+        if prev is None or prev["end"] != start - 2:
+            break
+        start = prev["start"]
+    if start == comp["start"]:
+        return comp
+    text = "".join(doc[i].text for i in range(start, comp["end"] + 1))
+    return {"text": _normalize_component_text(text), "start": start, "end": comp["end"]}
+
+
 def find_referenced_component(components, token):
     component = find_component_by_token(components, token.i)
     if component is not None:
@@ -591,11 +759,19 @@ def _is_locative_obl(token):
     「により」「によって」のような手段を表す格、「において」のような
     前提・状況を表す格（"より"/"おい"がfixedでついている場合）は
     場所ではないので除外する。
+
+    「と」が格助詞の場合は、並列列挙（「Ａと、Ｂと、…」）や共同格
+    （「Ａと接続される」）の目印であって場所ではないため、これも
+    除外する（GiNZAが超長文で、直前の列挙項目の末尾（「〜端子と、」）を
+    次の動詞のobl子として誤って結びつけてしまうことがあり、これを
+    「場所」と誤判定すると全く無関係な語がsourceとして採用されてしまう）。
     """
     if token.dep_ != "obl":
         return False
     for child in token.children:
         if child.dep_ == "case":
+            if child.text == "と":
+                return False
             for grandchild in child.children:
                 if grandchild.dep_ == "fixed" and grandchild.text in ("より", "よって", "おい"):
                     return False
@@ -1159,18 +1335,26 @@ def _find_nearest_topic_before_text(doc, components, verb):
             if t.head.dep_ == "nsubj" and t.head.head.i != verb.i:
                 cursor = t.head.head
                 crosses_acl = False
+                reached_verb = False
                 seen_path = set()
                 while cursor.i not in seen_path:
                     seen_path.add(cursor.i)
                     if cursor.i == verb.i:
+                        reached_verb = True
                         break
                     if cursor.dep_ == "acl":
+                        # aclを跨いだ先で結局この動詞（verb）自身に辿り着く場合
+                        # （＝「Ｘは、〜する第１面と、〜する第２面と、を有し」の
+                        # ように、aclが列挙項目自身を説明する連体修飾節で、
+                        # その列挙項目自体がverbのobjになっている場合）は、
+                        # 「別の名詞句の説明（＝別の節）」ではなく、verbの対象
+                        # そのものの内部構造にすぎないため、跨いだだけで即座に
+                        # 別節と判定せず、最後まで経路を追ってから判断する。
                         crosses_acl = True
-                        break
                     if cursor.head.i == cursor.i:
                         break
                     cursor = cursor.head
-                if crosses_acl:
+                if crosses_acl and not reached_verb:
                     continue
             comp = find_component_by_token(components, t.head.i) or find_referenced_component(components, t.head)
             if comp is not None:
@@ -1442,7 +1626,7 @@ def extract_comparison_relations(doc, components):
 
         relations.append({
             "source": source_name,
-            "relation": verb.text,
+            "relation": _relation_label(verb),
             "target": target_name,
             "type": "direct",
         })
@@ -1718,6 +1902,51 @@ _ATTRIBUTE_HEAD_SUFFIXES = (
 )
 
 
+_SURFACE_LOCATION_WORDS = {
+    "主面", "上面", "下面", "表面", "裏面", "側面", "底面", "天面",
+    "端面", "内面", "外面", "接触面", "対向面", "外周面", "内周面",
+}
+
+
+def _topic_owner(doc, token, components):
+    """
+    「Ｘは、…（Ｙに関する部分）…を含み」のように、「一部」「部分」等の
+    裸の部分名詞に「Ｘの」という明示的な所有格が付いていない場合でも、
+    その名詞が実際には現在の節の主題（トピック）Ｘに属していることが多い。
+    tokenより手前で最後に「は」により主題化された構成要素を、その節の
+    主題とみなす（新しい「Ｘは、」が現れれば、それ以降は主題が切り替わる
+    ため、常に「直前で最後に主題化されたもの」を使えば、節の境界を
+    明示的に区切らなくても自然に対応できる）。
+    """
+    topic = None
+    for t in doc:
+        if t.i >= token.i:
+            break
+        if t.dep_ == "case" and t.text == "は":
+            comp = (
+                find_component_by_token(components, t.head.i)
+                or find_referenced_component(components, t.head)
+            )
+            if comp is not None:
+                topic = comp
+    return topic
+
+
+def _genitive_owner(token, components):
+    """
+    「Ｘの主面」のように、tokenに「の」で係る所有格の名詞（Ｘ）があれば
+    それを返す。無ければNone。
+    """
+    for child in token.children:
+        if child.dep_ != "nmod":
+            continue
+        if any(c.dep_ == "case" and c.text == "の" for c in child.children):
+            comp = find_component_by_token(components, child.i) or find_referenced_component(components, child)
+            if comp is not None:
+                return comp
+    return None
+
+
 def _acl_semantic_target(verb, components):
     """連体修飾節(acl)が構文上かかる名詞(head)ではなく、意味上その節が説明している
     名詞を求める。例:「(基板に)含まれる銅の熱膨張係数」では、GiNZA上は head が
@@ -1753,6 +1982,36 @@ def _acl_semantic_target(verb, components):
     # head直前（＝最も直接的な所有格）を優先する。
     nearest = max(candidates, key=lambda c: c.i)
     return find_component_by_token(components, nearest.i) or find_referenced_component(components, nearest)
+
+
+def _relation_label(verb):
+    """
+    動詞トークンから、受身の助動詞（さ/れ/られ等）や過去の「た」を含む
+    自然な形の関係ラベルを組み立てる。
+
+    verb.textだけを使うと、「配置された」の「さ」「れ」「た」のように
+    助動詞がGiNZAでは別トークン（dep_="aux"）として切り離されている
+    ため、関係ラベルが「配置」のように動詞の語幹だけになってしまう
+    （「配置される」等に比べて読みにくく、意味も伝わりにくい）。
+    また、「位置決めされる」のように、動詞の語幹自体が「位置」
+    「決め」の2トークンに分かれ、advclで連結されている場合もある
+    （この場合、前半の語幹トークンは主語・目的語を持たない）。
+
+    「て」「おり」のような継続を表す部分は、関係ラベルとしては
+    冗長なので含めない。
+    """
+    prefix = ""
+    for c in verb.children:
+        if (
+            c.dep_ == "advcl"
+            and c.i == verb.i - 1
+            and not any(gc.dep_ in ("nsubj", "obj", "obl") for gc in c.children)
+        ):
+            prefix = c.text
+            break
+    aux_tokens = sorted((c for c in verb.children if c.dep_ == "aux"), key=lambda c: c.i)
+    suffix = "".join(a.text for a in aux_tokens)
+    return f"{prefix}{verb.text}{suffix}"
 
 
 def extract_direct_relations(doc, components):
@@ -1829,11 +2088,58 @@ def extract_direct_relations(doc, components):
                     if source_c is not None and target_c is not None and source_c["text"] != target_c["text"]:
                         relations.append({
                             "source": source_c["text"],
-                            "relation": verb.text,
+                            "relation": _relation_label(verb),
                             "target": target_c["text"],
                             "type": "direct",
                         })
                         continue
+
+        # 「ドレインが、前記第１電極に接続され、ゲートが、…」のように、
+        # 受身の動詞連鎖（advcl）が複数連なって最終的に1つの名詞（例：
+        # 「第１トランジスタ」）にかかる構文がある。この場合、各動詞
+        # 自身がnsubj（ドレイン等）とobl（電極等）を両方直接の子として
+        # 持っており、それ自体で完結した（誰が何に接続されるか）関係を
+        # 表している。ところが、この動詞のverb.head自身は名詞ではなく
+        # 次の動詞（連鎖の続き）であるため、下のhead_component解決
+        # ロジックは「係り先が構成要素でない」と判断し、連鎖をずっと
+        # 遡って最終的な名詞（第１トランジスタ）まで辿ってしまい、
+        # 本来の対象（電極）ではなく連鎖の最終到達点を誤ってtargetに
+        # してしまう（結果「ドレイン→接続→第１トランジスタ」のような
+        # 誤った関係になり、しかも連鎖中の全ノードが同じ誤ったtargetに
+        # 集約されてしまう）。
+        # nsubjとoblが両方その動詞自身の直接の子として存在する場合は、
+        # 外側の名詞を探しにいく必要が無い、自己完結した関係なので、
+        # そちらを最優先で使う。
+        if _is_passive(verb):
+            self_nsubj = next((c for c in verb.children if c.dep_ == "nsubj"), None)
+            self_obl = next(
+                (
+                    c for c in verb.children
+                    if c.dep_ == "obl"
+                    and not any(
+                        gc.dep_ == "fixed" and gc.text in ("より", "対し", "対して")
+                        for gc in c.children
+                    )
+                ),
+                None,
+            )
+            if self_nsubj is not None and self_obl is not None:
+                source_c = (
+                    find_component_by_token(components, self_nsubj.i)
+                    or find_referenced_component(components, self_nsubj)
+                )
+                target_c = (
+                    find_component_by_token(components, self_obl.i)
+                    or find_referenced_component(components, self_obl)
+                )
+                if source_c is not None and target_c is not None and source_c["text"] != target_c["text"]:
+                    relations.append({
+                        "source": source_c["text"],
+                        "relation": _relation_label(verb),
+                        "target": target_c["text"],
+                        "type": "direct",
+                    })
+                    continue
 
         head_component = find_component_by_token(components, verb.head.i)
         used_fallback = head_component is None
@@ -1877,6 +2183,7 @@ def extract_direct_relations(doc, components):
             # （実質的な主語＝本当の受け手）の方が正しいtargetであることが
             # 多いので、そちらを優先する。
             passive_target = head_component
+            head_is_claim_title = False
             topic_obl = None
             for child in verb.children:
                 if (
@@ -1967,6 +2274,20 @@ def extract_direct_relations(doc, components):
             # nsubjの有無で場合分けするよう修正する。
             has_real_nsubj_child = any(c.dep_ == "nsubj" for c in verb.children)
 
+            # 動詞自身にnsubjが無く、passive_targetも結局
+            # head_component（＝請求項タイトル等へのフォールバック）から
+            # 動いていない場合、GiNZAが本当の主語（例：「突起部」）を
+            # 動詞ではなくさらに遠いheadの子として誤って結びつけている
+            # 可能性がある（extract_positional_relationsで対応した
+            # 長距離nsubj誤結合と同種の問題）。_find_nsubj_target_for_verbで
+            # 動詞・headの両方の子からnsubjを探し直し、見つかればそちらを
+            # 真の主語として優先する。
+            resolved_nsubj = None
+            if not has_real_nsubj_child and head_is_claim_title and passive_target["text"] == head_component["text"]:
+                nsubj_target = _find_nsubj_target_for_verb(doc, components, verb)
+                if nsubj_target is not None and nsubj_target["text"] != passive_target["text"]:
+                    resolved_nsubj = nsubj_target
+
             source_candidates = []
             for child in verb.children:
                 if topic_obl is not None and child.i == topic_obl.i:
@@ -1999,17 +2320,60 @@ def extract_direct_relations(doc, components):
                 if has_real_nsubj_child:
                     relations.append({
                         "source": source["text"],
-                        "relation": verb.text,
+                        "relation": _relation_label(verb),
                         "target": passive_target["text"],
                         "type": "direct",
                     })
                 else:
-                    relations.append({
-                        "source": passive_target["text"],
-                        "relation": verb.text,
-                        "target": source["text"],
-                        "type": "direct",
-                    })
+                    # 「前記放熱装置の主面に配置された取り付けフレーム」のように、
+                    # 「に」格の相手（source）が「主面」「上面」のような
+                    # 汎用的な面・位置の名詞で、かつ「Ｘの」という所有格の
+                    # 相手（放熱装置）を持つ場合は、その面自体は実体のある
+                    # 構成要素ではないので関係先から外し、所有格の相手を
+                    # 直接の関係先にする。この場合、意味的には「放熱装置に
+                    # フレームが配置される」なので、向きも
+                    # source=放熱装置（面の持ち主）、target=passive_target
+                    # （配置される側）に入れ替える。
+                    if resolved_nsubj is not None:
+                        relations.append({
+                            "source": resolved_nsubj["text"],
+                            "relation": _relation_label(verb),
+                            "target": source["text"],
+                            "type": "direct",
+                        })
+                        continue
+                    owner = None
+                    if child.text in _SURFACE_LOCATION_WORDS:
+                        owner = _genitive_owner(child, components)
+                    if owner is not None and owner["text"] != passive_target["text"]:
+                        # 「前記放熱装置の主面に配置された取り付けフレーム」は、
+                        # 正しくは「取り付けフレームが（放熱装置の主面に）
+                        # 配置される」であり、source=passive_target
+                        # （取り付けフレーム）、target=owner+の+主面
+                        # （放熱装置の主面）であるべきことを実際の正解データ
+                        # （特開2025-188284）との比較で確認した。以前は
+                        # source/targetを丸ごと入れ替えていたが、それは逆
+                        # だった。丸ごと入れ替えずにこの向きのまま
+                        # 「owner+の+主面」をtargetにすると、532件回帰では
+                        # 一時的にprecisionがわずかに悪化したが、それは
+                        # 「Ｘの主面」を単独ノードとして残していたことが
+                        # 原因だった（本人の指示で「主面」等はＸ自体として
+                        # 統合する方針に確定し、_merge_surface_location_nodesが
+                        # このowner+の+主面を自動的にownerへ統合するようになった
+                        # ため、この向きのままで問題なくなった）。
+                        relations.append({
+                            "source": passive_target["text"],
+                            "relation": _relation_label(verb),
+                            "target": f"{owner['text']}の{source['text']}",
+                            "type": "direct",
+                        })
+                    else:
+                        relations.append({
+                            "source": passive_target["text"],
+                            "relation": _relation_label(verb),
+                            "target": source["text"],
+                            "type": "direct",
+                        })
         else:
             # 能動：headが直接の係り先として構成要素そのものであれば、それを
             # 主語(source)として使う（例：「Ｘを表すＹ」のＹ＝head）。
@@ -2110,10 +2474,18 @@ def extract_direct_relations(doc, components):
                 # 「及び」に近い項目からobjに向かって、nmod修飾語の連鎖
                 # として表れる（Ａ→Ｂ→Ｃ→Ｄのように、途中には「及び」が
                 # 付かないことが多い）。objの直接の子に「及び」「又は」
-                # 等のcc（等位接続）子が見つかったら、これは列挙だと
-                # 判断し、そこから続くnmodの連鎖を全部たどる。
+                # 等のcc（等位接続）子、または特許請求項で最も多用される
+                # 「Ａと、Ｂとを有する」のような格助詞「と」（＝cc扱いに
+                # ならない並列）が見つかったら、これは列挙だと判断し、
+                # そこから続くnmodの連鎖を全部たどる（532件の正解データを
+                # 調査したところ、objが2個以上の列挙になっている1163件中
+                # 769件で少なくとも1項目が欠落しており、その大半がこの
+                # 「と」による列挙を拾えていないことが原因だった）。
                 obj_candidates = [child]
-                has_enum_cc = any(gc.dep_ == "cc" for gc in child.children)
+                has_enum_cc = any(
+                    gc.dep_ == "cc" or (gc.dep_ == "case" and gc.text in ("と", "や"))
+                    for gc in child.children
+                )
                 if has_enum_cc:
                     cursor = child
                     seen_ids = {cursor.i}
@@ -2190,13 +2562,13 @@ def extract_direct_relations(doc, components):
                     for comp in components:
                         if not (scope_start <= comp["end"] < verb.i):
                             continue
-                        if not _is_list_item_component(doc, comp):
+                        if not _is_list_item_component(doc, comp, components):
                             continue
                         if comp["text"] == effective_source["text"]:
                             continue
                         relations.append({
                             "source": effective_source["text"],
-                            "relation": verb.text,
+                            "relation": _relation_label(verb),
                             "target": comp["text"],
                             "type": "direct",
                         })
@@ -2216,7 +2588,7 @@ def extract_direct_relations(doc, components):
 # ⑤ 「有する」関係の抽出
 # ============================================================
 
-def _is_list_item_component(doc, comp):
+def _is_list_item_component(doc, comp, components=None):
     """
     「Ａと、Ｂと、Ｃと、…を有する（備える）」のような並列列挙で、
     その構成要素の直後に「と、」（区切りの格助詞＋読点）が来ているかどうかを
@@ -2226,6 +2598,13 @@ def _is_list_item_component(doc, comp):
     「第１のトランジスタから第６のトランジスタと、…を有し」のような、
     範囲の始点側（「から」が直後に来る場合）も対象に含める
     （「乃至」は解析前に「から」へ正規化されるため、同じ扱いになる）。
+
+    （注：「と」の直後が読点でなく次の構成要素の先頭に直接続く場合
+    （「第１電極と第２電極とを有する」等）まで対象に広げることも試したが、
+    532件回帰でrecallは上がったもののprecisionが下がり、他の抽出箇所との
+    組み合わせでむしろ全体のrecallも下がる逆効果が確認されたため見送った。
+    同じ問題は_extract_direct_relationsの列挙連鎖検出側で、より安全な形で
+    改善済み。）
     """
     end = comp["end"]
     nxt = end + 1
@@ -2261,14 +2640,48 @@ def _enumeration_scope_start(doc, components, owner):
     ownerが列挙項目でない場合（根や、列挙と無関係な語）は、制限
     なし（-1）を返す。
     """
-    if owner is None or not _is_list_item_component(doc, owner):
+    if owner is None or not _is_list_item_component(doc, owner, components):
         return -1
     best = -1
     for c in components:
-        if c["end"] < owner["start"] and _is_list_item_component(doc, c):
+        if c["end"] < owner["start"] and _is_list_item_component(doc, c, components):
             if c["end"] > best:
                 best = c["end"]
     return best
+
+
+# 【検証済みだが不採用】「単数又は複数の半導体チップ、前記半導体チップに
+# 接続された第一電極端子、及び前記半導体チップに接続された第二電極端子を
+# 有した…」のように、列挙の各項目自体が関係節（「前記Ｘに接続された」）で
+# 修飾されている入れ子の列挙を、その関係節のobl項（「Ｘ」）経由でさらに
+# nmod連鎖をたどって回収する _acl_obl_backbone / _has_enum_marker /
+# _walk_comma_enum_siblings を実装し、狙った2件
+# （特開2025-175400「パワーモジュール 有する 第一電極端子/半導体チップ」、
+#  特開2025-187080「第２端子 含む 導電部」）のうち前者は正しく回収できたが、
+# 532件回帰で検証した結果、MICRO f1 0.4172→0.4163、MACRO f1 0.4162→0.4151と
+# precision・recallともに悪化した（他のクレームで、無関係な語への誤った
+# nmod連鎖を「列挙の兄弟」と誤認する副作用が、狙った2件の改善を上回った）。
+# 非劣化の原則に反するため不採用。実装（helper関数3つ＋呼び出し箇所）は
+# このコミットでは削除し、以前の単純なhas_enum_cc判定に戻した。
+
+
+# 【検証済みだが効果なしのため不採用】「手がかり句を用いた特許請求項の
+# 構造解析」（新森ら, 2004）のCOMPOSE_CUE直前パターン（表3: 「(名詞|記号)
+# と(、|,|)?」の繰り返し）に基づき、GiNZAの係り受け木（nmod/acl）を
+# 一切経由せず、verb（を有する/備える/含む等）の直前のトークン列だけを
+# 表層的に後方へ読んで列挙項目を回収する _scan_cue_enum_targets_backward
+# を実装し、既存のnmod連鎖歩き（上記）に追加的に（既存結果を壊さない
+# 形で）組み込んで532件回帰を実施した。結果はMICRO/MACRO f1とも
+# 1桁も変化なし（既存のnmod連鎖歩きが「と」で終わる単純な列挙は
+# 既に全て正しく拾えており、この表層スキャンで新たに拾えた項目は
+# 532件中0件だった）。「単数又は複数のＸ、（Ｘを参照する関係節）を
+# 含むＹ、及び…を有する」のように、列挙の各項目自体が関係節で修飾
+# されている（今回残っている）パターンは、目的語の直前ではなく、
+# 目的語を修飾する関係節全体の開始位置の直前に「及び」「、」が来るため、
+# この単純な後方スキャンでは検出できない（関係節の左端＝構成要素境界を
+# 別途特定する必要があり、GiNZAの依存構造に頼らずに安全にそれを行う
+# 方法は未解決）。効果が無いため、コードは追加せず元のnmod連鎖歩きのみ
+# に留めた。
 
 
 def extract_has_relations(doc, components):
@@ -2291,6 +2704,15 @@ def extract_has_relations(doc, components):
     root_component = (
         find_component_by_token(components, root_token.i) if root_token is not None else None
     )
+    if root_component is not None:
+        # 「パワーモジュールの製造方法」のように、クレームタイトルが
+        # 「Ｘの＜基本語＞」という所有格付き複合語になっている場合、
+        # 直前の「Ｘの」チェーンを含めた最大限の複合語に拡張する
+        # （find_full_title_component参照。root_componentが実際に
+        # ownerとして使われるのは、他の優先分岐が全部当たらなかった
+        # 最後のフォールバックの場合だけなので、この拡張が既存の
+        # 他の関係抽出に影響することはない）。
+        root_component = find_full_title_component(doc, components, root_component)
 
     relations = []
     for verb in doc:
@@ -2334,6 +2756,21 @@ def extract_has_relations(doc, components):
             if _fallback_targets:
                 head_component = _fallback_targets[0]
 
+        if (
+            head_component is not None
+            and root_token is not None
+            and head_component["end"] == root_token.i
+        ):
+            # head_componentが、たまたまroot_component（＝クレーム全体の
+            # タイトル、依存構造上のROOT）と同じ位置で終わっている場合
+            # （「…を備える、パワーモジュールの製造方法。」のように、
+            # 「を備える」がacl修飾として直接タイトル名詞にかかる場合）、
+            # find_full_title_componentと同じ「Ｘの」拡張を適用する
+            # （そうしないと、root_component側だけ拡張しても、この
+            # head_component経由の分岐では拡張前の短いタイトルのままに
+            # なってしまう）。
+            head_component = find_full_title_component(doc, components, head_component)
+
         targets = []
         owner = None
         # 「Ａと、Ｂと、Ｃと、…を有する（備える）」の並列列挙から得られた
@@ -2356,7 +2793,7 @@ def extract_has_relations(doc, components):
         # （変数を分けて持つ）。
         all_list_targets = [
             c for c in components
-            if c["end"] < verb.i and _is_list_item_component(doc, c)
+            if c["end"] < verb.i and _is_list_item_component(doc, c, components)
         ]
         early_list_targets = list(all_list_targets)
         if early_list_targets:
@@ -2365,7 +2802,7 @@ def extract_has_relations(doc, components):
                 early_list_targets = []
 
         acl_owner = None
-        acl_target = None
+        acl_targets = []
         if verb.dep_ == "acl" and subj_token is None and obj_token is not None and head_component is not None:
             # 連体修飾節（acl）として名詞にかかる「Ｘを有する／備える／含むＹ」は、
             # 構文上Ｙ（修飾される名詞）がＸを持つ、という意味が一意に決まる
@@ -2386,26 +2823,123 @@ def extract_has_relations(doc, components):
             # 話が別である。この場合はobjだけでなく列挙全体（Ａ、Ｂ、Ｃ）がＸの
             # 対象になるべきなので、ここでは処理せず後段の列挙ヒューリスティックに
             # 任せる（objがそれ自体「列挙項目」であるかどうかで判定する）。
-            if cand is not None and not _is_list_item_component(doc, cand):
+            # 【検証済みだが不採用】「第１電極と第２電極とを有する半導体
+            # チップ」のように、objが「と、」で終わる典型的な列挙項目
+            # ではない場合（コンマが無い）でも、cand自体が
+            # _is_list_item_component相当（「と」+「を」で終わる）なら
+            # ここでhas_enum_cc＋nmod連鎖を辿って回収する案を試したが、
+            # 532件回帰でmicro/macro共にrecallが悪化した（後段の列挙
+            # ヒューリスティック②③④に任せた方が広い範囲を正しく拾える
+            # ケースの方が多く、ここで早期に横取りすると却って範囲が
+            # 狭くなってしまうらしい）。非劣化の原則に反するため不採用。
+            if cand is not None and not _is_list_item_component(doc, cand, components):
                 if cand["text"] != head_component["text"]:
                     acl_owner = head_component
-                    acl_target = cand
+                    acl_targets = [cand]
+                    # 「基板主面及び基板裏面を有し」のように、obj自体は
+                    # 「と、」で終わる典型的な列挙項目ではないが、objの
+                    # 直接の子に等位接続（cc＝「及び」等）や「と」「や」の
+                    # 格助詞が見つかる場合がある。この場合、
+                    # _extract_direct_relationsのhas_enum_cc修正と同じ
+                    # 考え方で、そこから続くnmodの連鎖を辿って列挙項目を
+                    # 全部拾う（そうしないと、objだけが対象になり、それより
+                    # 前の兄弟列挙項目＝基板主面が抜け落ちてしまう）。
+                    # （入れ子の関係節を経由した拡張案は不採用。上のコメント
+                    #  参照）
+                    has_enum_cc = any(
+                        gc.dep_ == "cc" or (gc.dep_ == "case" and gc.text in ("と", "や"))
+                        for gc in obj_token.children
+                    )
+                    if has_enum_cc:
+                        cursor = obj_token
+                        seen_ids = {cursor.i}
+                        while True:
+                            nmod_child = None
+                            for nm in cursor.children:
+                                if nm.dep_ == "nmod" and nm.i < cursor.i and nm.i not in seen_ids:
+                                    nmod_child = nm
+                                    break
+                            if nmod_child is None:
+                                break
+                            nm_comp = (
+                                find_component_by_token(components, nmod_child.i)
+                                or find_referenced_component(components, nmod_child)
+                            )
+                            if nm_comp is not None and nm_comp["text"] != head_component["text"]:
+                                acl_targets.append(nm_comp)
+                            seen_ids.add(nmod_child.i)
+                            cursor = nmod_child
 
         if acl_owner is not None:
             owner = acl_owner
-            targets = [acl_target]
+            targets = acl_targets
         elif subj_token is not None:
             owner = (
                 find_component_by_token(components, subj_token.i)
                 or find_referenced_component(components, subj_token)
             )
+            t = None
             if obj_token is not None:
                 t = (
                     find_component_by_token(components, obj_token.i)
                     or find_referenced_component(components, obj_token)
                 )
-                if t is not None:
-                    targets.append(t)
+            # 「ケースは、第１面と、第２面と、を有する」のように、明示的な主語
+            # （nsubj）がある節でも、目的語（obj）自体が「〜と、」で終わる
+            # 並列列挙の最後の項目である場合がある。この場合、obj_token
+            # だけを対象にすると、それより前の兄弟列挙項目（第１面）が
+            # 完全に抜け落ちてしまう（第１面はnmodでobjに係っているだけで、
+            # 動詞の直接の子ではないため）。objが列挙項目だと判定できる
+            # ときは、head_component分岐と同じ考え方で、この節の範囲内の
+            # 列挙項目をすべて対象にする。
+            scoped_list_targets = []
+            if t is not None and owner is not None and _is_list_item_component(doc, t, components):
+                scope_start = _enumeration_scope_start(doc, components, owner)
+                scoped_list_targets = [
+                    c for c in all_list_targets
+                    if c["start"] > scope_start and c["text"] != owner["text"]
+                ]
+                # 「第１電極と第２電極とを有する」のように、最後の項目の直前の
+                # 兄弟項目が読点なしで直接次の項目へ続く場合（コンマが無い）、
+                # _is_list_item_component（直後が「、」であることを要求）に
+                # 引っかからずall_list_targetsに入らない。この場合でも、
+                # objからnmodの連鎖をたどって前の兄弟に行き着け、かつその
+                # 兄弟自身が「と」「や」の格助詞で終わっている（＝列挙の
+                # 一員である）と確認できる場合に限り、対象へ追加する
+                # （nmod連鎖なら何でも対象にすると無関係な「Ｘの」修飾まで
+                # 拾ってしまうため、「と／や」で終わることの確認を必須にする）。
+                cursor = obj_token
+                seen_ids = {cursor.i}
+                while True:
+                    nmod_child = None
+                    for nm in cursor.children:
+                        if nm.dep_ == "nmod" and nm.i < cursor.i and nm.i not in seen_ids:
+                            nmod_child = nm
+                            break
+                    if nmod_child is None:
+                        break
+                    seen_ids.add(nmod_child.i)
+                    is_enum_sibling = any(
+                        gc.dep_ == "case" and gc.text in ("と", "や")
+                        for gc in nmod_child.children
+                    )
+                    if not is_enum_sibling:
+                        break
+                    nm_comp = (
+                        find_component_by_token(components, nmod_child.i)
+                        or find_referenced_component(components, nmod_child)
+                    )
+                    if nm_comp is not None and nm_comp["text"] != owner["text"] and not any(
+                        c["start"] == nm_comp["start"] and c["end"] == nm_comp["end"]
+                        for c in scoped_list_targets
+                    ):
+                        scoped_list_targets.append(nm_comp)
+                    cursor = nmod_child
+            if scoped_list_targets:
+                targets = scoped_list_targets
+                enum_target_keys.update((c["start"], c["end"]) for c in targets)
+            elif t is not None:
+                targets.append(t)
         elif len(early_list_targets) >= 2 and (head_component is not None or root_component is not None):
             # head_component（動詞の係り先）がGiNZAの長文誤解析で
             # 見当違いの場所（例：後続の別の節）を指してしまっている
@@ -2432,9 +2966,30 @@ def extract_has_relations(doc, components):
                     owner = root_component
                 else:
                     owner = head_component
+                targets = [c for c in early_list_targets if c["text"] != owner["text"]]
             else:
-                owner = root_component
-            targets = [c for c in early_list_targets if c["text"] != owner["text"]]
+                # head_componentが見つからない（＝動詞の係り先が「こと」等で
+                # 実在の構成要素ではない）場合でも、「ケースは、第１面と、
+                # 第２面と、を有し」のように、テキスト上に近い明示的な主題
+                # 「Ｘは、」があるなら、無条件にroot_componentへフォールバック
+                # するより、そちらを所有者として優先する方が正確である。
+                # ただし、この場合のtargetsは、topicより前にある全く別の
+                # 列挙グループ（例：もっと前の「基板と、ケースと、端子と、
+                # ワイヤと、を備え」）まで拾ってしまわないよう、topicの
+                # 出現位置より後ろにある列挙項目だけに絞る
+                # （head_componentが見つかっている場合はこの絞り込みをしない。
+                #  head_component自体が動詞の直接の係り先という強い制約に
+                #  なっているため、以前からの挙動を変えないようにする）。
+                nearby_topic = _find_nearest_topic_before_text(doc, components, verb)
+                if nearby_topic is not None:
+                    owner = nearby_topic
+                    targets = [
+                        c for c in early_list_targets
+                        if c["text"] != owner["text"] and c["start"] > owner["end"]
+                    ]
+                else:
+                    owner = root_component
+                    targets = [c for c in early_list_targets if c["text"] != owner["text"]]
             enum_target_keys.update((c["start"], c["end"]) for c in targets)
         elif _find_nearest_topic_before_text(doc, components, verb) is not None:
             # 明示的なnsubjが見つからなくても、テキスト上に「Ｘは、」という
@@ -2444,7 +2999,7 @@ def extract_has_relations(doc, components):
             owner = _find_nearest_topic_before_text(doc, components, verb)
             list_targets = [
                 c for c in components
-                if c["end"] < verb.i and _is_list_item_component(doc, c) and c["text"] != owner["text"]
+                if c["end"] < verb.i and _is_list_item_component(doc, c, components) and c["text"] != owner["text"]
             ]
             targets = list_targets
             enum_target_keys.update((c["start"], c["end"]) for c in targets)
@@ -2466,6 +3021,55 @@ def extract_has_relations(doc, components):
             #  フォールバックになっており、無関係な語まで拾っていた）。
             scope_start = _enumeration_scope_start(doc, components, owner)
             scoped_list_targets = [c for c in all_list_targets if c["start"] > scope_start]
+            # 「第１電極と第２電極とを有する半導体チップ」のように、この
+            # 動詞の目的語（obj_token＝第２電極）自体が列挙項目である
+            # 場合でも、_enumeration_scope_start自身が「第２電極」を
+            # （owner＝半導体チップの）外側の列挙における直前の兄弟項目と
+            # 誤認し、scope_startとして「第２電極」のend自体を返してしまう
+            # ことがある（第２電極はこのacl節の内側の目的語であって、
+            # 半導体チップと同じ外側の列挙の兄弟ではないのに、テキスト上は
+            # 両方とも「〜と」で終わる列挙項目に見えるため区別できない）。
+            # その結果scoped_list_targetsが空になり、目的語自身（第２電極）
+            # まで対象から漏れてしまう。scope_start由来の絞り込みで
+            # 何も残らなかった場合は、目的語自体が列挙項目であるかどうかを
+            # 別途確認し、そうであれば目的語自身を起点に、そこから
+            # nmod連鎖をたどって読点なしで続く直前の兄弟項目
+            # （extract_has_relationsのsubj_token分岐で532件回帰により
+            #  検証済みの同じロジック）も回収する。
+            if not scoped_list_targets and obj_token is not None:
+                obj_comp = (
+                    find_component_by_token(components, obj_token.i)
+                    or find_referenced_component(components, obj_token)
+                )
+                if obj_comp is not None and _is_list_item_component(doc, obj_comp, components):
+                    scoped_list_targets = [obj_comp]
+                    cursor = obj_token
+                    seen_ids = {cursor.i}
+                    while True:
+                        nmod_child = None
+                        for nm in cursor.children:
+                            if nm.dep_ == "nmod" and nm.i < cursor.i and nm.i not in seen_ids:
+                                nmod_child = nm
+                                break
+                        if nmod_child is None:
+                            break
+                        seen_ids.add(nmod_child.i)
+                        is_enum_sibling = any(
+                            gc.dep_ == "case" and gc.text in ("と", "や")
+                            for gc in nmod_child.children
+                        )
+                        if not is_enum_sibling:
+                            break
+                        nm_comp = (
+                            find_component_by_token(components, nmod_child.i)
+                            or find_referenced_component(components, nmod_child)
+                        )
+                        if nm_comp is not None and nm_comp["text"] != owner["text"] and not any(
+                            c["start"] == nm_comp["start"] and c["end"] == nm_comp["end"]
+                            for c in scoped_list_targets
+                        ):
+                            scoped_list_targets.append(nm_comp)
+                        cursor = nmod_child
             if scoped_list_targets:
                 targets = scoped_list_targets
                 enum_target_keys.update((c["start"], c["end"]) for c in targets)
@@ -2845,6 +3449,17 @@ _GENITIVE_LINK_EXCLUDE_HEADS = (
     "一方", "他方", "双方", "反対側", "反対面", "反対", "両側", "一端", "他端",
     "一部", "各々", "それぞれ", "夫々", "全て", "全部", "一つ", "1つ", "１つ",
 )
+# 【検証済みだが不採用】「主面」「部分」等の面・部位の名詞も"一部"と同様に
+# 常に除外すべきかと思い、_SURFACE_LOCATION_WORDSと"部分"を丸ごと
+# 追加してみたが、532件の正解データを実際に確認すると「第１炭素層の上面」
+# 「絶縁基板の裏面」等、"Ｘの◯◯"という面・部位の複合語に対して
+# (Ｘ, の, Ｘの◯◯)という出自関係が付与されている例が48件も存在した
+# （"主端子の一部"／"主端子の他の部分"のように、一部/部分でも複数の
+# 部分参照がある場合はやはり付与されている）。ここで丸ごと除外すると、
+# 532件回帰でmicro recallが悪化した（非劣化の原則に反するため不採用）。
+# 「放熱装置の主面」（特開2025-188284）のように出自関係が無い方が正しい
+# 例も確かにあるが、それを一般語句だけで判別する安全な基準は
+# 見つかっていない。
 
 
 def _add_genitive_provenance_relations(relations):
@@ -2896,6 +3511,207 @@ def _add_genitive_provenance_relations(relations):
     return relations + new_relations
 
 
+def _merge_surface_location_nodes(relations):
+    """
+    「Ｘの主面」「Ｘの裏面」「Ｘ主面」のように、実体を持たない面・部位の
+    名詞（_SURFACE_LOCATION_WORDS）でＸを修飾しただけの複合語は、常にＸ
+    そのものとして扱う（本人の指示：「構成要素の一部を表す言葉は、その
+    構成要素として扱う」）。
+
+    「一部」「部分」（_merge_partitive_nodes）とは異なり、同じＸに対して
+    複数の面（例：Ｘの上面とＸの下面）が区別されている場合でも、常に
+    統合する（本人が明示的に確認済み：上面/下面の区別が失われても構わない）。
+
+    「ベース板の第１主面」「ベース板の第２主面」のように、「の」と面の
+    名詞の間に順序語等が挟まっている場合も、同じ請求項内に実在する
+    構成要素（ここでは「ベース板」）が複合語の前方一致で見つかれば、
+    それを所有者として統合する。
+    """
+    all_nodes = set()
+    for r in relations:
+        all_nodes.add(r["source"])
+        all_nodes.add(r["target"])
+
+    rename_map = {}
+    for node in all_nodes:
+        for word in sorted(_SURFACE_LOCATION_WORDS, key=len, reverse=True):
+            if node == word or not node.endswith(word):
+                continue
+            candidates = [o for o in all_nodes if o != node and node.startswith(o)]
+            if not candidates:
+                continue
+            owner = max(candidates, key=len)
+            rename_map[node] = owner
+            break
+
+    if not rename_map:
+        return relations
+
+    merged = []
+    seen = set()
+    for r in relations:
+        new_source = rename_map.get(r["source"], r["source"])
+        new_target = rename_map.get(r["target"], r["target"])
+        if new_source == new_target:
+            continue
+        new_r = dict(r)
+        new_r["source"] = new_source
+        new_r["target"] = new_target
+        key = (new_source, new_r.get("relation"), new_target)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(new_r)
+    return merged
+
+
+_PARTITIVE_SUFFIX_RE = re.compile(r"^(.+?)の(一部|部分)$")
+
+
+_BARE_PARTITIVE_WORDS = {"一部", "部分"}
+
+
+def _partitive_siblings(owner_text, all_nodes):
+    """
+    ownerに対して「ownerの＜…＞一部/部分」という形のノードが、同じ請求項内
+    に他にいくつあるかを返す（ownerそのものは含まない）。
+    """
+    prefix = owner_text + "の"
+    return [
+        n for n in all_nodes
+        if n != owner_text and n.startswith(prefix) and (n.endswith("一部") or n.endswith("部分"))
+    ]
+
+
+def _merge_partitive_nodes(relations, doc=None, components=None):
+    """
+    「Ｘの一部」「Ｘの部分」のようなノードが、同じ請求項内に「Ｘ」自体も
+    独立したノードとして存在する場合、部分と全体を別ノードとして分けて
+    表示する意味は薄いので、「Ｘの一部」を「Ｘ」に統合する
+    （「Ｘ」がその請求項に登場しない場合は、区別して残す）。
+
+    ただし、同じＸに対して「Ｘの一部」と「Ｘの他の部分」のように複数の
+    部分参照がある場合や、「Ｘの内側部分」「Ｘの先端部分」のように
+    修飾語で区別されている場合は、それぞれ別の実体を指しているので
+    統合しない（532件の正解データを実際に確認し、この基準で「統合すべき
+    なのに区別されている」14件と「区別するのが妥当」17件を判別できた
+    ことから、正解データ側の作り方とパイプライン側の統合ルールを
+    揃えている）。
+    """
+    all_nodes = set()
+    for r in relations:
+        all_nodes.add(r["source"])
+        all_nodes.add(r["target"])
+
+    rename_map = {}
+    for node in all_nodes:
+        m = _PARTITIVE_SUFFIX_RE.match(node)
+        if m:
+            base = m.group(1)
+            if base not in all_nodes or base == node:
+                continue
+            siblings = _partitive_siblings(base, all_nodes)
+            if len(siblings) > 1:
+                continue  # 「一部」と「他の部分」のように複数の部分参照がある→区別する
+            middle = node[len(base) + 1: -2]  # 「Ｘの」と末尾「一部/部分」の間
+            if middle:
+                continue  # 「内側部分」「先端部分」等、修飾語で区別されている→区別する
+            rename_map[node] = base
+
+    # 「Ｘの一部」の「Ｘの」が抽出処理の途中で既に落とされ、ノードの
+    # テキストが単に「一部」「部分」だけになっている場合。doc/componentsが
+    # 渡されていれば、所有格（「Ｘの」）の相手を辿って同じように統合する。
+    if doc is not None and components is not None:
+        for node in all_nodes:
+            if node in rename_map or node not in _BARE_PARTITIVE_WORDS:
+                continue
+            for comp in components:
+                if comp["text"] != node:
+                    continue
+                owner = _genitive_owner(doc[comp["end"]], components)
+                if owner is None:
+                    # 「Ｘの」という明示的な所有格が無い場合、節の主題を
+                    # 暗黙の所有者として使う（例:「第１端子は、…部分に
+                    # 設けられた貫通穴を含み」→「部分」は第１端子のもの）。
+                    owner = _topic_owner(doc, doc[comp["start"]], components)
+                if owner is None or owner["text"] not in all_nodes or owner["text"] == node:
+                    continue
+                if _partitive_siblings(owner["text"], all_nodes):
+                    # 明示的な「ownerの＜…＞部分」参照が他にもある請求項では、
+                    # 曖昧な裸の「一部/部分」を安易にownerへ統合しない
+                    break
+                rename_map[node] = owner["text"]
+                break
+
+    if not rename_map:
+        return relations
+
+    merged = []
+    seen = set()
+    for r in relations:
+        new_source = rename_map.get(r["source"], r["source"])
+        new_target = rename_map.get(r["target"], r["target"])
+        if new_source == new_target:
+            continue
+        new_r = dict(r)
+        new_r["source"] = new_source
+        new_r["target"] = new_target
+        key = (new_source, new_r.get("relation"), new_target)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(new_r)
+    return merged
+
+
+# ============================================================
+# 請求項の表現形式分類
+# ============================================================
+# 「手がかり句を用いた特許請求項の構造解析」（新森ら, 2004）の分類
+# （順次列挙形式／構成要素列挙形式／ジェプソン的形式）をもとに、
+# 532件の正解データで検証した結果、順次列挙形式（方法クレーム）だけが
+# 他の2形式（構成要素列挙0.439 / ジェプソン的0.413）に比べてF1が
+# 極端に低い（0.178）ことを確認済み。方法クレームの中でもさらに、
+# 「〜工程」という名詞の繰り返し列挙（既存のroot_componentフォールバック
+# ヒューリスティックがそこそこ機能する）と、「〜すること」という動詞の
+# 名詞化節による列挙（構成要素として認識されないため、has_relationsの
+# 「同じ語の繰り返し列挙→root_componentへ」ヒューリスティックが、別々の
+# 節に偶然出てくる同じ実体名を誤って「列挙の兄弟」と誤認し、無関係な
+# 誤抽出を多発させる）の2系統があり、後者は特に深刻（F1=0.000の例が
+# 複数）。
+
+_METHOD_TITLE_RE = _re_symbolic_label.compile(r"(製造方法|検査方法|測定方法|評価方法|加工方法)。?\s*$")
+
+
+def classify_claim_format(text):
+    """
+    請求項テキストを表現形式で分類する。
+
+    戻り値は次のいずれか:
+      "順次列挙形式"     … 方法クレーム（「〜工程」の繰り返し列挙、または
+                            「〜すること」の動詞名詞化節による列挙）。
+                            末尾が「製造方法」等の方法名で終わる、または
+                            本文に「工程」が2回以上出現する場合に判定する。
+      "ジェプソン的形式"   … 「〜において、」「〜であって、」による前半部/
+                            後半部の分割、または「〜を特徴とする」で
+                            終わる形式。
+      "構成要素列挙形式"   … 上記のいずれにも当たらない、通常の装置クレーム
+                            （「Ａと、Ｂと、を備える」等）。
+
+    3形式は本来（新森らの論文でも）排他的ではないが、本パイプラインでは
+    「タグ付け（構成要素境界の認識）ルールをどれに切り替えるか」という
+    ただ1つの決定のために使うので、優先順位を付けて単一の値を返す
+    （順次列挙形式の判定を最優先にするのは、方法クレームが
+    「…において、」等のジェプソン的な言い回しを併用していても、
+    タグ付けの観点では方法クレーム特有の扱いが優先されるべきため）。
+    """
+    if _METHOD_TITLE_RE.search(text) or text.count("工程") >= 2:
+        return "順次列挙形式"
+    if ("を特徴とする" in text) or ("であって、" in text) or ("において、" in text):
+        return "ジェプソン的形式"
+    return "構成要素列挙形式"
+
+
 def analyze_claim_ginza_only(text):
     """
     単文形式の請求項テキストを渡すと (構成要素リスト, 関係リスト) を返す。
@@ -2904,7 +3720,9 @@ def analyze_claim_ginza_only(text):
     """
     components, final_relations, doc = _extract_raw_relations(text)
     final_relations = _simplify_hierarchy(final_relations, doc, components)
+    final_relations = _merge_surface_location_nodes(final_relations)
     final_relations = _add_genitive_provenance_relations(final_relations)
+    final_relations = _merge_partitive_nodes(final_relations, doc, components)
     return components, final_relations
 
 
@@ -6986,12 +7804,25 @@ def _normalize_relation_for_match(text):
 # 正しい関係を抽出できているか」なので、既知の同義語グループは
 # 同じ関係とみなして比較する。
 RELATION_SYNONYM_GROUPS = [
-    {"有する", "備える", "具備する", "含む", "含める"},
+    # 「の」は正解データ側で「有する/含む」に相当する関係（全体が部分・
+    # 属性を持つ、の意）をそのまま属格「の」で表記している箇所が
+    # 532件中186クレーム・485件存在する（例:「スイッチ素子の高電位端子」
+    # →source=スイッチ素子, relation=の, target=高電位端子）。全て
+    # source=全体・target=部分/属性で方向は一貫しているため、同義語として
+    # 扱う（本人に確認済み）。
+    {"有する", "備える", "具備する", "含む", "含める", "の"},
     {"配置される", "配置", "設けられる", "設置される", "設置"},
     {"接続される", "接続", "連結される", "連結"},
     {"接触する", "接触", "当接する", "当接"},
     {"形成される", "形成"},
     {"固定される", "固定"},
+    # 以下、532件の正解データで実際の用例を確認し、方向（source=全体・
+    # target=部分/材料、または受動態でsource=被覆・搭載される側）が
+    # 一貫していることを確認した上で追加。能動態（「構成する」「搭載する」）
+    # は所有の向きが逆（source=部分側）になるため、あえて含めていない。
+    {"からなる", "構成される"},
+    {"搭載される", "実装される"},
+    {"覆う", "被覆する"},
 ]
 
 
@@ -7092,6 +7923,251 @@ def print_evaluation_report(predicted_relations, gold_triples, name="請求項",
         for r in result["unmatched_gold"]:
             print(f"  {r['source']} --{r['relation']}--> {r['target']}")
     return result
+
+
+# ============================================================
+# 緩い評価（ノード表記の正規化＋意味的類似度）
+# ============================================================
+# 【方針転換】2026年時点でユーザーの明示的な判断により、「評価方法は
+# 意味が伝わればいいくらいに緩くてよい」という方針に変更した。
+# 従来のevaluate_triples/batch_evaluate（source/targetの完全一致必須）は
+# GiNZA初期版0.277→改良版0.421という、これまでの厳格な比較の土台として
+# そのまま残す（後方互換のため一切変更しない）。今後のLLM版の評価は、
+# こちらの「緩い」評価を主指標として使う。
+#
+# 「緩さ」の内訳（ユーザー確認済み）：
+#   ①表記・字体の揺れ（簡体字/日本字体の混同、全角/半角）を正規化
+#   ②数量詞・修飾語（「複数の」「少なくとも１つの」等）の有無を無視
+#   ③上記正規化後もまだ一致しない場合は、埋め込みモデルによる意味的
+#     類似度（コサイン類似度が閾値以上）で一致とみなす
+#
+# ①②は無料（決定的・高速）なので必ず先に試し、③（埋め込み計算）は
+# ①②で一致しなかったペアにだけ使う（全ペアを毎回embeddingにかけると
+# 遅く、かつ①②で明らかに同じと分かるものまで確率的な閾値判定に
+# 委ねてしまうため）。
+
+import unicodedata as _unicodedata_lenient
+
+# LLM（Ollama）が日本語のつもりで簡体字/類似字体を出力することがある
+# （実運用ログで「収容する」→「收容する」を確認）。意味は同じなので、
+# 緩い評価では同一視する。新しい混同パターンが見つかり次第、追加する。
+_LENIENT_CHAR_VARIANTS = {
+    "收": "収",
+    "载": "載",  # 特開2025-174033で「载置する」「载置工程」を確認
+}
+
+# 埋め込みモデルが使えない場合の警告を、実行中に1回だけ表示するためのフラグ
+# （batch_evaluate_lenientで532件回すと、警告なしだと毎回同じ理由で
+# 静かにフォールバックし続けてしまい、精度低下の原因に気づきにくいため）。
+_EMBED_MODEL_WARNING_SHOWN = False
+
+# _QUANTIFIER_WORDS（構成要素の所有者プレフィックス除外用に既存定義済み）
+# に加え、「１つの」「三つの」のような数詞＋助数詞パターンも接頭辞として
+# 除去する。
+_QUANTIFIER_PREFIX_RE = _re_symbolic_label.compile(
+    "^(複数の|いくつかの|幾つかの|各|全ての|すべての|少なくとも|一部の|"
+    "双方の|任意の|それぞれの|[0-9一二三四五六七八九十]+つの|[0-9]+個の)"
+)
+
+
+def _normalize_node_text_lenient(text):
+    """
+    緩い評価のための、source/targetテキストの正規化。
+    「意味が伝わればいい」という基準を、①字体②数量詞・修飾語の観点で
+    具体化したもの（③の意味的類似度は、この正規化を通した上で
+    それでも不一致の場合にのみ埋め込みモデルにかける）。
+    """
+    if not text:
+        return text
+    t = text
+    for a, b in _LENIENT_CHAR_VARIANTS.items():
+        t = t.replace(a, b)
+    t = _unicodedata_lenient.normalize("NFKC", t)
+    for prefix in ("前記", "該"):
+        if t.startswith(prefix) and t != prefix:
+            t = t[len(prefix):]
+    prev = None
+    while prev != t:
+        prev = t
+        m = _QUANTIFIER_PREFIX_RE.match(t)
+        if m and len(t) > len(m.group(0)):
+            t = t[len(m.group(0)):]
+    return t.strip()
+
+
+def evaluate_triples_lenient(predicted_relations, gold_triples, lenient_relation_match=True,
+                              semantic_threshold=0.75, use_semantic=True):
+    """
+    「意味が伝わっていれば正解」という基準でのF値（evaluate_triplesの
+    緩和版）。source/targetは①字体・数量詞の正規化→②（それでも
+    不一致なら）埋め込みモデルによる意味的類似度、の2段階でマッチを試みる。
+    relationはevaluate_triplesと同じ緩和ロジック（漢字部分一致・同義語）。
+
+    戻り値はevaluate_triples()と同じキー構成に加え、
+    "match_method"（"exact_or_normalized" / "semantic"）別の内訳を
+    "正解内訳" として返す。
+    """
+    def _rel_match(p_rel, g_rel):
+        if p_rel == g_rel:
+            return True
+        if not lenient_relation_match:
+            return False
+        pn = _normalize_relation_for_match(p_rel)
+        gn = _normalize_relation_for_match(g_rel)
+        if pn == gn or pn in gn or gn in pn:
+            return True
+        return _relation_synonym_match(p_rel, g_rel)
+
+    norm_pred = [
+        (i, _normalize_node_text_lenient(p["source"]), _normalize_node_text_lenient(p["target"]), p["relation"])
+        for i, p in enumerate(predicted_relations)
+    ]
+    norm_gold = [
+        (i, _normalize_node_text_lenient(g["source"]), _normalize_node_text_lenient(g["target"]), g["relation"])
+        for i, g in enumerate(gold_triples)
+    ]
+
+    matched_pred_idx = {}
+    matched_gold_idx = set()
+
+    # ①②: 正規化後の完全一致を先に確定させる
+    for pi, p_src, p_tgt, p_rel in norm_pred:
+        for gi, g_src, g_tgt, g_rel in norm_gold:
+            if gi in matched_gold_idx:
+                continue
+            if p_src == g_src and p_tgt == g_tgt and _rel_match(p_rel, g_rel):
+                matched_pred_idx[pi] = ("normalized", gi)
+                matched_gold_idx.add(gi)
+                break
+
+    # ③: 残りは埋め込みモデルによる意味的類似度でマッチを試みる
+    remaining_pred = [(pi, p) for pi, p in enumerate(predicted_relations) if pi not in matched_pred_idx]
+    remaining_gold = [(gi, g) for gi, g in enumerate(gold_triples) if gi not in matched_gold_idx]
+    if use_semantic and remaining_pred and remaining_gold:
+        try:
+            model = _get_embed_model()
+            pred_texts = [
+                _triple_to_text((
+                    _normalize_node_text_lenient(p["source"]), p["relation"],
+                    _normalize_node_text_lenient(p["target"]),
+                ))
+                for _, p in remaining_pred
+            ]
+            gold_texts = [
+                _triple_to_text((
+                    _normalize_node_text_lenient(g["source"]), g["relation"],
+                    _normalize_node_text_lenient(g["target"]),
+                ))
+                for _, g in remaining_gold
+            ]
+            emb_pred = model.encode(pred_texts, normalize_embeddings=True)
+            emb_gold = model.encode(gold_texts, normalize_embeddings=True)
+            sim = emb_pred @ emb_gold.T
+
+            candidates = []
+            for a in range(sim.shape[0]):
+                for b in range(sim.shape[1]):
+                    candidates.append((sim[a, b], a, b))
+            candidates.sort(key=lambda x: -x[0])
+
+            used_gold_local = set()
+            for s, a, b in candidates:
+                if s < semantic_threshold:
+                    break
+                pi, _ = remaining_pred[a]
+                gi, _ = remaining_gold[b]
+                if pi in matched_pred_idx or b in used_gold_local or gi in matched_gold_idx:
+                    continue
+                matched_pred_idx[pi] = ("semantic", gi)
+                matched_gold_idx.add(gi)
+                used_gold_local.add(b)
+        except Exception as e:
+            # sentence-transformers未インストール、初回モデルダウンロードに
+            # 必要なネットワークが使えない等、埋め込みモデルが使えない
+            # 環境では③をスキップし、①②の正規化一致のみで評価する
+            # （use_semantic=Falseと同じ挙動にフォールバックする）。
+            # ImportErrorだけでなく、モデルダウンロード時のネットワーク
+            # エラー（huggingface_hubの取得失敗等）もここで拾う必要がある。
+            global _EMBED_MODEL_WARNING_SHOWN
+            if not _EMBED_MODEL_WARNING_SHOWN:
+                print(
+                    f"[警告] 意味的類似度によるマッチングを利用できません"
+                    f"（{type(e).__name__}: {e}）。表記正規化のみで評価します。"
+                )
+                _EMBED_MODEL_WARNING_SHOWN = True
+
+    matched_pred = [predicted_relations[i] for i in sorted(matched_pred_idx)]
+    unmatched_pred = [p for i, p in enumerate(predicted_relations) if i not in matched_pred_idx]
+    unmatched_gold = [g for i, g in enumerate(gold_triples) if i not in matched_gold_idx]
+
+    tp = len(matched_pred_idx)
+    precision = tp / len(predicted_relations) if predicted_relations else 0.0
+    recall = tp / len(gold_triples) if gold_triples else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    n_normalized = sum(1 for method, _ in matched_pred_idx.values() if method == "normalized")
+    n_semantic = sum(1 for method, _ in matched_pred_idx.values() if method == "semantic")
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "正解数": tp,
+        "システム抽出数": len(predicted_relations),
+        "正解データ数": len(gold_triples),
+        "matched_pred": matched_pred,
+        "unmatched_pred": unmatched_pred,
+        "unmatched_gold": unmatched_gold,
+        "正解内訳": {"表記正規化一致": n_normalized, "意味的類似度一致": n_semantic},
+    }
+
+
+def batch_evaluate_lenient(test_cases, lenient_relation_match=True, semantic_threshold=0.75,
+                            use_semantic=True, use_ollama=False):
+    """
+    evaluate_triples_lenient() を複数件まとめて実行する、batch_evaluate()の
+    緩い評価版。返り値の形はbatch_evaluate()と同じ（micro/macro）。
+    """
+    analyze_fn = analyze_claim if use_ollama else analyze_claim_ginza_only
+
+    results = []
+    for case in test_cases:
+        if len(case) == 4:
+            name, text, gold, category = case
+        else:
+            name, text, gold = case
+            category = None
+        try:
+            _, predicted = analyze_fn(text)
+        except Exception:
+            predicted = []
+        result = evaluate_triples_lenient(
+            predicted, gold, lenient_relation_match=lenient_relation_match,
+            semantic_threshold=semantic_threshold, use_semantic=use_semantic,
+        )
+        result["name"] = name
+        result["category"] = category
+        results.append(result)
+
+    total_tp = sum(r["正解数"] for r in results)
+    total_pred = sum(r["システム抽出数"] for r in results)
+    total_gold = sum(r["正解データ数"] for r in results)
+    micro_precision = total_tp / total_pred if total_pred else 0.0
+    micro_recall = total_tp / total_gold if total_gold else 0.0
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if (micro_precision + micro_recall) > 0 else 0.0
+    )
+    macro_precision = sum(r["precision"] for r in results) / len(results) if results else 0.0
+    macro_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
+    macro_f1 = sum(r["f1"] for r in results) / len(results) if results else 0.0
+
+    return {
+        "results": results,
+        "micro": {"precision": micro_precision, "recall": micro_recall, "f1": micro_f1},
+        "macro": {"precision": macro_precision, "recall": macro_recall, "f1": macro_f1},
+        "semantic_threshold": semantic_threshold,
+    }
 
 
 def batch_evaluate(test_cases, lenient_relation_match=True, use_ollama=False):
@@ -8321,3 +9397,41 @@ def batch_evaluate_semantic(test_cases, threshold=0.75, use_ollama=False, progre
         "macro": {"precision": macro_precision, "recall": macro_recall, "f1": macro_f1},
         "threshold": threshold,
     }
+
+
+def analyze_claim_translate(text, model=None, host=None, debug=False, debug_out=None):
+    """
+    「タグ化 → ローカルLLM(Ollama)で英訳 → 英語で依存構造解析 → タグを
+    元の日本語に戻す」新方式（translate_sao.py）でSAOを抽出する。
+
+    まだ実験的な方式であり、オラクル分割＋手動翻訳での検証（macro F1
+    96〜98%程度）しか行っていない。自動タグ付け＋実際のOllama翻訳での
+    end-to-end精度は eval_translate_sao.py で別途確認すること。
+
+    analyze_claim() / analyze_claim_ginza_only() と同じ
+    (components, relations) の形で返すので、evaluate_triples や
+    build_graphviz にそのまま渡せる。
+    """
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    if this_dir not in sys.path:
+        sys.path.insert(0, this_dir)
+
+    try:
+        import translate_sao as _ts
+    except ImportError as e:
+        raise RuntimeError(
+            "新方式（タグ化→英訳）の実行に必要なファイルが見つからないか、"
+            "必要なパッケージが不足しています。translate_sao.py と "
+            "en_relation_rules.py を patent_pipeline.py と同じフォルダに置き、"
+            "`pip install spacy ollama` と "
+            "`python -m spacy download en_core_web_sm` を実行してください。"
+            f"（詳細: {e}）"
+        ) from e
+
+    kwargs = {"pp": sys.modules[__name__], "host": host, "debug": debug, "debug_out": debug_out}
+    if model:
+        kwargs["model"] = model
+    else:
+        kwargs["model"] = _ts.DEFAULT_MODEL
+
+    return _ts.analyze_claim_translate(text, **kwargs)
