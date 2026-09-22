@@ -14,4 +14,4 @@ japanize-matplotlib
 openpyxl
 graphviz
 ollama
-
+openai>=1.0
