@@ -188,7 +188,15 @@ def load_sample():
     f = PC.find_corpus_file()
     if f is None:
         return None
-    data = PC.load_corpus(f)
+    try:
+        data = PC.load_corpus(f)
+        assert isinstance(data.get("patents"), list)
+    except Exception as exc:  # noqa: BLE001
+        # ファイルが空・途中までしかない・HTML（GitHubのページを保存したもの）などの場合でも、
+        # アプリ全体は止めず、サンプルなしで起動する
+        head = f.read_bytes()[:80]
+        return {"_error": f"{f.name} を読み込めませんでした（{type(exc).__name__}、大きさ {f.stat().st_size:,} バイト、"
+                          f"先頭 {head[:40]!r}）。"}
     data["meta"].update({"name": SAMPLE_NAME, "sample": True})
     for p in data["patents"]:
         p["relations"] = tidy_candidates(p["relations"])
@@ -207,9 +215,12 @@ def set_dataset(data):
         st.session_state[k] = v
 
 
+SAMPLE_ERROR = None
 if st.session_state.dataset is None:
     _sample = load_sample()
-    if _sample is not None:
+    if _sample is not None and "_error" in _sample:
+        SAMPLE_ERROR = _sample["_error"]
+    elif _sample is not None:
         set_dataset(json.loads(json.dumps(_sample)))
 
 DATA = st.session_state.dataset
@@ -232,6 +243,9 @@ def patent_label(pid):
 
 
 def need_data():
+    if SAMPLE_ERROR and not DATA:
+        st.error("サンプルデータ：" + SAMPLE_ERROR + "GitHub の corpus_sao_532.json を、配布したファイルで"
+                 "上げ直してください（中身が「{\"meta\": …」で始まるJSONのはずです）。")
     if not DATA or not DATA.get("patents"):
         st.warning("分析するデータがありません。「データの読み込み」ページで特許リストを読み込んでください。")
         st.stop()
@@ -458,8 +472,8 @@ def page_data():
                     "各特許の判定は、その特許を学習に使っていない交差検証のモデルで求めています。")
         if st.button("サンプルデータを開く"):
             s = load_sample()
-            if s is None:
-                st.error("corpus_sao_532.json が見つかりません。")
+            if s is None or "_error" in s:
+                st.error("サンプルデータを開けません。" + (s["_error"] if s else "corpus_sao_532.json が見つかりません。"))
             else:
                 set_dataset(json.loads(json.dumps(s)))
                 st.rerun()
