@@ -11513,6 +11513,7 @@ HAS_RELATIONS = {"有する", "備える", "具備する", "含む", "含める"
 FONT = "Noto Sans CJK JP,Yu Gothic,Meiryo,sans-serif"
 
 
+RELATION_GROUP_NAMES = ["接続", "配置・位置", "覆う・収める", "動作・機能"]
 RELATION_COLORS = [
     ("#2563eb", ("接続", "導通", "連結", "結合")),                                   # 接続
     ("#16a34a", ("配置", "設け", "位置", "形成", "積層", "搭載", "実装", "載置", "固定", "取り付",
@@ -11535,7 +11536,19 @@ def _esc(s):
     return html.escape(s).replace('"', '\\"')
 
 
-def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
+def relation_group(rel):
+    """関係語の種類（凡例・絞り込み用）。"""
+    for (color, _), name in zip(RELATION_COLORS, RELATION_GROUP_NAMES):
+        if color == relation_color(rel):
+            return name
+    return "その他"
+
+
+def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR", focus=None, groups=None,
+                            show_labels=True, merge=True):
+    """focus: この部品に関わる矢印だけを描く（None ならすべて）。
+    groups: 描く関係の種類（relation_group の名前の集合。None ならすべて）。
+    merge: 同じ2つの箱をつなぐ矢印を1本にまとめる（関係名はまとめて表示）。"""
     rels = [r for r in relations if r["source"] != r["target"]]
 
     names = []
@@ -11619,8 +11632,10 @@ def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
         if p in containers:
             fill = ["#eef2ff", "#f0fdf4", "#fff7ed", "#ffffff"][min(len(p) - 1, 3)]
             lines.append(f"{pad}subgraph cluster_{ids[p]} {{")
+            hot = focus and p[-1] == focus
             lines.append(f'{pad}  label=<<b>{html.escape(p[-1])}</b>>; labeljust=l; style="rounded,filled"; '
-                         f'fillcolor="{fill}"; color="#64748b"; penwidth=1.4; margin=12;')
+                         f'fillcolor="{"#fef9c3" if hot else fill}"; color="{"#ca8a04" if hot else "#64748b"}"; '
+                         f'penwidth={2.4 if hot else 1.4}; margin=12;')
             lines.append(f'{pad}  {anchor(p)} [shape=point, width=0.01, style=invis, label=""];')
             for c in children[p]:
                 emit(c, indent + 1)
@@ -11628,6 +11643,8 @@ def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
         elif len(p) == 1:
             lines.append(f'{pad}{ids[p]} [label="{_esc(p[-1])}", shape=ellipse, style="dashed", '
                          'color="#94a3b8", fontcolor="#475569"];')
+        elif focus and p[-1] == focus:
+            lines.append(f'{pad}{ids[p]} [label="{_esc(p[-1])}", fillcolor="#fef9c3", color="#ca8a04", penwidth=2.4];')
         else:
             lines.append(f'{pad}{ids[p]} [label="{_esc(p[-1])}"];')
 
@@ -11646,8 +11663,10 @@ def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
             return k
         return max(instances[tgt_name], key=lambda q: shared(src_path, q))
 
-    # 関係の種類ごとに色を分け、ラベルには白い背景を付けて線と重なっても読めるようにする。
-    # 部品が複数の箱に複製されている場合でも、1つの関係は1本の矢印だけにする。
+    # 1つの関係は1本の矢印だけにし、同じ2つの箱をつなぐ矢印は1本にまとめる
+    # （向きが両方あれば両矢印）。関係名は線の色（種類）と、まとめたラベルで示す。
+    edges = {}
+    order = []
     drawn = set()
     for r in rels:
         if r["relation"] in HAS_RELATIONS:
@@ -11667,10 +11686,46 @@ def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
         if best is None:
             continue
         _, sp, tp = best
-        color = relation_color(r["relation"], rel_color)
-        label = ('<<table border="0" cellborder="0" cellpadding="1" cellspacing="0" bgcolor="white">'
-                 f'<tr><td><font color="{color}">{html.escape(r["relation"])}</font></td></tr></table>>')
-        a = [f"label={label}", f'color="{color}"', "penwidth=1.5"]
+        # 自分を含む箱への矢印（箱の中の部品→外側の箱）は描くと箱の枠に刺さるだけなので省く
+        if sp[:len(tp)] == tp or tp[:len(sp)] == sp:
+            continue
+        # 図の配置が変わらないように、絞り込みで外れた関係も「見えない線」「薄い線」として残す
+        if groups is not None and relation_group(r["relation"]) not in groups:
+            state = 0
+        elif focus and focus not in (r["source"], r["target"]):
+            state = 1
+        else:
+            state = 2
+        k = (frozenset((sp, tp)), state) if merge else (sp, tp, r["relation"], state)
+        if k not in edges:
+            edges[k] = {"sp": sp, "tp": tp, "rels": [], "dirs": set(), "state": state}
+            order.append(k)
+        e = edges[k]
+        if r["relation"] not in e["rels"]:
+            e["rels"].append(r["relation"])
+        e["dirs"].add((sp, tp))
+
+    for k in order:
+        e = edges[k]
+        sp, tp = e["sp"], e["tp"]
+        color = relation_color(e["rels"][0], rel_color)
+        both = len(e["dirs"]) > 1
+        shown = e["rels"][:2]
+        text = "／".join(shown) + ("／他%d" % (len(e["rels"]) - 2) if len(e["rels"]) > 2 else "")
+        many = sum(1 for x in edges.values() if x["state"] == 2) > 25
+        if e["state"] == 0:
+            a = ["style=invis"]
+        elif e["state"] == 1:
+            a = ['color="#cbd5e1"', "penwidth=0.8", "arrowsize=0.5"]
+        else:
+            # 矢印が多いときは少し透かして、重なった線の見分けをつきやすくする
+            a = [f'color="{color}{"b3" if many and not focus else ""}"', "penwidth=1.4", "arrowsize=0.7"]
+            if show_labels:
+                a.append('label=<<table border="0" cellborder="0" cellpadding="1" cellspacing="0" bgcolor="white">'
+                         f'<tr><td><font color="{color}" point-size="11">{html.escape(text)}</font></td></tr></table>>')
+        a.append(f'tooltip="{_esc(sp[-1])} → {_esc(tp[-1])}: {_esc(" / ".join(e["rels"]))}"')
+        if both:
+            a.append("dir=both")
         if sp in containers:
             a.append(f"ltail=cluster_{ids[sp]}")
         if tp in containers:
@@ -13305,6 +13360,9 @@ def relations_csv(corpus, reviews=None):
 # ---------------------------------------------------------------------------
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
+# app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
+PIPELINE_VERSION = "2026-09-24"
+
 DEFAULT_BANDS = {
     "accept": 0.58, "threshold": 0.275, "review_low": 0.175, "target_precision": 0.8,
     "stats": {"採用": {"精度": 0.8034}, "要確認": {"精度": 0.288}, "除外": {"精度": 0.0576},
@@ -13806,6 +13864,138 @@ def tidy_relations(rels):
         seen.add((s, a, t))
         out.append(dict(r, source=s, relation=a, target=t))
     return out
+
+
+# ---------------------------------------------------------------- ワードクラウド（サーモグラフィー風）
+# 温度計の色（アイアンボウ）：冷たい＝黒・紺・紫、熱い＝赤・橙・黄・白。よく出る語ほど熱く大きく描く。
+THERMO_STOPS = [(0.00, (40, 20, 110)), (0.18, (95, 20, 150)), (0.36, (175, 25, 135)), (0.52, (230, 60, 60)),
+                (0.68, (250, 125, 20)), (0.84, (255, 205, 40)), (1.00, (255, 255, 225))]
+
+
+def thermo_color(v):
+    """0〜1の値を、サーモグラフィーの色（#rrggbb）にする。"""
+    v = min(max(float(v), 0.0), 1.0)
+    for (a, ca), (b, cb) in zip(THERMO_STOPS, THERMO_STOPS[1:]):
+        if v <= b:
+            t = (v - a) / (b - a) if b > a else 0
+            return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(ca, cb))
+    return "#%02x%02x%02x" % THERMO_STOPS[-1][1]
+
+
+_WC_NUMERIC_RE = re.compile(r"^[0-9０-９.．,，\-－~〜～]+")
+
+
+def wordcloud_terms(corpus, target="構成要素", patent_ids=None, reviews=None, drop_title=True, min_count=2, top_n=80):
+    """ワードクラウドに出す語。選んだ特許の中で多く出てくる順に top_n 語。
+    target: 構成要素（番号を除いた部品名：「第1電極」→「電極」）／関係（言い切りの形の関係語）
+    戻り値: [(語, 選んだ特許での件数, 全体での件数, 特化係数)]
+    特化係数＝（選んだ特許のうちその語を含む割合）÷（データ全体での割合）。1が平均、2なら全体の2倍よく出る。"""
+    def terms(p):
+        rels = effective_relations(p, reviews)
+        if target == "関係":
+            out = {clean_relation(r["relation"]) for r in rels}
+        else:
+            out = {base_term(x) for r in rels for x in (r["source"], r["target"])}
+            if drop_title and p.get("title"):
+                out.discard(base_term(p["title"]))
+        # 「4.0質量%」のような数値だけの語は除く
+        return {t for t in out if t and len(t) >= 2 and not _WC_NUMERIC_RE.match(t)}
+
+    all_ids = [p["id"] for p in corpus["patents"]]
+    sel = set(patent_ids) if patent_ids is not None else set(all_ids)
+    df_all, df_sel = Counter(), Counter()
+    for p in corpus["patents"]:
+        ts_ = terms(p)
+        df_all.update(ts_)
+        if p["id"] in sel:
+            df_sel.update(ts_)
+    n_all, n_sel = max(len(all_ids), 1), max(len(sel & set(all_ids)), 1)
+    rows = [(t, c, df_all[t], (c / n_sel) / (df_all[t] / n_all)) for t, c in df_sel.items() if c >= min_count]
+    rows.sort(key=lambda r: (-r[1], -r[3]))
+    return rows[:top_n]
+
+
+def wordcloud_heat(rows, color_by="件数"):
+    """各語の「温度」（0〜1）。件数なら多いほど熱く、特化係数なら全体より偏って多いほど熱い
+    （特化係数1＝平均で中ほどの赤紫、2倍で橙、3倍近くで白。平均より少ない語は紫〜紺）。"""
+    if color_by == "件数":
+        c = np.sqrt(np.array([r[1] for r in rows], dtype=float))
+        lo, hi = float(c.min()), float(c.max())
+        return [float((x - lo) / (hi - lo)) if hi - lo > 1e-9 else 1.0 for x in c]
+    return [float(min(max(0.45 + 0.35 * math.log2(max(r[3], 1e-6)), 0.0), 1.0)) for r in rows]
+
+
+def _text_width(t, fs):
+    return sum(fs * (0.58 if ord(ch) < 0x3000 else 1.0) for ch in t)
+
+
+def wordcloud_layout(rows, heat=None, width=900, height=520, min_fs=13, max_fs=62, seed=0):
+    """語を中心から渦巻き状に、重ならないように置く（件数の多い語ほど大きく、先に中心近くへ）。"""
+    if not rows:
+        return []
+    heat = heat or wordcloud_heat(rows)
+    c = np.sqrt(np.array([r[1] for r in rows], dtype=float))
+    lo, hi = float(c.min()), float(c.max())
+    placed, boxes = [], []
+    rng = np.random.default_rng(seed)
+    for r, x, h_ in sorted(zip(rows, c, heat), key=lambda z: -z[1]):
+        k = (x - lo) / (hi - lo) if hi - lo > 1e-9 else 1.0
+        fs = min_fs + (max_fs - min_fs) * k
+        w, h = _text_width(r[0], fs) + 6, fs * 1.18
+        start = rng.uniform(0, 2 * np.pi)
+        ok = False
+        for step in range(4000):
+            ang = start + 0.35 * step
+            rad = 7.0 * np.sqrt(step)
+            cx, cy = width / 2 + rad * np.cos(ang) * 1.45, height / 2 + rad * np.sin(ang)
+            x0, y0 = cx - w / 2, cy - h / 2
+            if x0 < 4 or y0 < 4 or x0 + w > width - 4 or y0 + h > height - 4:
+                continue
+            if all(x0 + w <= bx or bx + bw <= x0 or y0 + h <= by or by + bh <= y0 for bx, by, bw, bh in boxes):
+                ok = True
+                break
+        if not ok:
+            continue
+        boxes.append((x0, y0, w, h))
+        placed.append({"text": r[0], "count": r[1], "count_all": r[2], "ratio": r[3], "fs": fs,
+                       "x": cx, "y": cy, "heat": h_})
+    return placed
+
+
+def wordcloud_svg(placed, width=900, height=520, legend=("少ない（冷）", "多い（熱）"), title=""):
+    """サーモグラフィー風のSVG（暗い背景に、熱い色ほどぼんやり光る語）。語にマウスを重ねると値が出る。"""
+    import html as _html
+    grad = "".join(f'<stop offset="{int(a * 100)}%" stop-color="{thermo_color(a)}"/>' for a, _ in THERMO_STOPS)
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height + 46}" width="100%" '
+             'style="font-family:\'Noto Sans JP\',\'Yu Gothic\',Meiryo,sans-serif;display:block">',
+             '<defs><radialGradient id="bg" cx="50%" cy="48%" r="75%"><stop offset="0%" stop-color="#1b1036"/>'
+             '<stop offset="100%" stop-color="#05030c"/></radialGradient>'
+             f'<linearGradient id="bar" x1="0" x2="1" y1="0" y2="0">{grad}</linearGradient>'
+             '<filter id="glow" x="-30%" y="-60%" width="160%" height="220%"><feGaussianBlur stdDeviation="5"/></filter>'
+             '</defs>',
+             f'<rect width="{width}" height="{height + 46}" rx="10" fill="url(#bg)"/>']
+    # 熱い語のまわりにぼんやりした光（サーモグラフィーのにじみ）
+    for p in sorted(placed, key=lambda p: p["heat"]):
+        if p["heat"] < 0.25:
+            continue
+        parts.append(f'<text x="{p["x"]:.1f}" y="{p["y"]:.1f}" font-size="{p["fs"]:.1f}" font-weight="800" '
+                     f'text-anchor="middle" dominant-baseline="central" fill="{thermo_color(p["heat"])}" '
+                     f'opacity="{0.25 + 0.45 * p["heat"]:.2f}" filter="url(#glow)">{_html.escape(p["text"])}</text>')
+    for p in sorted(placed, key=lambda p: p["heat"]):
+        parts.append(f'<text x="{p["x"]:.1f}" y="{p["y"]:.1f}" font-size="{p["fs"]:.1f}" '
+                     f'font-weight="{700 if p["heat"] > 0.5 else 500}" text-anchor="middle" dominant-baseline="central" '
+                     f'fill="{thermo_color(0.16 + 0.84 * p["heat"])}" style="cursor:default">'
+                     f'<title>{_html.escape(p["text"])}：選んだ特許 {p["count"]}件／全体 {p["count_all"]}件'
+                     f'（特化係数 {p["ratio"]:.2f}）</title>'
+                     f'{_html.escape(p["text"])}</text>')
+    y = height + 14
+    parts.append(f'<rect x="{width - 290}" y="{y}" width="200" height="12" rx="3" fill="url(#bar)"/>')
+    parts.append(f'<text x="{width - 298}" y="{y + 10}" font-size="12" fill="#cbd5e1" text-anchor="end">{legend[0]}</text>')
+    parts.append(f'<text x="{width - 82}" y="{y + 10}" font-size="12" fill="#cbd5e1">{legend[1]}</text>')
+    if title:
+        parts.append(f'<text x="16" y="{y + 10}" font-size="13" fill="#e2e8f0">{_html.escape(title)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 # ===========================================================================
@@ -14377,7 +14567,7 @@ _THIS = sys.modules[__name__]
 en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
 translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
 node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, node_score=node_score, numbers=numbers, rel_match=rel_match)
-nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, _esc=_esc, relation_color=relation_color, relations_to_nested_dot=relations_to_nested_dot)
+nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, _esc=_esc, relation_color=relation_color, relation_group=relation_group, relations_to_nested_dot=relations_to_nested_dot)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
 seg_pairs = _types.SimpleNamespace(HAS_VERBS=HAS_VERBS_sp, _tree_dist=_tree_dist, pairs_from_segment=pairs_from_segment, segment_pairs=segment_pairs)
@@ -14386,7 +14576,7 @@ sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, build_cand
 sao_selector11 = _types.SimpleNamespace(HERE=HERE, build_candidates=build_candidates11, claim_features=claim_features11, merge_occurrences=merge_occurrences)
 sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, tidy_relations=tidy_relations)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
 
 

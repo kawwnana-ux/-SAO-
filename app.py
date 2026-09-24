@@ -70,6 +70,15 @@ relations_to_nested_dot = pp.relations_to_nested_dot  # 入れ子の構造図（
 
 st.set_page_config(page_title="特許分析プラットフォーム", layout="wide", page_icon="🔬")
 
+# app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
+# AttributeError になるので、起動時に確かめて分かりやすく知らせる。
+NEED_PIPELINE = "2026-09-24"
+if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
+    st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
+             "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
+             f"（必要な版: {NEED_PIPELINE}／今の版: {getattr(PC, 'PIPELINE_VERSION', 'なし')}）")
+    st.stop()
+
 APP_DIR = Path(__file__).resolve().parent
 OZ_WORLD_HTML_PATH = APP_DIR / "oz_world_embed.html"
 CLOUD_MODEL = "qwen/qwen-2.5-7b-instruct"
@@ -324,19 +333,42 @@ def llm_error_message():
             f"Ollamaが起動しているか（ollama serve）、モデルが取得済みか（ollama pull {model_name}）を確認してください。")
 
 
-def sao_graph(relations):
+GRAPH_GROUPS = list(pp.RELATION_GROUP_NAMES) + ["その他"]
+
+
+def sao_graph(relations, key="main"):
     if not relations:
         st.info("表示できるSAO関係がありません。")
         return
     direction = "TB" if st.session_state.get("graph_dir", "").startswith("縦") else "LR"
-    st.graphviz_chart(relations_to_nested_dot(PC.tidy_relations(relations), direction=direction),
+    rels = PC.tidy_relations(relations)
+    # 矢印の多い部品から並べる（構成を表す「備える・有する」は箱の入れ子で描くので数えない）
+    deg = Counter()
+    for r in rels:
+        if r["relation"] not in pp.HAS_RELATIONS and r["source"] != r["target"]:
+            deg[r["source"]] += 1
+            deg[r["target"]] += 1
+    n_arrows = sum(1 for r in rels if r["relation"] not in pp.HAS_RELATIONS)
+    c1, c2, c3 = st.columns([2, 3, 1.2])
+    ALL = "（すべての矢印を表示）"
+    focus = c1.selectbox("注目する部品", [ALL] + [n for n, _ in deg.most_common()], key=f"g_focus_{key}",
+                         format_func=lambda n: n if n == ALL else f"{n}（矢印 {deg[n]}本）",
+                         help="選んだ部品に関わる矢印だけを色つきで表示し、他の矢印は薄い灰色にします。")
+    groups = c2.multiselect("表示する関係の種類", GRAPH_GROUPS, default=GRAPH_GROUPS, key=f"g_groups_{key}")
+    labels = c3.checkbox("関係名を表示", value=True, key=f"g_labels_{key}")
+    if focus == ALL and n_arrows > 25:
+        st.caption(f"矢印が {n_arrows} 本あります。見にくいときは「注目する部品」を選ぶか、関係の種類を絞ってください。"
+                   "同じ2つの部品をつなぐ矢印は1本にまとめ、関係名を「／」で並べています。")
+    st.graphviz_chart(relations_to_nested_dot(rels, direction=direction, focus=None if focus == ALL else focus,
+                                              groups=set(groups), show_labels=labels),
                       use_container_width=True)
     st.markdown(
         "<div style='font-size:.8rem;opacity:.85'>箱の入れ子＝構成（備える・有する・含む）／点線の楕円＝どの構成要素にも"
-        "属さない対象（方向・設置対象など）／矢印の色："
+        "属さない対象（方向・設置対象など）／両矢印＝2つの部品の間に両方向の関係がある／矢印の色："
         "<span style='color:#2563eb'>■接続</span>　<span style='color:#16a34a'>■配置・位置</span>　"
         "<span style='color:#9333ea'>■覆う・収める</span>　<span style='color:#ea580c'>■動作・機能</span>　"
-        "<span style='color:#475569'>■その他</span>（右上のボタンで全画面表示）</div>", unsafe_allow_html=True)
+        "<span style='color:#475569'>■その他</span>（矢印にマウスを重ねると関係名がすべて出ます。右上のボタンで全画面表示）</div>",
+        unsafe_allow_html=True)
 
 
 def status_badges(counts):
@@ -1015,15 +1047,71 @@ def page_similarity():
     a, b = st.columns(2)
     with a:
         st.markdown(f"**{pid}**")
-        sao_graph(ra)
+        sao_graph(ra, key="a")
     with b:
         st.markdown(f"**{other}**")
-        sao_graph(rb)
+        sao_graph(rb, key="b")
 
 
 # ===========================================================================
 # 🧭 FIレーダー
 # ===========================================================================
+
+def page_wordcloud():
+    need_data()
+    st.title("🔥 ワードクラウド")
+    st.caption("SAOに出てくる部品名（または関係語）を、サーモグラフィーのように表示する。"
+               "文字の大きさ＝その語が出てくる特許の件数。色（温度）＝件数、または全体と比べた偏り（特化係数）。"
+               "語にマウスを重ねると件数が出ます。")
+    pats = DATA["patents"]
+    c1, c2, c3 = st.columns([1.2, 1.6, 1.2])
+    target = c1.radio("対象", ["構成要素", "関係"], horizontal=True,
+                      help="構成要素＝番号を除いた部品名（「第1電極」「第2電極」→「電極」）。関係＝「接続される」などの関係語。")
+    color_by = c2.radio("色（温度）の意味", ["件数", "特化係数（全体と比べた偏り）"], horizontal=True,
+                        help="特化係数＝選んだ特許でその語が出てくる割合 ÷ データ全体での割合。"
+                             "1が平均（赤紫）、2倍で橙、3倍近くで白。平均より少ない語は紫〜紺。")
+    top_n = c3.slider("表示する語の数", 20, 150, 80, step=10)
+    c4, c5, c6 = st.columns([1.4, 1.4, 1.2])
+    companies = [c for c, _ in Counter(p["company"] for p in pats).most_common() if c != "不明"]
+    ALL = "（すべての出願人）"
+    comp = c4.selectbox("出願人で絞り込む", [ALL] + companies)
+    level = 0
+    fis = [f for f, _ in Counter(f for p in pats for f in PC.fi_codes(p, level)).most_common()]
+    ALLFI = "（すべてのFI）"
+    fi = c5.selectbox("FI（サブクラス）で絞り込む", [ALLFI] + fis) if fis else ALLFI
+    years = sorted({int(p["year"]) for p in pats if str(p.get("year", "")).isdigit()})
+    yr = c6.select_slider("出願年", options=years, value=(years[0], years[-1])) if len(years) > 1 else None
+    drop_title = st.checkbox("発明の名称そのもの（「半導体装置」など）は除く", value=True)
+    ids = [p["id"] for p in pats
+           if (comp == ALL or p["company"] == comp) and (fi == ALLFI or fi in PC.fi_codes(p, level))
+           and (yr is None or (str(p.get("year", "")).isdigit() and yr[0] <= int(p["year"]) <= yr[1]))]
+    if not ids:
+        st.info("条件に合う特許がありません。")
+        return
+    filtered = len(ids) < len(pats)
+    if color_by.startswith("特化") and not filtered:
+        st.caption("※ 絞り込みをしていないと、特化係数はすべて1（全体と同じ）になります。出願人・FI・年で絞り込んでください。")
+    rows = PC.wordcloud_terms(DATA, target=target, patent_ids=ids, reviews=st.session_state.reviews,
+                              drop_title=drop_title, min_count=2 if len(ids) >= 20 else 1, top_n=top_n)
+    if not rows:
+        st.info("表示できる語がありません。")
+        return
+    key = "件数" if color_by == "件数" else "特化係数"
+    heat = PC.wordcloud_heat(rows, key)
+    placed = PC.wordcloud_layout(rows, heat)
+    label = " ／ ".join(x for x in (comp if comp != ALL else "", fi if fi != ALLFI else "",
+                                    f"{yr[0]}〜{yr[1]}年" if yr and (yr[0], yr[1]) != (years[0], years[-1]) else "") if x)
+    title = f"{label or 'すべての特許'}（{len(ids)}件）"
+    legend = ("少ない（冷）", "多い（熱）") if key == "件数" else ("全体より少ない（冷）", "全体より多い（熱）")
+    svg = PC.wordcloud_svg(placed, legend=legend, title=title)
+    components.html(f'<meta charset="utf-8"><div style="max-width:1000px;margin:0 auto">{svg}</div>', height=640)
+    df = pd.DataFrame([{"語": r[0], "件数（選んだ特許）": r[1], "件数（全体）": r[2], "特化係数": round(r[3], 2)}
+                       for r in rows])
+    with st.expander("語の一覧（件数・特化係数）"):
+        st.dataframe(df, hide_index=True, use_container_width=True)
+        st.download_button("CSVで保存", df.to_csv(index=False).encode("utf-8-sig"), "wordcloud_terms.csv", "text/csv")
+    st.download_button("画像（SVG）で保存", svg.encode("utf-8"), "wordcloud.svg", "image/svg+xml")
+
 
 def page_radar():
     need_data()
@@ -1289,9 +1377,9 @@ def page_compare():
     st.caption("※ このスコアは絶対的な尺度ではなく、AとBを相対的に比べるための指標です。")
     ga, gb = st.columns(2)
     with ga:
-        sao_graph(res["relations_a"])
+        sao_graph(res["relations_a"], key="dep_a")
     with gb:
-        sao_graph(res["relations_b"])
+        sao_graph(res["relations_b"], key="dep_b")
     st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
     c1, c2, c3 = st.columns(3)
     for col, key, name in ((c1, "common", "共通トリプル"), (c2, "only_a", "Aだけにあるトリプル"), (c3, "only_b", "Bだけにあるトリプル")):
@@ -1418,7 +1506,8 @@ nav = st.navigation({
                    st.Page(page_network, title="SAOネットワーク", icon="🕸️", url_path="network"),
                    st.Page(page_similarity, title="類似性マップ", icon="🗺️", url_path="similarity"),
                    st.Page(page_radar, title="FIレーダー", icon="🧭", url_path="radar"),
-                   st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution")],
+                   st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution"),
+                   st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
     "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
                 st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
     "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export")],
