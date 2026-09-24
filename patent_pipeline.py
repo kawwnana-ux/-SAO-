@@ -11846,6 +11846,28 @@ TREE_LINE = "#1e3a8a"
 WRAP = 5  # 階層図で1段に並べる子の数（これを超えると次の段へ折り返す）
 
 
+COMPONENT_PALETTE = [
+    ("#dbeafe", "#2563eb", "#1e3a8a"), ("#dcfce7", "#16a34a", "#14532d"), ("#fee2e2", "#dc2626", "#7f1d1d"),
+    ("#fef3c7", "#d97706", "#78350f"), ("#ede9fe", "#7c3aed", "#4c1d95"), ("#cffafe", "#0891b2", "#164e63"),
+    ("#fce7f3", "#db2777", "#831843"), ("#ecfccb", "#65a30d", "#365314"), ("#ffedd5", "#ea580c", "#7c2d12"),
+    ("#e0e7ff", "#4f46e5", "#312e81"), ("#ccfbf1", "#0d9488", "#134e4a"), ("#f5f5f4", "#57534e", "#292524"),
+    ("#fae8ff", "#c026d3", "#701a75"), ("#e0f2fe", "#0284c7", "#0c4a6e"), ("#fef9c3", "#a16207", "#713f12"),
+    ("#ffe4e6", "#e11d48", "#881337"), ("#d1fae5", "#059669", "#064e3b"), ("#f3e8ff", "#9333ea", "#581c87"),
+    ("#e7e5e4", "#78716c", "#1c1917"), ("#fff7ed", "#c2410c", "#7c2d12"),
+]
+
+
+def component_colors(relations):
+    """同じ構成要素には同じ色（塗り・枠・文字）を割り当てる。出てくる順に20色を使い回す。"""
+    out = {}
+    for r in relations:
+        for x in (r["source"], r["target"]):
+            if x not in out:
+                f, b, t = COMPONENT_PALETTE[len(out) % len(COMPONENT_PALETTE)]
+                out[x] = {"fill": f, "border": b, "font": t}
+    return out
+
+
 def _tree_levels(rels):
     """各ノードの階層（0＝一番上の上位概念）。どこからも矢印を受けないノードを上に置き、
     そこから矢印の向きにたどった段数を階層とする（輪になっている部分は、残りのうち矢印の多いノードから）。"""
@@ -11878,7 +11900,7 @@ def _tree_levels(rels):
 
 
 def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, show_labels=True, show_roles=True,
-                          show_cross=False):
+                          show_cross=False, colors=None):
     """階層図：一番上に主語（上位概念）、その下に「関係」を挟んで目的語（下位概念）を並べる木の形の図。
     同じ主語・同じ関係の目的語はまとめて枝分かれさせる。階層を上に戻る関係や、同じ階層どうしの関係は、
     show_cross=True のときだけ点線で描く（既定では木の形を見やすくするため描かない）。"""
@@ -11900,7 +11922,9 @@ def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, sh
         f'edge [color="{TREE_LINE}", penwidth=1.6, arrowsize=0.8, fontname="{FONT}"];',
     ]
     for x in names:
-        s = TREE_STYLES[min(level[x], 2)]
+        s = dict(TREE_STYLES[min(level[x], 2)])
+        if colors and x in colors:
+            s.update(colors[x])  # 構成要素ごとの色（同じ部品は同じ色）
         hot = focus and x == focus
         role = (f'<br/><font point-size="10" color="{s["font"]}">（{s["role"]}）</font>' if show_roles else "")
         lines.append(f'  {ids[x]} [label=<<b><font point-size="15" color="{s["font"]}">{html.escape(x)}</font></b>{role}>, '
@@ -11936,7 +11960,7 @@ def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, sh
     return "\n".join(lines)
 
 
-def relations_to_tree_html(relations, groups=None, max_depth=6):
+def relations_to_tree_html(relations, groups=None, max_depth=6, colors=None, font_size=".9rem"):
     """階層図と同じ構造を、字下げした文字の木で表す（「この図の構造」）。"""
     rels, seen = [], set()
     for r in relations:
@@ -11957,7 +11981,9 @@ def relations_to_tree_html(relations, groups=None, max_depth=6):
     shown = set()
 
     def walk(x, depth):
-        s = TREE_STYLES[min(level[x], 2)]
+        s = dict(TREE_STYLES[min(level[x], 2)])
+        if colors and x in colors:
+            s.update(colors[x])
         pad = depth * 1.4
         out.append(f'<div style="margin-left:{pad}em;margin-top:3px">{"└ " if depth else ""}'
                    + chip.format(f=s["fill"], b=s["border"], c=s["font"], t=html.escape(x))
@@ -11974,7 +12000,7 @@ def relations_to_tree_html(relations, groups=None, max_depth=6):
     for x in names:
         if level[x] == 0:
             walk(x, 0)
-    return '<div style="font-size:.9rem;line-height:1.55">' + "".join(out) + "</div>"
+    return f'<div style="font-size:{font_size};line-height:1.6">' + "".join(out) + "</div>"
 
 
 def tree_cross_relations(relations, groups=None):
@@ -13843,6 +13869,26 @@ def patents_with_node(corpus, term, reviews=None):
     return out
 
 
+def highlight_colored(text, colors):
+    """本文中の構成要素を、構成要素ごとの色（colors: 名前→{"fill","border"}）でマークした HTML。
+    「前記」「複数の」などが付いた書き方にも当たるよう、表示名（display_node）で探す。"""
+    import html as _html
+
+    names = sorted({w for w in colors if w}, key=len, reverse=True)
+    if not names:
+        return _html.escape(text).replace("\n", "<br>")
+    pat = re.compile("|".join(re.escape(w) for w in names))
+    out, last = [], 0
+    for m in pat.finditer(text):
+        c = colors[m.group(0)]
+        out.append(_html.escape(text[last:m.start()]))
+        out.append(f'<mark style="background:{c["fill"]};border-bottom:2px solid {c["border"]};padding:0 2px;'
+                   f'border-radius:3px">{_html.escape(m.group(0))}</mark>')
+        last = m.end()
+    out.append(_html.escape(text[last:]))
+    return "".join(out).replace("\n", "<br>")
+
+
 def highlight(text, words):
     """本文中の words をマーカーで強調した HTML を返す。"""
     import html as _html
@@ -14006,7 +14052,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-24b"
+PIPELINE_VERSION = "2026-09-25"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -14190,7 +14236,7 @@ def _embed(X, dim, seed=0):
 
 
 def layout_world(corpus, k_neighbors=6):
-    """オズの世界（発明の名称＋FI の近さで3次元に配置）の座標と近傍エッジを求める。"""
+    """Patent World（発明の名称＋FI の近さで3次元に配置）の座標と近傍エッジを求める。"""
     from scipy.sparse import hstack
     from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -14242,7 +14288,7 @@ def layout_map(corpus, reviews=None):
 
 
 def finalize_dataset(corpus):
-    """グループ分け・オズの世界・類似性マップの座標をまとめて作る。"""
+    """グループ分け・Patent World・類似性マップの座標をまとめて作る。"""
     assign_groups(corpus)
     layout_world(corpus)
     layout_map(corpus)
@@ -14360,7 +14406,7 @@ _OZ_JS = r"""
 
 
 def oz_world_html(corpus, template):
-    """オズの世界（Three.js）の HTML に、このデータセットの点・エッジ・凡例を差し込む。
+    """Patent World（Three.js）の HTML に、このデータセットの点・エッジ・凡例を差し込む。
     ・近傍の線は常時は出さず、点をクリックして「近い特許を表示」を押したときだけ、その特許と
       近い特許（最大6件）を線で結ぶ。
     ・3本の軸に「技術特徴軸1〜3（次元圧縮の方法）」と名前を付ける。各軸に固有の技術的な意味はない。"""
@@ -14382,8 +14428,8 @@ def oz_world_html(corpus, template):
     html_out = re.sub(r'(<div id="legend" class="panel">\s*<h2>[^<]*</h2>).*?(</div>\s*<div id="info-panel")',
                       lambda m: m.group(1) + "\n" + rows + "\n" + m.group(2), html_out, count=1, flags=re.S)
     n_e = len(corpus.get("world_edges", []))
-    method = corpus.get("world_method", "")
-    short = "UMAP" if "UMAP" in method else ("t-SNE" if "t-SNE" in method else "SVD")
+    method = corpus.get("world_method", "") or "次元圧縮"
+    short = "UMAP" if "UMAP" in method else ("t-SNE" if "t-SNE" in method else ("SVD" if "SVD" in method else "次元圧縮"))
     axis_names = ["技術特徴軸%d（%s）" % (k, short) for k in (1, 2, 3)]
     html_out = re.sub(r"(<div id=\"title-bar\" class=\"panel\">\s*<h1>[^<]*</h1>\s*<span>)[^<]*(</span>)",
                       lambda m: m.group(1) + "発明の名称＋FI・%s・%d件　点をクリックすると詳細" % (method, len(ps))
@@ -14393,7 +14439,7 @@ def oz_world_html(corpus, template):
     html_out = re.sub(r"<dt>次元圧縮</dt><dd>[^<]*</dd>", "<dt>次元圧縮</dt><dd>%s</dd>" % method, html_out)
     html_out = re.sub(r'(<div id="info-panel" class="panel">.*?)<p>.*?</p>',
                       lambda m: m.group(1) + "<p>X・Y・Zは技術特徴軸1〜3（%s）。各軸そのものに固有の技術的意味はなく、"
-                      "特許間の近さを3次元に配置したもの。近い点ほど「発明の名称＋FI」の特徴が似ている。"
+                      "特許間の近さを3次元に配置したもの。発明の名称＋FIから得られる特徴が近い特許ほど近くに配置されます。"
                       "線は、次元圧縮の前の特徴空間で近い特許どうしを結ぶ。</p>" % short, html_out, count=1, flags=re.S)
     for old, new in (("Zoom In", "拡大"), ("Zoom Out", "縮小"), ("Reset View", "視点を戻す"), ("Rotate", "回転"),
                      ("Expand All", "全ての近傍線"), ("Collapse All", "線を消す"), (">Info<", ">データ概要<"),
@@ -14401,11 +14447,14 @@ def oz_world_html(corpus, template):
         html_out = html_out.replace(old, new, 1)
     html_out = html_out.replace("<li>点にマウスを合わせる：詳細表示</li>",
                                 "<li>点にマウスを合わせる：名称を表示</li><li>点をクリック：詳細と「近い特許を表示」</li>", 1)
+    # 表示名は「Patent World」（元の部品の題名「オズの世界」を置き換える）
+    html_out = html_out.replace("<title>オズの世界</title>", "<title>Patent World</title>", 1)
+    html_out = html_out.replace("<h1>オズの世界</h1>", "<h1>Patent World</h1>", 1)
     html_out = html_out.replace("</style>", _OZ_CSS + "</style>", 1)
     html_out = html_out.replace('<div id="tooltip"></div>',
                                 '<div id="tooltip"></div>\n<div id="sel-panel" class="panel"></div>\n'
                                 '<div id="axis-note" class="panel">X・Y・Z＝技術特徴軸1〜3（%s）。軸そのものに意味はなく、'
-                                '近い点ほど「発明の名称＋FI」が似ている</div>' % short, 1)
+                                '発明の名称＋FIから得られる特徴が近い特許ほど近くに配置されます</div>' % short, 1)
     anchor = '  renderer.domElement.addEventListener("mousemove", onPointerMove);'
     html_out = html_out.replace(anchor, anchor + "\n" + _OZ_JS.replace("__AXIS_NAMES__", json.dumps(axis_names,
                                                                                                    ensure_ascii=False)), 1)
@@ -14413,7 +14462,7 @@ def oz_world_html(corpus, template):
 
 
 def sample_world_edges(corpus, template):
-    """サンプル（532件）用：研究で作ったオズの世界の近傍エッジを、このデータの並び順に付け替える。"""
+    """サンプル（532件）用：研究で作った Patent World の近傍エッジを、このデータの並び順に付け替える。"""
     i = template.index("window.__GRAPH_DATA__ = ") + len("window.__GRAPH_DATA__ = ")
     d, _ = json.JSONDecoder().raw_decode(template[i:])
     pos = {p["id"]: k for k, p in enumerate(corpus["patents"])}
@@ -15230,7 +15279,7 @@ _THIS = sys.modules[__name__]
 en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
 translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
 node_match_eval = _types.SimpleNamespace(LOOSE_LEVELS=LOOSE_LEVELS, _KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, _loose_node=_loose_node, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, loose_match_count=loose_match_count, node_score=node_score, numbers=numbers, rel_match=rel_match)
-nested_graph = _types.SimpleNamespace(DEEPSEA_BG=DEEPSEA_BG, DEEPSEA_DIM=DEEPSEA_DIM, DEEPSEA_NODE=DEEPSEA_NODE, DEEPSEA_ROOT=DEEPSEA_ROOT, FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, TREE_LINE=TREE_LINE, TREE_STYLES=TREE_STYLES, WRAP=WRAP, _esc=_esc, _tree_levels=_tree_levels, relation_color=relation_color, relation_group=relation_group, relations_to_flat_dot=relations_to_flat_dot, relations_to_nested_dot=relations_to_nested_dot, relations_to_tree_dot=relations_to_tree_dot, relations_to_tree_html=relations_to_tree_html, tree_cross_relations=tree_cross_relations)
+nested_graph = _types.SimpleNamespace(COMPONENT_PALETTE=COMPONENT_PALETTE, DEEPSEA_BG=DEEPSEA_BG, DEEPSEA_DIM=DEEPSEA_DIM, DEEPSEA_NODE=DEEPSEA_NODE, DEEPSEA_ROOT=DEEPSEA_ROOT, FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, TREE_LINE=TREE_LINE, TREE_STYLES=TREE_STYLES, WRAP=WRAP, _esc=_esc, _tree_levels=_tree_levels, component_colors=component_colors, relation_color=relation_color, relation_group=relation_group, relations_to_flat_dot=relations_to_flat_dot, relations_to_nested_dot=relations_to_nested_dot, relations_to_tree_dot=relations_to_tree_dot, relations_to_tree_html=relations_to_tree_html, tree_cross_relations=tree_cross_relations)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
 seg_pairs = _types.SimpleNamespace(HAS_VERBS=HAS_VERBS_sp, _tree_dist=_tree_dist, pairs_from_segment=pairs_from_segment, segment_pairs=segment_pairs)
@@ -15241,7 +15290,7 @@ sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE,
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
 node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=LEAD, MAX_NODES=MAX_NODES, NOUNISH=NOUNISH, OWNER_LABELS=OWNER_LABELS, QTY_RE=QTY_RE, _chains=_chains, _coord_partner=_coord_partner, _units=_units, keep_pair=keep_pair, node_pair_candidates=node_pair_candidates, pairs_in_segment=pairs_in_segment, segment_nodes=segment_nodes)
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
 
 

@@ -13,13 +13,11 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 
 ページ構成（サイドバーのナビゲーション）
   データ
-    📥 データの読み込み       … 特許リストを読み込んで一括解析／解析済みデータを開く／サンプル（532件）
-    🏠 ダッシュボード          … 抽出・確認の進み具合、判定の根拠、抽出の自動チェック
+    📥 データの読み込み       … 特許リストを読み込んで一括解析／解析済みデータ（JSON）を開く
   抽出と確認
-    🧪 AI解析                 … 1件の請求項を解析し、処理の各段階と採用／要確認／除外を表示
-    ✍️ 人手確認               … AIの判定を人が確認・修正して確定する
+    🧪 解析と確認             … 読み込んだ特許のAIの判定を確認・修正して確定する／請求項を1件貼り付けて解析する
   可視化・分析
-    🌍 Patent World           … オズの世界（発明の名称＋FI の近さで3次元に配置）
+    🌍 Patent World           … 発明の名称＋FI から得られる特徴の近さで3次元に配置
     🕸️ SAOネットワーク         … 構成要素のつながり。ノードをクリックすると該当請求項へ
     🗺️ 類似性マップ            … SAOの近さで配置。点をクリックすると似た特許と共通部分
     🧭 FIレーダー              … 出願人（または出願年）ごとのFIの分布
@@ -33,8 +31,7 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 プログラムは app.py（画面）と patent_pipeline.py（解析の処理すべて）の2つ。
 同じフォルダに、次のデータファイルを置く。
   sao_selector14_train.npz … 実験14の選別モデルの学習データ（必須）
-  oz_world_embed.html      … Patent World（オズの世界）の表示部品
-  corpus_sao_532.json      … サンプルデータ（半導体関連特許532件の解析結果）
+  oz_world_embed.html      … Patent World の表示部品
 
 【実行方法（自分のPC・Ollama）】
     pip install -r requirements.txt
@@ -72,7 +69,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-24b"
+NEED_PIPELINE = "2026-09-25"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -83,7 +80,6 @@ APP_DIR = Path(__file__).resolve().parent
 OZ_WORLD_HTML_PATH = APP_DIR / "oz_world_embed.html"
 CLOUD_MODEL = "qwen/qwen-2.5-7b-instruct"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-SAMPLE_NAME = "サンプル：半導体関連特許 532件"
 
 SRC_GROUPS = [
     ("LLM抽出（qwen2.5）", ("LLMraw", "E1:llm_direct")),
@@ -193,27 +189,6 @@ def tidy_candidates(cands):
     return out
 
 
-@st.cache_data(show_spinner="サンプルデータを読み込み中…")
-def load_sample():
-    f = PC.find_corpus_file()
-    if f is None:
-        return None
-    try:
-        data = PC.load_corpus(f)
-        assert isinstance(data.get("patents"), list)
-    except Exception as exc:  # noqa: BLE001
-        # ファイルが空・途中までしかない・HTML（GitHubのページを保存したもの）などの場合でも、
-        # アプリ全体は止めず、サンプルなしで起動する
-        head = f.read_bytes()[:80]
-        return {"_error": f"{f.name} を読み込めませんでした（{type(exc).__name__}、大きさ {f.stat().st_size:,} バイト、"
-                          f"先頭 {head[:40]!r}）。"}
-    data["meta"].update({"name": SAMPLE_NAME, "sample": True})
-    for p in data["patents"]:
-        p["relations"] = tidy_candidates(p["relations"])
-    PC.assign_groups(data)
-    return data
-
-
 def set_dataset(data):
     """表示するデータセットを切り替える（人手確認などの作業状態はリセット）。"""
     data.setdefault("meta", {})["uid"] = data["meta"].get("uid") or uuid.uuid4().hex
@@ -224,14 +199,6 @@ def set_dataset(data):
                  ("search_results", None), ("_xlsx", None)):
         st.session_state[k] = v
 
-
-SAMPLE_ERROR = None
-if st.session_state.dataset is None:
-    _sample = load_sample()
-    if _sample is not None and "_error" in _sample:
-        SAMPLE_ERROR = _sample["_error"]
-    elif _sample is not None:
-        set_dataset(json.loads(json.dumps(_sample)))
 
 DATA = st.session_state.dataset
 PATENTS = {p["id"]: p for p in DATA["patents"]} if DATA else {}
@@ -253,9 +220,6 @@ def patent_label(pid):
 
 
 def need_data():
-    if SAMPLE_ERROR and not DATA:
-        st.error("サンプルデータ：" + SAMPLE_ERROR + "GitHub の corpus_sao_532.json を、配布したファイルで"
-                 "上げ直してください（中身が「{\"meta\": …」で始まるJSONのはずです）。")
     if not DATA or not DATA.get("patents"):
         st.warning("分析するデータがありません。「データの読み込み」ページで特許リストを読み込んでください。")
         st.stop()
@@ -337,75 +301,52 @@ def llm_error_message():
 GRAPH_GROUPS = list(pp.RELATION_GROUP_NAMES) + ["その他"]
 
 
-def sao_graph(relations, key="main", title="構成要素間関係"):
+def sao_graph(relations, key="main", colors=None):
+    """SAOの階層図（上位概念→関係→下位概念の木）。同じ構成要素は同じ色で描く。使った色を返す
+    （請求項の本文のマークにも同じ色を使うため）。"""
     if not relations:
         st.info("表示できるSAO関係がありません。")
-        return
-    direction = "TB" if st.session_state.get("graph_dir", "").startswith("縦") else "LR"
+        return {}
     rels = PC.tidy_relations(relations)
-    c0, c1, c2, c3 = st.columns([1.5, 1.8, 2.6, 1.1])
-    style = c0.selectbox("図の形式", ["階層図", "関係図", "構成の入れ子"], key=f"g_style_{key}",
-                         help="階層図＝上位概念（主語）から「関係」を挟んで下位概念（目的語）へ枝分かれする木の形。"
-                              "関係図＝すべての関係を「→ 関係」の矢印で描く（濃紺の背景）。"
-                              "構成の入れ子＝備える・有する等を箱の入れ子で描き、それ以外の関係を矢印で描く。")
-    flat = style == "関係図"
-    tree = style == "階層図"
+    colors = colors or pp.component_colors(rels)
     deg = Counter()
     for r in rels:
-        if r["source"] != r["target"] and (flat or r["relation"] not in pp.HAS_RELATIONS):
+        if r["source"] != r["target"]:
             deg[r["source"]] += 1
             deg[r["target"]] += 1
+    c1, c2, c3, c4 = st.columns([1.8, 2.6, 0.9, 1.6])
     ALL = "（すべて）"
     focus = c1.selectbox("注目する部品", [ALL] + [n for n, _ in deg.most_common()], key=f"g_focus_{key}",
-                         format_func=lambda n: n if n == ALL else f"{n}（矢印 {deg[n]}本）",
-                         help="選んだ部品に関わる矢印だけを目立たせ、他の矢印は暗く（薄く）します。")
+                         format_func=lambda n: n if n == ALL else f"{n}（関係 {deg[n]}件）",
+                         help="選んだ部品の枠を太くし、それ以外の枝を薄くします。")
     groups = c2.multiselect("表示する関係の種類", GRAPH_GROUPS, default=GRAPH_GROUPS, key=f"g_groups_{key}")
     labels = c3.checkbox("関係名", value=True, key=f"g_labels_{key}")
+    view = c4.radio("表示", ["図と構造", "構造だけを大きく"], key=f"g_view_{key}", horizontal=True)
     focus = None if focus == ALL else focus
-    if tree:
-        cross = pp.tree_cross_relations(rels, groups=set(groups))
-        show_cross = st.checkbox(f"階層を横切る関係（同じ階層どうし・上に戻る関係 {len(cross)} 件）も点線で表示",
-                                 value=False, key=f"g_cross_{key}") if cross else False
-        g1, g2 = st.columns([3, 1.15])
-        with g1:
-            st.graphviz_chart(pp.relations_to_tree_dot(rels, focus=focus, groups=set(groups), show_labels=labels,
-                                                       show_cross=show_cross), use_container_width=True)
-        with g2:
-            st.markdown(
-                "<div style='border:1px solid #cbd5e1;border-radius:10px;padding:10px 12px;font-size:.85rem'>"
-                "<b>凡例</b><br>"
-                "<span style='background:#fde2ea;border:1.5px solid #e0527a;border-radius:4px;padding:0 10px'>　</span>"
-                " 主語（上位概念）<br>"
-                "<span style='background:#d9f5e8;border:1.5px solid #22a06b;border-radius:4px;padding:0 10px'>　</span>"
-                " 目的語（下位概念）<br>"
-                "<span style='background:#efe4fb;border:1.5px solid #9b6bd6;border-radius:4px;padding:0 10px'>　</span>"
-                " さらに下位の概念<br>"
-                "<b style='color:#1d4ed8'>有する</b> 関係（動詞）　<b style='color:#1e3a8a'>→</b> 関係の向き（上位→下位）"
-                "</div>", unsafe_allow_html=True)
-            st.markdown("**この図の構造**")
-            st.markdown(pp.relations_to_tree_html(rels, groups=set(groups)), unsafe_allow_html=True)
-        if cross and not show_cross:
-            with st.expander(f"図に描いていない関係（階層を横切る関係 {len(cross)} 件）"):
-                st.dataframe(pd.DataFrame([{"主語": r["source"], "関係": r["relation"], "目的語": r["target"]}
-                                           for r in cross]), hide_index=True, use_container_width=True)
-        return
-    if flat:
-        dot = pp.relations_to_flat_dot(rels, title=title, direction=direction, focus=focus, groups=set(groups),
-                                       show_labels=labels)
-    else:
-        dot = relations_to_nested_dot(rels, direction=direction, focus=focus, groups=set(groups), show_labels=labels)
-    st.graphviz_chart(dot, use_container_width=True)
-    if flat:
-        st.caption("矢印＝「主語 → 関係 → 目的語」。枠の色が違う箱は、図の起点（どこからも矢印を受けない部品のうち、"
-                   "矢印の多いもの）。矢印にマウスを重ねると関係が出ます（右上のボタンで全画面表示）。")
-    else:
-        st.markdown(
-            "<div style='font-size:.8rem;opacity:.85'>箱の入れ子＝構成（備える・有する・含む）／点線の楕円＝どの構成要素にも"
-            "属さない対象（方向・設置対象など）／両矢印＝2つの部品の間に両方向の関係がある／矢印の色："
-            "<span style='color:#2563eb'>■接続</span>　<span style='color:#16a34a'>■配置・位置</span>　"
-            "<span style='color:#9333ea'>■覆う・収める</span>　<span style='color:#ea580c'>■動作・機能</span>　"
-            "<span style='color:#475569'>■その他</span>（矢印にマウスを重ねると関係名がすべて出ます）</div>",
-            unsafe_allow_html=True)
+    legend = ("<div style='font-size:.8rem;opacity:.8;margin:2px 0 6px'>色＝構成要素（同じ部品は同じ色。請求項の本文の"
+              "マークとも同じ色）／上から下へ：上位概念（主語）→ 関係 → 下位概念（目的語）</div>")
+    if view == "構造だけを大きく":
+        st.markdown(legend, unsafe_allow_html=True)
+        st.markdown("<div style='border:1px solid rgba(148,163,184,.5);border-radius:10px;padding:14px 18px'>"
+                    + pp.relations_to_tree_html(rels, groups=set(groups), colors=colors, font_size="1.25rem")
+                    + "</div>", unsafe_allow_html=True)
+        return colors
+    cross = pp.tree_cross_relations(rels, groups=set(groups))
+    show_cross = st.checkbox(f"階層を横切る関係（同じ階層どうし・上に戻る関係 {len(cross)} 件）も点線で表示",
+                             value=False, key=f"g_cross_{key}") if cross else False
+    st.markdown(legend, unsafe_allow_html=True)
+    g1, g2 = st.columns([3, 1.2])
+    with g1:
+        st.graphviz_chart(pp.relations_to_tree_dot(rels, focus=focus, groups=set(groups), show_labels=labels,
+                                                   show_cross=show_cross, colors=colors), use_container_width=True)
+    with g2:
+        st.markdown("**この図の構造**")
+        st.markdown(pp.relations_to_tree_html(rels, groups=set(groups), colors=colors), unsafe_allow_html=True)
+    if cross and not show_cross:
+        with st.expander(f"図に描いていない関係（階層を横切る関係 {len(cross)} 件）"):
+            st.dataframe(pd.DataFrame([{"主語": r["source"], "関係": r["relation"], "目的語": r["target"]}
+                                       for r in cross]), hide_index=True, use_container_width=True)
+    return colors
 
 
 def status_badges(counts):
@@ -421,7 +362,10 @@ def status_badges(counts):
 def editor_config():
     return {
         "採用する": st.column_config.CheckboxColumn("採用する", help="チェックした関係だけが確定されます"),
-        "確率": st.column_config.ProgressColumn("確率", min_value=0.0, max_value=1.0, format="%.2f"),
+        "確率": st.column_config.ProgressColumn(
+            "確率", min_value=0.0, max_value=1.0, format="%.2f",
+            help="AI（選別モデル）が見積もった「この関係が正しい見込み」（0〜1）。1に近いほど確か。"
+                 "正解データ532件で確かめると、0.57以上で選ばれた「採用」は約8割が正しかった。"),
         "判定": st.column_config.TextColumn("AIの判定", disabled=True),
         "抽出元": st.column_config.TextColumn("抽出元", disabled=True),
     }
@@ -460,8 +404,6 @@ with st.sidebar:
         st.info("💻 ローカルモード：このPCのOllamaに接続します", icon="💻")
         model_name = st.text_input("Ollamaモデル名", value=ts.DEFAULT_MODEL)
         ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
-    st.markdown("### 🧩 SAO構造図")
-    graph_dir = st.radio("図の向き", ["横（左→右）", "縦（上→下）"], horizontal=True, key="graph_dir")
     st.caption(f"抽出方法：{PC.METHOD_NAME}。{PC.METHOD_SCORE}。")
 
 
@@ -473,7 +415,7 @@ def page_data():
     st.title("📥 データの読み込み")
     if DATA:
         st.info(f"現在のデータ：**{DATA['meta'].get('name')}**（{len(DATA['patents']):,} 件）", icon="📂")
-    tab1, tab2, tab3 = st.tabs(["📄 特許リストを読み込んで解析", "💾 解析済みデータを開く", "🧪 サンプルデータ"])
+    tab1, tab2 = st.tabs(["📄 特許リストを読み込んで解析", "💾 解析済みデータを開く"])
 
     with tab1:
         st.markdown(
@@ -545,16 +487,6 @@ def page_data():
             except Exception as e:  # noqa: BLE001
                 st.error(f"読み込めませんでした（このアプリで保存したJSONか確認してください）: {e}")
 
-    with tab3:
-        st.markdown("卒業研究で使った半導体関連特許532件（三菱電機・富士電機・ローム・東芝など）の解析結果です。"
-                    "各特許の判定は、その特許を学習に使っていない交差検証のモデルで求めています。")
-        if st.button("サンプルデータを開く"):
-            s = load_sample()
-            if s is None or "_error" in s:
-                st.error("サンプルデータを開けません。" + (s["_error"] if s else "corpus_sao_532.json が見つかりません。"))
-            else:
-                set_dataset(json.loads(json.dumps(s)))
-                st.rerun()
 
 
 def run_ingest(ing):
@@ -601,124 +533,21 @@ def finish_ingest(ing, partial=False):
         st.error("解析できた特許がありません。")
         return
     data = PC.new_dataset(ing["name"], [json.loads(json.dumps(p)) for p in ps])
-    with st.spinner("オズの世界・類似性マップの配置を計算中…"):
+    with st.spinner("Patent World・類似性マップの配置を計算中…"):
         PC.finalize_dataset(data)
     set_dataset(data)
     if not partial:
         st.session_state.ingest = None
-    st.success(f"「{ing['name']}」（{len(ps)}件）の解析が終わりました。ダッシュボードや各分析ページで見られます。"
+    st.success(f"「{ing['name']}」（{len(ps)}件）の解析が終わりました。「解析と確認」や各分析ページで見られます。"
                "エクスポートページから解析済みデータ（JSON）を保存しておくと、次回はすぐ開けます。")
     st.balloons()
 
 
 # ===========================================================================
-# 🏠 ダッシュボード
+# 🧪 解析と確認（請求項を1件解析する／読み込んだ特許を確認する）
 # ===========================================================================
 
-def page_dashboard():
-    need_data()
-    import plotly.express as px
-    import plotly.graph_objects as go
-
-    reviews = st.session_state.reviews
-    st.title("🏠 ダッシュボード")
-    st.caption(f"「{DATA['meta'].get('name')}」の請求項を {PC.METHOD_NAME} で解析した結果と、人による確認の進み具合。")
-    c = PC.status_counts(DATA, reviews)
-    m = st.columns(4)
-    m[0].metric("特許件数", f"{c['特許件数']:,}")
-    m[1].metric("AIが抽出したSAO", f"{c['抽出SAO']:,}", help="選別モデルが選んだ関係（採用＋要確認の一部）")
-    m[2].metric("人手確認済みの特許", f"{c['人手確認済みの特許']:,} / {c['特許件数']:,}")
-    m[3].metric("確定SAO（人手確認済み）", f"{c['確定SAO（人手確認済み）']:,}")
-    st.progress(c["人手確認済みの特許"] / max(c["特許件数"], 1), text="人手確認の進み具合")
-
-    st.markdown("#### AIの判定（全候補）")
-    status_badges(c)
-    b = DATA.get("bands", PC.DEFAULT_BANDS)
-    st.caption(f"採用＝選別モデルが選び、確率 {b['accept']:.2f} 以上／要確認＝選ばれたが確率がそれ未満、"
-               f"または選ばれなかったが確率 {b['review_low']:.2f} 以上／除外＝それ以外。")
-
-    left, right = st.columns([3, 2])
-    with left:
-        rows = []
-        for p in DATA["patents"]:
-            cnt = Counter(r["status"] for r in p["relations"])
-            for s in PC.STATUS_ORDER[:2]:
-                rows.append({"出願人": p["group"], "判定": s, "件数": cnt.get(s, 0)})
-        df = pd.DataFrame(rows).groupby(["出願人", "判定"], as_index=False)["件数"].sum()
-        fig = px.bar(df, x="出願人", y="件数", color="判定", color_discrete_map=STATUS_COLORS, barmode="stack",
-                     title="出願人別：採用・要確認の件数")
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
-        plot(fig)
-    with right:
-        fig = go.Figure(go.Funnel(y=["全候補", "要確認以上", "採用"],
-                                  x=[c["採用"] + c["要確認"] + c["除外"], c["採用"] + c["要確認"], c["採用"]],
-                                  marker={"color": ["#94a3b8", "#d97706", "#16a34a"]}))
-        fig.update_layout(title="候補の絞り込み", height=360, margin=dict(l=10, r=10, t=50, b=10))
-        plot(fig)
-
-    with st.expander("📐 判定の根拠（532件の正解データ・5分割交差検証で推定）", expanded=False):
-        s = PC.DEFAULT_BANDS["stats"]
-        st.dataframe(pd.DataFrame([{"判定": k, "そのうち正しい割合（推定）": f"{100 * s[k]['精度']:.1f}%"}
-                                   for k in ("採用", "要確認", "除外")]), hide_index=True, use_container_width=True)
-        st.write("正しいSAOが、どの判定に入っているか：" + "／".join(
-            f"{k} {100 * v:.1f}%" for k, v in sorted(s["正解の所在"].items(), key=lambda kv: -kv[1])))
-        st.caption(f"抽出方法：{PC.METHOD_NAME}（{PC.METHOD_SCORE}）。「採用」は精度80%以上になる確率の下限で"
-                   "区切っている。要確認だけを人が見れば、効率よく誤りを直せる。分野の違う特許では精度が変わりうる。")
-
-    st.markdown("#### よく現れる構成要素（基本語）")
-    cnt = Counter()
-    for p in DATA["patents"]:
-        cnt.update({PC.base_term(x) for r in PC.effective_relations(p, reviews) for x in (r["source"], r["target"])})
-    top = pd.DataFrame(cnt.most_common(20), columns=["構成要素", "特許件数"])
-    fig = px.bar(top[::-1], x="特許件数", y="構成要素", orientation="h", height=520)
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-    plot(fig)
-
-    with st.expander("✅ 抽出の自動チェック（関係が0件・自己ループ・意味のない語・孤立した部品 などの不具合パターン）"):
-        texts = {p["id"]: (p["text"], PC.effective_relations(p, reviews)) for p in DATA["patents"]}
-
-        def _from_data(pid):
-            rels = texts[pid][1]
-            return [{"text": x} for x in {y for r in rels for y in (r["source"], r["target"])}], rels
-
-        results, summary = pp.evaluate_corpus_health([(pid, pid) for pid in texts], analyze_fn=_from_data)
-        m2 = st.columns(3)
-        m2[0].metric("合格率", f"{summary['pass_rate'] * 100:.1f}%")
-        m2[1].metric("平均構成要素数", f"{summary['avg_components']:.1f}")
-        m2[2].metric("平均関係数", f"{summary['avg_relations']:.1f}")
-        names = {"check_has_components": "構成要素が取れている", "check_has_relations": "関係が1件以上ある",
-                 "check_no_self_loop": "自己ループがない", "check_no_bare_generic_node": "「面」「部」だけの曖昧なノードがない",
-                 "check_ending_noun_present": "題名（末尾の名詞）がノードにある",
-                 "check_orphan_ratio_ok": "どこにもつながらない構成要素が少ない",
-                 "check_no_fan_in_anomaly": "1つの部品に持ち主が集中していない"}
-        rdf = pd.DataFrame(results).rename(columns=names)
-        checks = [c for c in rdf.columns if c.startswith("check_") or c in names.values()]
-        if checks:
-            st.dataframe((rdf[checks].mean().sort_values() * 100).round(1).rename("合格率(%)").reset_index()
-                         .rename(columns={"index": "チェック項目"}), use_container_width=True, hide_index=True)
-        bad = rdf[~rdf["passed"]]
-        if len(bad):
-            st.markdown(f"不合格の特許（{len(bad)}件）：人手確認で優先して見るとよい")
-            st.dataframe(bad[["id"] + checks].rename(columns={"id": "特許番号"}), use_container_width=True,
-                         hide_index=True)
-
-    queue = sorted(DATA["patents"], key=lambda p: -sum(r["status"] == PC.STATUS_REVIEW for r in p["relations"]))
-    queue = [p for p in queue if p["id"] not in reviews][:10]
-    if queue:
-        st.markdown("#### 次に確認するとよい特許（要確認が多い順）")
-        st.dataframe(pd.DataFrame([{
-            "特許番号": p["id"], "発明の名称": p["title"], "出願人": p["company"],
-            "要確認": sum(r["status"] == PC.STATUS_REVIEW for r in p["relations"]),
-            "採用": sum(r["status"] == PC.STATUS_ACCEPT for r in p["relations"])} for p in queue]),
-            hide_index=True, use_container_width=True)
-
-
-# ===========================================================================
-# 🧪 AI解析（1件）
-# ===========================================================================
-
-def page_analyze():
-    st.title("🧪 AI解析")
+def analyze_body():
     st.caption(f"請求項を1件、{PC.METHOD_NAME}で解析し、処理の各段階とAIの判定（採用／要確認／除外）を表示します。"
                "結果は表で修正してから確定できます。")
     col1, col2 = st.columns([3, 1])
@@ -762,8 +591,9 @@ def page_analyze():
 
     st.markdown("#### ② AIの判定")
     status_badges(Counter(c["status"] for c in res["cands"]))
-    st.caption(f"採用：確率 {res['bands']['accept']:.2f} 以上で選ばれた関係／要確認：選ばれたがそれ未満、"
-               f"または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外（表では非表示）")
+    st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
+               f"採用：確率 {res['bands']['accept']:.2f} 以上で選ばれた関係（正解データでは約8割が正しい）／"
+               f"要確認：選ばれたがそれ未満、または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外（表では非表示）")
 
     st.markdown("#### ③ 確認・修正")
     st.caption("「採用する」のチェックを付け外しし、主語・関係・目的語は直接書き換えられます。表の一番下の行から関係を追加できます。")
@@ -777,24 +607,23 @@ def page_analyze():
                             column_config=editor_config(), key=f"an_editor_{hash(res['text']) % 10**8}")
     confirmed = [r for r in PC.table_to_review(edited) if r["keep"]]
 
-    g1, g2 = st.columns([3, 2])
-    with g1:
-        st.markdown("**確定予定のSAO構造**")
-        sao_graph(confirmed)
-    with g2:
-        st.markdown("**構成要素（GiNZA）**")
-        st.write("、".join(res["tags"]) or "―")
-        b1, b2 = st.columns(2)
-        if b1.button("✅ 確定して保存", type="primary"):
-            if res.get("pick") in PATENTS:
-                st.session_state.reviews[res["pick"]] = PC.table_to_review(edited)
-                st.success(f"{res['pick']} の人手確認結果として保存しました（ダッシュボード・分析ページに反映）。")
-            else:
-                st.session_state.workspace.append({"id": f"解析{len(st.session_state.workspace) + 1}",
-                                                   "text": res["text"], "relations": confirmed})
-                st.success("ワークスペースに保存しました（エクスポートページから書き出せます）。")
-        b2.download_button("⬇️ CSVで保存", pd.DataFrame(confirmed).to_csv(index=False).encode("utf-8-sig"),
-                           file_name="sao_confirmed.csv", mime="text/csv")
+    st.markdown(f"**構成要素（GiNZA）**：{'、'.join(res['tags']) or '―'}")
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("✅ 確定して保存", type="primary"):
+        if res.get("pick") in PATENTS:
+            st.session_state.reviews[res["pick"]] = PC.table_to_review(edited)
+            st.success(f"{res['pick']} の確認結果として保存しました（分析ページに反映されます）。")
+        else:
+            st.session_state.workspace.append({"id": f"解析{len(st.session_state.workspace) + 1}",
+                                               "text": res["text"], "relations": confirmed})
+            st.success("ワークスペースに保存しました（エクスポートページから書き出せます）。")
+    b2.download_button("⬇️ CSVで保存", pd.DataFrame(confirmed).to_csv(index=False).encode("utf-8-sig"),
+                       file_name="sao_confirmed.csv", mime="text/csv")
+    st.markdown("**確定予定のSAO構造**")
+    colors = sao_graph(confirmed, key="analyze")
+    with st.expander("請求項の本文（構成要素を図と同じ色でマーク）"):
+        st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(res['text'], colors)}</div>",
+                    unsafe_allow_html=True)
     with st.expander("除外した候補も含めた全候補（確率順）"):
         st.dataframe(pd.DataFrame([{k: c[k] for k in ("status", "prob", "source", "relation", "target", "origin")}
                                    for c in res["cands"]]).rename(columns={
@@ -802,15 +631,12 @@ def page_analyze():
             hide_index=True, use_container_width=True)
 
 
-# ===========================================================================
-# ✍️ 人手確認
-# ===========================================================================
-
-def page_review():
-    need_data()
+def review_body():
+    if not DATA or not DATA.get("patents"):
+        st.info("確認する特許がありません。「データの読み込み」ページで特許リストを読み込んで解析してください。")
+        return
     reviews = st.session_state.reviews
-    st.title("✍️ 人手確認")
-    st.caption("AIの判定を確認・修正して確定します。確定した内容は、ダッシュボード・ネットワーク・類似性マップなど"
+    st.caption("読み込んだ特許ごとに、AIの判定を確認・修正して確定します。確定した内容は、ネットワーク・類似性マップなど"
                "すべての分析に反映されます（エクスポートページで保存・読み込みできます）。")
     f1, f2, f3 = st.columns([2, 2, 1])
     comp = f1.multiselect("出願人で絞り込む", sorted({p["company"] for p in DATA["patents"]}))
@@ -840,10 +666,7 @@ def page_review():
         if p.get("url"):
             st.markdown(f"[公報を開く]({p['url']})")
         table = PC.review_table(p, reviews)
-        words = set(table["主語(S)"]).union(table["目的語(O)"]) if len(table) else set()
-        st.markdown(f"<div style='font-size:.92rem;line-height:1.8;border:1px solid rgba(148,163,184,.4);"
-                    f"border-radius:8px;padding:10px;max-height:420px;overflow:auto'>{PC.highlight(p['text'], words)}</div>",
-                    unsafe_allow_html=True)
+        text_box = st.empty()  # 本文は、下の表で確定する構成要素と同じ色でマークする（表の後で描く）
     with right:
         edited = st.data_editor(table, num_rows="dynamic", use_container_width=True, hide_index=True,
                                 column_config=editor_config(), key=f"rv_{DATA['meta']['uid']}_{pid}")
@@ -858,11 +681,28 @@ def page_review():
             st.rerun()
         b3.caption("確定すると次の特許へ進みます")
     st.markdown("**確定後のSAO構造（プレビュー）**")
-    sao_graph([r for r in PC.table_to_review(edited) if r["keep"]])
+    kept = [r for r in PC.table_to_review(edited) if r["keep"]]
+    colors = pp.component_colors(PC.tidy_relations(kept))
+    text_box.markdown(f"<div style='font-size:.92rem;line-height:1.9;border:1px solid rgba(148,163,184,.4);"
+                      f"border-radius:8px;padding:10px;max-height:420px;overflow:auto'>"
+                      f"{PC.highlight_colored(p['text'], colors)}</div>", unsafe_allow_html=True)
+    sao_graph(kept, key="review", colors=colors)
+
+
+def page_extract():
+    st.title("🧪 解析と確認")
+    modes = ["読み込んだ特許を確認する", "請求項を貼り付けて解析する"]
+    mode = st.radio("やること", modes, index=0 if DATA else 1, horizontal=True, key="extract_mode",
+                    label_visibility="collapsed")
+    st.divider()
+    if mode == modes[0]:
+        review_body()
+    else:
+        analyze_body()
 
 
 # ===========================================================================
-# 🌍 Patent World（オズの世界）
+# 🌍 Patent World
 # ===========================================================================
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -881,41 +721,20 @@ def world_axis_names():
 
 def page_world():
     need_data()
-    import plotly.express as px
-
-    st.title("🌍 Patent World（オズの世界）")
-    tab1, tab2 = st.tabs(["🌌 オズの世界（技術ランドスケープ）", "🔎 SAOの特徴で色分け"])
-    with tab1:
-        ax = world_axis_names()
-        st.caption("各特許を「発明の名称＋FI」の近さで3次元空間に配置した技術ランドスケープ。色は出願人。"
-                   "**点をクリック**すると文献番号・発明の名称・出願人・FI・出願日が表示され、「近い特許を表示」を押すと"
-                   "その特許と近い特許（最大6件）だけを線で結ぶ。ドラッグで回転、スクロールでズーム。")
-        st.caption(f"X軸：{ax[0]}／Y軸：{ax[1]}／Z軸：{ax[2]}。※各軸そのものに固有の技術的意味はなく、"
-                   "特許間の近さを3次元に配置したものです。近い点ほど「発明の名称＋FI」の特徴が類似しています。")
-        if OZ_WORLD_HTML_PATH.exists():
-            components.html(world_html(DATA, DATA["meta"]["uid"]), height=760, scrolling=False)
-        else:
-            st.error(f"{OZ_WORLD_HTML_PATH.name} が見つかりません。app.py と同じフォルダに置いてください。")
-    with tab2:
-        feats = PC.feature_table(DATA, st.session_state.reviews)
-        pos = pd.DataFrame([{"特許番号": p["id"], "x": p.get("x"), "y": p.get("y"), "z": p.get("z"),
-                             "出願人": p["group"]} for p in DATA["patents"]])
-        df = feats.merge(pos, on="特許番号").dropna(subset=["x"])
-        axes = ["構成要素数", "SAO関係数", "階層の深さ", "分岐の多さ", "関係の多様性", "機能・配置の記述", "数値限定"]
-        color = st.selectbox("色分けに使う特徴", ["出願人"] + axes + ["請求項の文字数"])
-        fig = px.scatter_3d(df, x="x", y="y", z="z", color=color,
-                            color_discrete_map=COLORS if color == "出願人" else None,
-                            hover_name="発明の名称", hover_data={"特許番号": True, "SAO関係数": True,
-                                                              "x": False, "y": False, "z": False}, height=640)
-        fig.update_traces(marker=dict(size=4))
-        ax = world_axis_names()
-        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0),
-                          scene=dict(xaxis_title=ax[0], yaxis_title=ax[1], zaxis_title=ax[2]))
-        plot(fig)
-        st.caption("配置はオズの世界と同じ。※各軸そのものに固有の技術的意味はなく、近い点ほど「発明の名称＋FI」の特徴が類似している。")
-        pid = st.selectbox("詳しく見る特許", [p["id"] for p in DATA["patents"]], format_func=patent_label,
-                           key="world_pid")
-        show_patent_card(pid)
+    st.title("🌍 Patent World")
+    ax = world_axis_names()
+    st.caption("各特許を「発明の名称＋FI」の近さで3次元空間に配置した技術ランドスケープ。色は出願人。"
+               "**点をクリック**すると文献番号・発明の名称・出願人・FI・出願日が表示され、「近い特許を表示」を押すと"
+               "その特許と近い特許（最大6件）だけを線で結ぶ。ドラッグで回転、スクロールでズーム。")
+    st.caption(f"X軸：{ax[0]}／Y軸：{ax[1]}／Z軸：{ax[2]}。※各軸そのものに固有の技術的意味はなく、"
+               "特許間の近さを3次元に配置したものです。発明の名称＋FIから得られる特徴が近い特許ほど近くに配置されます。")
+    if OZ_WORLD_HTML_PATH.exists():
+        components.html(world_html(DATA, DATA["meta"]["uid"]), height=760, scrolling=False)
+    else:
+        st.error(f"{OZ_WORLD_HTML_PATH.name} が見つかりません。app.py と同じフォルダに置いてください。")
+    pid = st.selectbox("詳しく見る特許", [p["id"] for p in DATA["patents"]], format_func=patent_label,
+                       key="world_pid")
+    show_patent_card(pid)
 
 
 def show_patent_card(pid):
@@ -1035,7 +854,7 @@ def page_similarity():
     st.title("🗺️ 類似性マップ")
     st.caption("各特許のSAO（基本語にしたトリプル・組・構成要素）をTF-IDFで数値化し、似ているものほど近くに"
                "配置した地図。 **点をクリックすると、似ている特許と共通するSAOが表示されます。** "
-               "オズの世界（発明の名称＋FI）とは違い、請求項の構造の近さで並べている。")
+               "Patent World（発明の名称＋FI）とは違い、請求項の構造の近さで並べている。色は出願人。")
     if len(DATA["patents"]) < 2:
         st.info("2件以上の特許が必要です。")
         return
@@ -1044,8 +863,7 @@ def page_similarity():
     df = pd.DataFrame([{"特許番号": p["id"], "発明の名称": p["title"], "出願人": p["group"], "x": p.get("map_x", 0.0),
                         "y": p.get("map_y", 0.0), "SAO数": len(PC.effective_relations(p, st.session_state.reviews))}
                        for p in DATA["patents"]])
-    color = st.radio("色分け", ["出願人", "SAO数"], horizontal=True)
-    fig = px.scatter(df, x="x", y="y", color=color, color_discrete_map=COLORS if color == "出願人" else None,
+    fig = px.scatter(df, x="x", y="y", color="出願人", color_discrete_map=COLORS,
                      hover_name="発明の名称", hover_data={"特許番号": True, "x": False, "y": False},
                      custom_data=["特許番号"], height=620)
     fig.update_traces(marker=dict(size=8))
@@ -1535,10 +1353,8 @@ def page_export():
 # ナビゲーション
 # ---------------------------------------------------------------------------
 nav = st.navigation({
-    "データ": [st.Page(page_data, title="データの読み込み", icon="📥", url_path="data"),
-             st.Page(page_dashboard, title="ダッシュボード", icon="🏠", default=True)],
-    "抽出と確認": [st.Page(page_analyze, title="AI解析", icon="🧪", url_path="analyze"),
-                 st.Page(page_review, title="人手確認", icon="✍️", url_path="review")],
+    "データ": [st.Page(page_data, title="データの読み込み", icon="📥", url_path="data", default=True)],
+    "抽出と確認": [st.Page(page_extract, title="解析と確認", icon="🧪", url_path="extract")],
     "可視化・分析": [st.Page(page_world, title="Patent World", icon="🌍", url_path="world"),
                    st.Page(page_network, title="SAOネットワーク", icon="🕸️", url_path="network"),
                    st.Page(page_similarity, title="類似性マップ", icon="🗺️", url_path="similarity"),
