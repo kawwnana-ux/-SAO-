@@ -11965,7 +11965,7 @@ def _dependency_pairs(pp, text):
 
 # ===========================================================================
 # 【統合】sao_selector.py
-# 名前の付け替え: Selector → Selector9, TRAIN_FILE → TRAIN_FILE9, analyze_claim_selected → analyze_claim_selected9, build_candidates → build_candidates9, claim_features → claim_features9, select → select9
+# 名前の付け替え: build_candidates → build_candidates9, claim_features → claim_features9
 # ===========================================================================
 """
 sao_selector.py
@@ -11994,7 +11994,6 @@ import pathlib as _pathlib
 import numpy as np
 
 HERE = _pathlib.Path(__file__).resolve().parent
-TRAIN_FILE9 = HERE / "sao_selector_train.npz"
 
 INVALID = {"複数", "互い", "こと", "もの", "場合", "状態", "様子", "全体", "一部", "両方", "それぞれ",
            "いずれか", "各々", "これ", "それ", "あれ", "ここ", "そこ", "一方", "他方",
@@ -12109,52 +12108,10 @@ def build_candidates9(ts, pp, text, llm_output=None, llm_cache=None, claim_id=No
             "cleaned": pp._clean_claim_text(text), "format": pp.classify_claim_format(text)}
 
 
-def select9(pp, info, prob, threshold):
-    """確率の高い順に採用。同じ2つの構成要素の組（向きを問わない）からは1件だけ。"""
-    n = pp._normalize_node_text_lenient
-    out, seen = [], set()
-    for i in np.argsort(-prob):
-        if prob[i] < threshold:
-            break
-        c = info["cands"][i]
-        key = frozenset((n(c["source"]), n(c["target"])))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
-                    "type": c["srcs"][0].split(":")[-1] if c["srcs"] else "selected",
-                    "prob": float(prob[i])})
-    return out
 
 
-class Selector9:
-    """学習データから選別モデルを作る。exclude_ids を渡すと、その請求項を除いて学習する
-    （交差検証の評価用）。"""
-
-    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE9):
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        d = np.load(train_file, allow_pickle=False)
-        X, Y, ids = d["X"], d["Y"], d["ids"]
-        self.threshold = float(d["threshold"])
-        if exclude_ids:
-            keep = ~np.isin(ids, np.array(sorted(exclude_ids)))
-            X, Y = X[keep], Y[keep]
-        X = X.copy()
-        X[:, KEPT_INDEX] = 0.0
-        self.model = HistGradientBoostingClassifier(
-            max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=40,
-            l2_regularization=1.0, early_stopping=False, random_state=0).fit(X, Y)
-
-    def predict(self, pp, info):
-        X = claim_features9(pp, info)
-        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
 
 
-def analyze_claim_selected9(ts, pp, selector, text, threshold=None, **kw):
-    info = build_candidates9(ts, pp, text, **kw)
-    prob = selector.predict(pp, info)
-    rels = select9(pp, info, prob, selector.threshold if threshold is None else threshold)
-    return info, rels
 
 
 def cv_folds(texts_by_id, n_folds=5, seed=42):
@@ -12170,7 +12127,7 @@ def cv_folds(texts_by_id, n_folds=5, seed=42):
 
 # ===========================================================================
 # 【統合】sao_selector10.py
-# 名前の付け替え: Selector → Selector10, TRAIN_FILE → TRAIN_FILE10, analyze_claim_selected → analyze_claim_selected10, build_candidates → build_candidates10, claim_features → claim_features10
+# 名前の付け替え: build_candidates → build_candidates10, claim_features → claim_features10
 # ===========================================================================
 """
 sao_selector10.py
@@ -12187,7 +12144,6 @@ pass  # （統合済み）import claim_segmenter as CS
 pass  # （統合済み）import sao_selector as S
 
 HERE = _pathlib.Path(__file__).resolve().parent
-TRAIN_FILE10 = HERE / "sao_selector10a_train.npz"
 SEG_KEYS = ["GS:direct", "GS:positional", "GS:has", "GS:distrib"]
 
 
@@ -12225,27 +12181,9 @@ def claim_features10(pp, info):
     return np.hstack([X, np.array(extra, dtype=float)])
 
 
-class Selector10(Selector9):
-    """実験10の選別モデル。学習データと特徴量だけが実験9と異なる。"""
-
-    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE10):
-        super().__init__(exclude_ids=exclude_ids, train_file=train_file)
-
-    def predict(self, pp, info):
-        X = claim_features10(pp, info)
-        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
-
-
-def analyze_claim_selected10(ts, pp, selector, text, threshold=None, **kw):
-    info = build_candidates10(ts, pp, text, **kw)
-    prob = selector.predict(pp, info)
-    rels = select9(pp, info, prob, selector.threshold if threshold is None else threshold)
-    return info, rels
-
-
 # ===========================================================================
 # 【統合】sao_selector11.py
-# 名前の付け替え: Selector → Selector11, TRAIN_FILE → TRAIN_FILE11, analyze_claim_selected → analyze_claim_selected11, build_candidates → build_candidates11, claim_features → claim_features11, select → select11
+# 名前の付け替え: build_candidates → build_candidates11, claim_features → claim_features11
 # ===========================================================================
 """
 sao_selector11.py
@@ -12279,7 +12217,6 @@ pass  # （統合済み）import sao_selector as S
 pass  # （統合済み）import sao_selector10 as S10
 
 HERE = _pathlib.Path(__file__).resolve().parent
-TRAIN_FILE11 = HERE / "sao_selector11_train.npz"
 
 
 def merge_occurrences(info):
@@ -12356,41 +12293,6 @@ def claim_features11(pp, info):
             float(len(y)) if y else 0.0,
         ])
     return np.hstack([X, np.array(extra, dtype=float)])
-
-
-def select11(pp, info, prob, threshold):
-    """実験9と同じ選び方。ただし「XのY」と「Y」は同じノードとみなして組の重複を判定する。"""
-    n = pp._normalize_node_text_lenient
-    owners = info.get("merge_owners", {})
-    canon = {X + "の" + Y: Y for Y, xs in owners.items() for X in xs}
-    out, seen = [], set()
-    for i in np.argsort(-prob):
-        if prob[i] < threshold:
-            break
-        c = info["cands"][i]
-        key = frozenset((n(canon.get(c["source"], c["source"])), n(canon.get(c["target"], c["target"]))))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
-                    "type": c["srcs"][0].split(":")[-1] if c["srcs"] else "selected",
-                    "prob": float(prob[i])})
-    return out
-
-
-class Selector11(Selector9):
-    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE11):
-        super().__init__(exclude_ids=exclude_ids, train_file=train_file)
-
-    def predict(self, pp, info):
-        X = claim_features11(pp, info)
-        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
-
-
-def analyze_claim_selected11(ts, pp, selector, text, threshold=None, **kw):
-    info = build_candidates11(ts, pp, text, **kw)
-    prob = selector.predict(pp, info)
-    return info, select11(pp, info, prob, selector.threshold if threshold is None else threshold)
 
 
 # ===========================================================================
@@ -13059,7 +12961,7 @@ def company_year_bubble(corpus, reviews=None):
     for p in corpus["patents"]:
         if p.get("year") is None:
             continue
-        rows.append({"企業": p["company"], "出願年": p["year"],
+        rows.append({"企業": p.get("group", p["company"]), "出願年": p["year"],
                      "SAO数": len(effective_relations(p, reviews))})
     df = pd.DataFrame(rows)
     if df.empty:
@@ -13068,9 +12970,12 @@ def company_year_bubble(corpus, reviews=None):
                                               SAO数合計=("SAO数", "sum")).reset_index())
 
 
-def company_tech_matrix(corpus, axis="FIサブクラス", reviews=None, top_tech=15):
+def company_tech_matrix(corpus, axis="FIサブクラス", reviews=None, top_tech=15, top_comp=12):
     rows = []
+    comp_top = {c for c, _ in Counter(p["company"] for p in corpus["patents"]).most_common(top_comp)}
     for p in corpus["patents"]:
+        if p["company"] not in comp_top:
+            continue
         if axis == "FIサブクラス":
             techs = p.get("fi_sub") or []
         elif axis == "FIメイングループ":
@@ -13139,46 +13044,331 @@ def relations_csv(corpus, reviews=None):
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 
 
+# ---------------------------------------------------------------------------
+# 汎用のデータセット（任意の特許リストを読み込んで解析する）
+# ---------------------------------------------------------------------------
+
+# 実験12の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
+DEFAULT_BANDS = {
+    "accept": 0.63, "threshold": 0.25, "review_low": 0.15, "target_precision": 0.8,
+    "stats": {"採用": {"精度": 0.802}, "要確認": {"精度": 0.3097}, "除外": {"精度": 0.0968},
+              "正解の所在": {"採用": 0.3169, "要確認": 0.2277, "除外": 0.0827, "候補なし": 0.3727}},
+}
+METHOD_NAME = "実験12（係り受け候補＋2段階選別）"
+METHOD_SCORE = "532件の正解データで、トリプル完全一致 F1 53.6%（適合率 60.5%・再現率 48.1%）"
+
+GROUP_PALETTE = ["#3987e5", "#d95926", "#199e70", "#9b59d0", "#e0a100", "#2bb3c0", "#e0457b", "#7a8b2c"]
+OTHER_COLOR = "#8a8880"
+
+COLUMN_ALIASES = {
+    "id": ["文献番号", "公開番号", "登録番号", "公報番号", "出願番号", "特許番号", "番号", "id", "ID", "patent_id"],
+    "title": ["発明の名称", "名称", "タイトル", "title", "発明名称"],
+    "applicant": ["出願人/権利者", "出願人／権利者", "出願人", "権利者", "出願人名", "applicant", "applicants"],
+    "fi": ["FI", "FI分類", "FIコード", "fi", "fi_code"],
+    "ipc": ["IPC", "国際特許分類", "ipc"],
+    "date": ["出願日", "出願年月日", "application_date", "filing_date", "date"],
+    "url": ["文献URL", "URL", "url"],
+    "claim": ["請求項", "請求項1", "請求項１", "請求の範囲", "特許請求の範囲", "請求項本文", "クレーム", "claim",
+              "claims", "text", "本文"],
+}
+
+
+def _norm_col(c):
+    return str(c).strip().lower().replace(" ", "").replace("　", "")
+
+
+def detect_columns(df):
+    """表の列名から、番号・発明の名称・出願人・FI・出願日・請求項の列を自動で見つける。"""
+    norm = {_norm_col(c): c for c in df.columns}
+    out = {}
+    for key, aliases in COLUMN_ALIASES.items():
+        out[key] = None
+        for a in aliases:
+            if _norm_col(a) in norm:
+                out[key] = norm[_norm_col(a)]
+                break
+    return out
+
+
+def read_table(data, filename):
+    """アップロードされた CSV / Excel を DataFrame にする（CSV は UTF-8・Shift_JIS の両方に対応）。"""
+    name = filename.lower()
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(io.BytesIO(data))
+    for enc in ("utf-8-sig", "cp932", "utf-16"):
+        try:
+            return pd.read_csv(io.BytesIO(data), encoding=enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return pd.read_csv(io.BytesIO(data), encoding="utf-8", errors="replace")
+
+
+_CLAIM_HEAD_RE = re.compile(r"【請求項\s*[0-9０-９]+\s*】")
+
+
+def first_claim(text):
+    """【請求項１】【請求項２】…のように複数の請求項が入っていたら、請求項1だけを取り出す。"""
+    t = str(text or "").strip()
+    heads = list(_CLAIM_HEAD_RE.finditer(t))
+    if len(heads) >= 1:
+        end = heads[1].start() if len(heads) >= 2 else len(t)
+        return t[heads[0].end():end].strip()
+    return t
+
+
+_CORP_RE = re.compile(r"(株式会社|有限会社|合同会社|一般社団法人|国立大学法人|学校法人|独立行政法人|\(株\)|（株）|"
+                      r"Co\.,?\s*Ltd\.?|Corporation|Inc\.?|CO\.,?\s*LTD\.?)", re.IGNORECASE)
+
+
+def company_name(applicant):
+    """筆頭出願人を、会社の種類（株式会社など）を除いた短い名前にする。"""
+    first = re.split(r"[;；、,\n]", str(applicant or ""))[0].strip()
+    short = _CORP_RE.sub("", first).strip(" 　・")
+    return short or first or "不明"
+
+
+def fi_parts(fi):
+    """FI（例：H01L25/04@C,H01L23/46@Z）から、サブクラス・メイングループ・FI記号の一覧を作る。"""
+    subs, mains, full = [], [], []
+    for x in re.split(r"[,;；、\s]+(?=[A-HY][0-9]{2}[A-Z])", str(fi or "")):
+        x = x.strip()
+        m = re.match(r"^([A-HY][0-9]{2}[A-Z])\s*([0-9]+)(?:\s*/\s*([0-9]+))?", x)
+        if m:
+            subs.append(m.group(1))
+            mains.append("%s%s/00" % (m.group(1), m.group(2)))
+            full.append("%s%s/%s" % (m.group(1), m.group(2), m.group(3) or "00"))
+    return list(dict.fromkeys(subs)), list(dict.fromkeys(mains)), list(dict.fromkeys(full))
+
+
+def make_patent(pid, text, title="", applicant="", fi="", date="", url=""):
+    subs, mains, _ = fi_parts(fi)
+    ym = re.search(r"(19|20)\d{2}", str(date or ""))
+    return {"id": str(pid), "title": str(title or ""), "applicant": str(applicant or ""),
+            "company": company_name(applicant) if applicant else "不明", "fi": str(fi or ""),
+            "fi_sub": subs, "fi_main": mains, "year": int(ym.group(0)) if ym else None,
+            "filing_date": str(date or ""), "url": str(url or ""), "text": first_claim(text),
+            "relations": [], "n_rejected": 0, "analyzed": False}
+
+
+def patents_from_table(df, cols, limit=None):
+    """表（DataFrame）と列の対応から、解析前の特許レコードのリストを作る。"""
+    out, seen = [], set()
+    for i, row in df.iterrows():
+        text = row.get(cols["claim"]) if cols.get("claim") else None
+        if text is None or (isinstance(text, float) and math.isnan(text)) or not str(text).strip():
+            continue
+
+        def g(k):
+            v = row.get(cols[k]) if cols.get(k) else ""
+            return "" if v is None or (isinstance(v, float) and math.isnan(v)) else v
+
+        pid = str(g("id") or "行%d" % (i + 1))
+        base, k = pid, 2
+        while pid in seen:
+            pid = "%s_%d" % (base, k)
+            k += 1
+        seen.add(pid)
+        out.append(make_patent(pid, text, g("title"), g("applicant"), g("fi") or g("ipc"), g("date"), g("url")))
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def apply_analysis(patent, cands):
+    """1件の解析結果（全候補と判定）を特許レコードに入れる。除外は件数だけ残す。"""
+    keep = [c for c in cands if c["status"] != STATUS_REJECT]
+    patent["relations"] = [{"source": c["source"], "relation": c["relation"], "target": c["target"],
+                            "prob": c["prob"] if c["prob"] is not None else 1.0, "selected": bool(c["selected"]),
+                            "status": c["status"], "origin": "+".join(c.get("srcs", [])) or c.get("origin", "")}
+                           for c in keep]
+    patent["n_rejected"] = len(cands) - len(keep)
+    patent["analyzed"] = True
+    return patent
+
+
+def new_dataset(name, patents, bands=None):
+    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector12", "n": len(patents)},
+            "bands": dict(bands or DEFAULT_BANDS), "patents": patents}
+
+
+def assign_groups(corpus, top=7):
+    """出願人（会社）ごとの色分け用グループ。件数の多い上位 top 社と「その他」。"""
+    cnt = Counter(p["company"] for p in corpus["patents"])
+    tops = [c for c, _ in cnt.most_common() if c not in ("不明", "その他")][:top]
+    for p in corpus["patents"]:
+        p["group"] = p["company"] if p["company"] in tops else "その他"
+    corpus["groups"] = tops + (["その他"] if any(p["group"] == "その他" for p in corpus["patents"]) else [])
+    return corpus
+
+
+def group_colors(corpus):
+    cols = {g: GROUP_PALETTE[i % len(GROUP_PALETTE)] for i, g in enumerate(g for g in corpus.get("groups", [])
+                                                                          if g != "その他")}
+    cols["その他"] = OTHER_COLOR
+    return cols
+
+
+def _embed(X, dim, seed=0):
+    """高次元の特徴を dim 次元に落とす（件数が十分なら t-SNE、少なければ SVD）。"""
+    from sklearn.decomposition import TruncatedSVD
+
+    n = X.shape[0]
+    k = max(1, min(50, n - 1, X.shape[1] - 1))
+    Z = TruncatedSVD(k, random_state=seed).fit_transform(X) if n > 2 and X.shape[1] > 2 else X.toarray()
+    Zn = Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-9)
+    if n >= 12:
+        from sklearn.manifold import TSNE
+
+        Y = TSNE(dim, perplexity=max(2.0, min(30.0, (n - 1) / 3.0)), init="pca", random_state=seed,
+                 metric="cosine").fit_transform(Zn)
+        method = "SVD(%d)→t-SNE(%d)" % (k, dim)
+    else:
+        Y = np.zeros((n, dim))
+        Y[:, :min(dim, Zn.shape[1])] = Zn[:, :dim]
+        method = "SVD(%d)" % dim
+    return Y, Zn, method
+
+
+def layout_world(corpus, k_neighbors=6):
+    """オズの世界（発明の名称＋FI の近さで3次元に配置）の座標と近傍エッジを求める。"""
+    from scipy.sparse import hstack
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    ps = corpus["patents"]
+    if len(ps) < 2:
+        for p in ps:
+            p["x"], p["y"], p["z"] = 0.0, 0.0, 0.0
+        corpus["world_edges"], corpus["world_method"] = [], "―"
+        return corpus
+    titles = [p.get("title") or p["text"][:60] for p in ps]
+    fis = [fi_parts(p.get("fi", ""))[0] + fi_parts(p.get("fi", ""))[1] + fi_parts(p.get("fi", ""))[2] for p in ps]
+    X1 = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), sublinear_tf=True).fit_transform(titles)
+    parts = [X1]
+    if any(fis):
+        parts.append(TfidfVectorizer(analyzer=lambda x: x or ["FIなし"], sublinear_tf=True).fit_transform(fis) * 1.5)
+    X = hstack(parts).tocsr()
+    Y, Zn, method = _embed(X, 3)
+    for p, (a, b, c) in zip(ps, Y):
+        p["x"], p["y"], p["z"] = round(float(a), 4), round(float(b), 4), round(float(c), 4)
+    S = Zn @ Zn.T
+    edges, seen = [], set()
+    k = min(k_neighbors, len(ps) - 1)
+    for i in range(len(ps)):
+        for j in np.argsort(-S[i])[1:k + 1]:
+            key = (min(i, int(j)), max(i, int(j)))
+            if key not in seen:
+                seen.add(key)
+                edges.append({"source": key[0], "target": key[1], "dist": round(float(1 - S[i, j]), 4)})
+    corpus["world_edges"], corpus["world_method"] = edges, method
+    return corpus
+
+
+def layout_map(corpus, reviews=None):
+    """類似性マップ（SAOの近さで2次元に配置）の座標を求める。"""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    ps = corpus["patents"]
+    docs = [sao_tokens(effective_relations(p, reviews)) or ["SAOなし"] for p in ps]
+    if len(ps) < 2:
+        for p in ps:
+            p["map_x"], p["map_y"] = 0.0, 0.0
+        return corpus
+    X = TfidfVectorizer(analyzer=lambda x: x, sublinear_tf=True).fit_transform(docs)
+    Y, _, method = _embed(X, 2)
+    for p, (a, b) in zip(ps, Y):
+        p["map_x"], p["map_y"] = round(float(a), 4), round(float(b), 4)
+    corpus["map_method"] = method
+    return corpus
+
+
+def finalize_dataset(corpus):
+    """グループ分け・オズの世界・類似性マップの座標をまとめて作る。"""
+    assign_groups(corpus)
+    layout_world(corpus)
+    layout_map(corpus)
+    corpus["meta"]["n"] = len(corpus["patents"])
+    return corpus
+
+
+def oz_world_html(corpus, template):
+    """オズの世界（Three.js）の HTML に、このデータセットの点・エッジ・凡例を差し込む。"""
+    ps = corpus["patents"]
+    colors = group_colors(corpus)
+    keys = {g: "g%d" % i for i, g in enumerate(corpus.get("groups", []))}
+    nodes = [{"id": p["id"], "title": p.get("title", ""), "applicant": p.get("applicant", ""), "fi": p.get("fi", ""),
+              "group": keys.get(p.get("group", "その他"), "other"), "x": p.get("x", 0.0), "y": p.get("y", 0.0),
+              "z": p.get("z", 0.0)} for p in ps]
+    data = {"nodes": nodes, "edges": corpus.get("world_edges", [])}
+    i = template.index("window.__GRAPH_DATA__ = ") + len("window.__GRAPH_DATA__ = ")
+    _, end = json.JSONDecoder().raw_decode(template[i:])
+    html_out = template[:i] + json.dumps(data, ensure_ascii=False) + template[i + end:]
+    gc = ",\n    ".join("%s: 0x%s" % (keys[g], colors.get(g, OTHER_COLOR)[1:]) for g in keys)
+    html_out = re.sub(r"var GROUP_COLOR = \{[^}]*\};", "var GROUP_COLOR = {\n    %s,\n    other: 0x%s,\n  };"
+                      % (gc, OTHER_COLOR[1:]), html_out, count=1)
+    rows = "\n".join('  <div class="legend-row"><span class="legend-dot" style="background:%s"></span>%s</div>'
+                     % (colors.get(g, OTHER_COLOR), g.replace("<", "&lt;")) for g in keys)
+    html_out = re.sub(r'(<div id="legend" class="panel">\s*<h2>[^<]*</h2>).*?(</div>\s*<div id="info-panel")',
+                      lambda m: m.group(1) + "\n" + rows + "\n" + m.group(2), html_out, count=1, flags=re.S)
+    n_e = len(corpus.get("world_edges", []))
+    method = corpus.get("world_method", "")
+    html_out = re.sub(r"(<div id=\"title-bar\" class=\"panel\">\s*<h1>[^<]*</h1>\s*<span>)[^<]*(</span>)",
+                      lambda m: m.group(1) + "発明の名称＋FI・%s・%d件・近傍エッジ%d本" % (method, len(ps), n_e)
+                      + m.group(2), html_out, count=1)
+    html_out = re.sub(r"<dt>特許件数</dt><dd>[^<]*</dd>", "<dt>特許件数</dt><dd>%d件</dd>" % len(ps), html_out)
+    html_out = re.sub(r"<dt>エッジ数</dt><dd>[^<]*</dd>", "<dt>エッジ数</dt><dd>%d本（各点の近傍）</dd>" % n_e, html_out)
+    html_out = re.sub(r"<dt>次元圧縮</dt><dd>[^<]*</dd>", "<dt>次元圧縮</dt><dd>%s</dd>" % method, html_out)
+    return html_out
+
+
+# ---------------------------------------------------------------------------
+# FIのレーダーチャート
+# ---------------------------------------------------------------------------
+
+FI_LEVELS = {"サブクラス（例：H01L）": 0, "メイングループ（例：H01L25/00）": 1, "FI記号（例：H01L25/04）": 2}
+
+
+def fi_codes(patent, level=0):
+    return fi_parts(patent.get("fi", ""))[level]
+
+
+def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, top_fi=8, share=True):
+    """FIを軸にしたレーダーチャート用のデータ。
+    by: "出願人"（会社ごと）または "出願年"（年ごと）。値は、そのグループの特許のうち
+    そのFIを持つものの割合（share=True、%）または件数。
+    戻り値: (軸のFIの一覧, {グループ: [値...]}, {グループ: 件数})"""
+    def key(p):
+        return p["company"] if by == "出願人" else (str(p["year"]) if p.get("year") else "年不明")
+
+    ps = corpus["patents"]
+    if not groups:
+        cnt = Counter(key(p) for p in ps)
+        groups = [g for g, _ in cnt.most_common() if g not in ("不明", "年不明")][:top_groups]
+    sel = [p for p in ps if key(p) in groups]
+    fi_cnt = Counter(c for p in sel for c in set(fi_codes(p, level)))
+    axes = [c for c, _ in fi_cnt.most_common(top_fi)]
+    out, sizes = {}, {}
+    for g in groups:
+        gp = [p for p in sel if key(p) == g]
+        sizes[g] = len(gp)
+        vals = [sum(1 for p in gp if a in fi_codes(p, level)) for a in axes]
+        out[g] = [round(100 * v / len(gp), 1) if (share and gp) else v for v in vals]
+    return axes, out, sizes
+
+
 # ===========================================================================
 # 【統合】eval_translate_sao.py
 # 名前の付け替え: main → main_eval
 # ===========================================================================
 """
-eval_translate_sao.py
-======================
-translate_sao.py の厳格F1を、既存のGiNZA版（patent_pipeline.py）と
-全く同じ評価基準（evaluate_triples / RELATION_SYNONYM_GROUPS）で測定する。
+評価（旧 eval_translate_sao.py）
+================================
+532件の正解データに対して、実験12の抽出を5分割交差検証で評価する。
 
-2つのモードがある（--mode）:
-  llm_direct（デフォルト）: 「タグ化 → タグ付き日本語のままLLMにSAOを
-      直接出力させる → 日本語に逆変換」方式。英訳を挟まないので、
-      翻訳段とSAO抽出段の誤差が混ざらない。
-  translate: 従来の「タグ化 → Ollama/DeepL翻訳 → 英語で依存構造解析 →
-      日本語に逆変換」方式（比較用に残している）。
+    python patent_pipeline.py --eval-mode exact --limit 532 --llm-cache llm_cache.json --out exp12_exact.json
 
-【方針転換】以前は「評価方法を甘くして数値を良く見せることは絶対にしない」
-という方針の下、evaluate_triples（source/targetの完全一致必須）だけを
-使っていた。その後、ユーザーの明示的な判断により「意味が伝わっていれば
-正解でよい」という基準に変更し、既定の評価をevaluate_triples_lenient
-（①表記・字体の正規化、②数量詞・修飾語の除去、③それでも不一致なら
-埋め込みモデルによる意味的類似度）に切り替えた（--eval-mode strictで
-従来の厳格評価にも戻せる。GiNZA初期0.277→改良0.421という過去の数字は
-すべて厳格評価によるものなので、そちらと比較する際は必ず--eval-mode strict
-を使うこと）。
-
-使い方（自分のPC上、Ollamaが起動している状態で）:
-    pip install spacy ollama
-    python -m spacy download en_core_web_sm
-    python3 eval_translate_sao.py --pipeline-dir /path/to/real_app --data-dir /path/to/gold_data --limit 20
-
-532件全部を回すとLLM呼び出しが大量に発生し、1クレームあたり数十秒〜
-1分程度かかることがあるため、全体では数時間規模になりうる。そのため
-本スクリプトは毎クレーム処理後に --out へ結果を保存しており、
---resume を付けて再実行すると、既に --out に保存済みのクレームは
-スキップして続きから再開できる（PCのスリープ・ネットワーク切断・
-途中終了などで作業が失われないようにするため）。
---debug を付けるとクレームごとにタグ付き原文・LLM出力（または英訳）・
-抽出結果を表示する。
+--eval-mode exact（主指標：トリプル完全一致）／node（主語・目的語ごとの意味的一致）／
+lenient（旧：トリプル全体の意味的類似度 0.75）／strict（旧：表記の完全一致）。
+毎件 --out に保存するので、--resume で途中から再開できる。
 """
 import argparse
 import json
@@ -13370,20 +13560,8 @@ def main_eval():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--host", default=None)
     parser.add_argument(
-        "--mode", default="llm_direct", choices=["llm_direct", "translate", "selected", "selected10", "selected11", "selected12"],
-        help="selected12: 【実験12・推奨】selected11の候補に、係り受けに基づく汎用の候補"
-             "（述語にかかる構成要素どうしの組、dep_pairs.py）を追加し、2段階の選別モデルで選ぶ"
-             "（sao_selector12.py）。1組から採る関係の数も交差検証の内側で選んだ値を使う。"
-             "selected11: 【実験11】selected10の候補に「XのY」を結合したノードの候補を"
-             "追加し、トリプル完全一致の基準で学習した選別モデル（sao_selector11.py）。"
-             "selected10: 【実験10】selectedの候補に、手がかり句で分割した区間ごとの"
-             "GiNZA解析（claim_segmenter.py、新森ら2004に基づく）を追加したもの（sao_selector10.py）。"
-             "selected: 【実験9】候補選別モデル（sao_selector.py）。LLM直接抽出・GiNZA補完・"
-             "GiNZA単体版の出力を候補として集め、学習済みモデルで正解の確率を予測して選ぶ。"
-             "評価では交差検証の分割ごとに、その分割を除いた請求項だけで学習したモデルを使う。"
-             "llm_direct（デフォルト）: 英訳を挟まず、タグ付き日本語をそのままLLMに渡して"
-             "SAOを直接抽出する。translate: 従来の「タグ付き日本語→英訳→英語で"
-             "依存構造解析」方式（--backend/--deepl-keyはこちらでのみ使う）。",
+        "--mode", default="selected12", choices=["selected12"],
+        help="抽出方法。実験12（係り受け候補＋2段階選別、主指標 F1 53.6%%）のみ。",
     )
     parser.add_argument("--backend", default="ollama", choices=["ollama", "deepl"],
                          help="--mode translate専用。翻訳エンジン。"
@@ -13586,58 +13764,33 @@ def main_eval():
     if args.filter_redundant_root_ownership:
         print("--filter-redundant-root-ownership有効: クレームタイトルによる二重所有を除去")
 
-    if args.mode in ("selected", "selected10", "selected11", "selected12"):
-        pass  # （統合済み）import sao_selector
-        pass  # （統合済み）import sao_selector10
-        pass  # （統合済み）import sao_selector11
-        if args.mode == "selected12":
-            pass  # （統合済み）import sao_selector12
-        folds = cv_folds({c["id"]: c["text"] for c in json.load(
-            open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
-        fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
-        import numpy as _np
-        _sel_mod = {"selected": sao_selector, "selected10": sao_selector10,
-                    "selected11": sao_selector11,
-                    "selected12": sao_selector12 if args.mode == "selected12" else None}[args.mode]
-        _train = _np.load(_sel_mod.TRAIN_FILE, allow_pickle=False)
-        fold_threshold = [float(t) for t in _train["fold_thresholds"]]
-        print(f"--mode {args.mode}: 交差検証の5分割ごとに選別モデルを学習しています…")
-        if args.mode == "selected12":
-            # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
-            fold_selector = [_sel_mod.Selector(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
-        else:
-            fold_selector = [_sel_mod.Selector(exclude_ids=set(f)) for f in folds]
-        print(f"  分割ごとのしきい値: {fold_threshold}")
+    # 抽出は実験12（係り受け候補＋2段階選別）のみ。交差検証の分割ごとに、その分割を
+    # 除いた請求項だけで学習した選別モデルを使う（評価する請求項を学習に使わない）
+    pass  # （統合済み）import sao_selector
+    pass  # （統合済み）import sao_selector12
+    folds = cv_folds({c["id"]: c["text"] for c in json.load(
+        open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
+    fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
+    import numpy as _np
+    _train = _np.load(TRAIN_FILE12, allow_pickle=False)
+    fold_threshold = [float(t) for t in _train["fold_thresholds"]]
+    print("交差検証の5分割ごとに選別モデルを学習しています…")
+    # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
+    fold_selector = [Selector12(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
+    print(f"  分割ごとのしきい値: {fold_threshold}")
     if args.eval_mode in ("node", "exact"):
         pass  # （統合済み）import node_match_eval
 
     for c in targets:
         cid = c["id"]
         try:
-            if args.mode in ("selected", "selected10", "selected11", "selected12"):
-                selector = fold_selector[fold_of[cid]]
-                extra = {}
-                if args.mode == "selected12" and selector.fold_max_per_pair:
-                    extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
-                _, predicted = _sel_mod.analyze_claim_selected(
-                    ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
-                    llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
-            elif args.mode == "translate":
-                _, predicted = analyze_claim_translate_llm(
-                    c["text"], model=args.model, host=args.host, pp=pp, debug=args.debug,
-                    backend=args.backend, deepl_api_key=args.deepl_key,
-                )
-            else:
-                _, predicted = analyze_claim_llm_direct(
-                    c["text"], model=args.model, host=args.host, pp=pp, debug=args.debug,
-                    llm_cache=llm_cache, claim_id=cid,
-                    verify_risky_ginza=args.verify_risky_ginza, risk_threshold=args.risk_threshold,
-                    verify_fanout=args.verify_fanout, fanout_risk_threshold=args.fanout_risk_threshold,
-                    extra_risk_rules=extra_risk_rules,
-                    verify_cache=verify_cache,
-                    filter_invalid_targets=args.filter_invalid_targets,
-                    filter_redundant_root_ownership=args.filter_redundant_root_ownership,
-                )
+            selector = fold_selector[fold_of[cid]]
+            extra = {}
+            if selector.fold_max_per_pair:
+                extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
+            _, predicted = analyze_claim_selected12(
+                ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
+                llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
         except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
             print(f"[{cid}] エラーのためスキップ: {e}")
             continue
@@ -13774,14 +13927,12 @@ node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE,
 nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, _esc=_esc, relations_to_nested_dot=relations_to_nested_dot)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
-sao_selector = _types.SimpleNamespace(FORMATS=FORMATS, HERE=HERE, INVALID=INVALID, KEPT_INDEX=KEPT_INDEX, SIMP=SIMP, SIMPLIFIED=SIMPLIFIED, SRC_KEYS=SRC_KEYS, Selector=Selector9, TRAIN_FILE=TRAIN_FILE9, analyze_claim_selected=analyze_claim_selected9, build_candidates=build_candidates9, claim_features=claim_features9, cv_folds=cv_folds, rel_group=rel_group, select=select9)
-sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, Selector=Selector10, TRAIN_FILE=TRAIN_FILE10, analyze_claim_selected=analyze_claim_selected10, build_candidates=build_candidates10, claim_features=claim_features10, cv_folds=cv_folds, select=select9)
-sao_selector11 = _types.SimpleNamespace(HERE=HERE, Selector=Selector11, TRAIN_FILE=TRAIN_FILE11, analyze_claim_selected=analyze_claim_selected11, build_candidates=build_candidates11, claim_features=claim_features11, cv_folds=cv_folds, merge_occurrences=merge_occurrences, select=select11)
+sao_selector = _types.SimpleNamespace(FORMATS=FORMATS, HERE=HERE, INVALID=INVALID, KEPT_INDEX=KEPT_INDEX, SIMP=SIMP, SIMPLIFIED=SIMPLIFIED, SRC_KEYS=SRC_KEYS, build_candidates=build_candidates9, claim_features=claim_features9, cv_folds=cv_folds, rel_group=rel_group)
+sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, build_candidates=build_candidates10, claim_features=claim_features10)
+sao_selector11 = _types.SimpleNamespace(HERE=HERE, build_candidates=build_candidates11, claim_features=claim_features11, merge_occurrences=merge_occurrences)
 sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, analyze_claim_selected=analyze_claim_selected12, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
-platform_core = _types.SimpleNamespace(CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, HAS_WORDS=HAS_WORDS, HERE=HERE, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _longest_path=_longest_path, base_term=base_term, build_network=build_network, classify=classify, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, find_corpus_file=find_corpus_file, highlight=highlight, is_has=is_has, layout_network=layout_network, load_corpus=load_corpus, origin_label=origin_label, patents_with_node=patents_with_node, percentile_scores=percentile_scores, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CORP_RE=_CORP_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
-SELECTOR_MODULES = {"sao_selector12": sao_selector12, "sao_selector11": sao_selector11,
-                    "sao_selector10": sao_selector10, "sao_selector": sao_selector}
 
 
 if __name__ == "__main__":
