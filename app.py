@@ -27,18 +27,24 @@
   出力
     📤 エクスポート            … Excel／CSV、人手確認結果の保存と読み込み
 
+【ファイル構成】
+プログラムは app.py（画面）と patent_pipeline.py（解析の処理すべて）の2つだけ。
+同じフォルダに、次のデータファイルを置く。
+  corpus_sao_532.json      … 532件の分析結果（ダッシュボード・人手確認・可視化用）
+  sao_selector12_train.npz … 実験12の選別モデルの学習データ（実験9〜11の .npz も同様）
+  oz_world_embed.html      … Patent World（オズの世界）
+
 【実行方法（自分のPC・Ollama）】
     pip install -r requirements.txt
     ollama pull qwen2.5:7b
     streamlit run app.py
-同じフォルダに、translate_sao.py・patent_pipeline.py・en_relation_rules.py・
-platform_core.py・corpus_sao_532.json・oz_world_embed.html・sao_selector*.py・
-sao_selector*_train.npz・claim_segmenter.py・dep_pairs.py・node_match_eval.py・
-nested_graph.py を置いてください。
+
+【評価（旧 eval_translate_sao.py）】
+    python patent_pipeline.py --mode selected12 --eval-mode exact --limit 532 --llm-cache llm_cache.json --out exp12_exact.json
 
 【Streamlit Community Cloud】
-Secrets に OPENROUTER_API_KEY を設定すると、translate_sao._ollama_chat を OpenRouter
-経由の qwen2.5-7b-instruct に差し替えて動かす（translate_sao.py 自体は変更しない）。
+Secrets に OPENROUTER_API_KEY を設定すると、LLM呼び出し（patent_pipeline._ollama_chat）を
+OpenRouter 経由の qwen2.5-7b-instruct に差し替えて動かす。
 532件の分析ページ（ダッシュボード・人手確認・可視化）は事前に抽出した
 corpus_sao_532.json を使うので、LLMを呼ばずに動く。
 """
@@ -60,20 +66,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import patent_pipeline as pp
-import platform_core as PC
-import translate_sao as ts
 
-try:
-    from nested_graph import relations_to_nested_dot
-except ImportError:
-    relations_to_nested_dot = None
-
-SELECTOR_MODULES = {}
-for _name in ("sao_selector12", "sao_selector11", "sao_selector10", "sao_selector"):
-    try:
-        SELECTOR_MODULES[_name] = __import__(_name)
-    except Exception:  # noqa: BLE001
-        pass
+# これまで別ファイルに分けていたモジュールは、すべて patent_pipeline.py に統合した。
+# 以前の名前（ts・PC など）のまま使えるように別名を付ける。
+ts = pp                                  # 旧 translate_sao.py（LLM抽出）
+PC = pp.platform_core                    # 旧 platform_core.py（分析・集計・書き出し）
+relations_to_nested_dot = pp.relations_to_nested_dot  # 旧 nested_graph.py（入れ子の構造図）
+SELECTOR_MODULES = pp.SELECTOR_MODULES   # 旧 sao_selector*.py（実験9〜12の選別モデル）
 
 st.set_page_config(page_title="特許分析プラットフォーム", layout="wide", page_icon="🔬")
 
@@ -206,9 +205,10 @@ def load_selector(module_name):
 
 @st.cache_data(show_spinner="532件の分析データを読み込み中…")
 def load_corpus():
-    if not PC.CORPUS_FILE.exists():
+    f = PC.find_corpus_file()
+    if f is None:
         return None
-    return PC.load_corpus()
+    return PC.load_corpus(f)
 
 
 @st.cache_data(show_spinner=False)
@@ -232,7 +232,7 @@ def patent_label(pid):
 
 def need_corpus():
     if CORPUS is None:
-        st.error("corpus_sao_532.json が見つかりません。app.py と同じフォルダに置いてください。")
+        st.error(f"corpus_sao_532.json が見つかりません。app.py と同じフォルダ（{APP_DIR}）に置いてください。")
         st.stop()
 
 
@@ -263,7 +263,7 @@ def origin_of(srcs):
 def duplicate_flags(gpp, mod, info, keys):
     """選ばれた関係と同じ組で同義の関係（「有する」と「備える」など）の候補に印を付ける
     （人が確認するときに同じものが繰り返し出ないようにする）。"""
-    from node_match_eval import rel_match
+    rel_match = pp.rel_match
 
     n = gpp._normalize_node_text_lenient
     if hasattr(mod, "canon"):

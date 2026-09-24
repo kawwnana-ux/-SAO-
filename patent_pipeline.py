@@ -9435,3 +9435,4355 @@ def analyze_claim_translate(text, model=None, host=None, debug=False, debug_out=
         kwargs["model"] = _ts.DEFAULT_MODEL
 
     return _ts.analyze_claim_translate(text, **kwargs)
+
+
+# ###########################################################################
+# ここから下は、卒業研究の途中で別ファイルに分けていたモジュールを統合したもの。
+# 各節の先頭に元のファイル名を示す。同じ名前の関数が複数のファイルにあったものは、
+# 末尾に番号などを付けて区別している（例：実験12の選別モデル → Selector12）。
+# 元のファイル名で呼べるように、最後に名前空間（translate_sao・sao_selector12 など）
+# も用意してある。
+# ###########################################################################
+import pathlib as _pathlib
+import types as _types
+
+
+# ===========================================================================
+# 【統合】en_relation_rules.py
+# 名前の付け替え: nlp → nlp_en
+# ===========================================================================
+"""
+en_relation_rules.py
+=====================
+英訳された特許クレーム（構成要素は COMPONENT_<番号> というタグに
+置き換えられている前提）から、spaCy(en_core_web_sm)の依存構造解析結果を
+使って (source, relation, target) のSAOトリプルを抽出する。
+
+設計の考え方:
+  日本語は「1文に長い連体修飾節が何重にも入れ子になる」「格助詞（と/に等）が
+  多義的」「主語省略・長距離係り受け誤り」のために、GiNZA単体でのSAO抽出には
+  大量の特例ロジックが必要になっていた（patent_pipeline.py参照）。
+  英訳すると、SVO構造・前置詞・並列(conj)がほぼ一意に決まるため、
+  少数の一般的な依存構造パターン（HAS＋並列、能動他動詞、受身＋前置詞、
+  比較級、コピュラ＋of等）だけでSAOの大部分をカバーできる、という
+  仮説を検証するために書いた。
+
+  ただし「動詞ごとに正しい日本語ラベルを知っている」必要はあるので、
+  各パターンには小さな動詞辞書がある。日本語側のRELATION_WORDS/
+  HAS_LEMMAS等に相当するもので、ここが今後の主なメンテナンス対象になる。
+
+  10クレーム程度のオラクル検証（正解ノード分割を使った検証。
+  /tmp/proto_run.py 相当）でmacro F1 98%程度を確認済み
+  （GiNZA単体は同じ8クレームでmacro F1 43.8%）。
+  ただしこれは「ノード分割は完璧」「翻訳はClaudeが手作業」という前提での
+  ベストケースなので、実際にOllama翻訳と自動タグ付けを組み合わせた
+  end-to-endの精度は別途 eval_translate_sao.py で検証すること。
+"""
+import re
+
+import spacy
+
+# ------------------------------------------------------------------
+# nlp（en_core_web_sm）の遅延読み込み
+# ------------------------------------------------------------------
+# このモジュールはtranslate_sao.pyからモジュールレベルで
+# `import en_relation_rules as err` されるが、実際にnlp（英語モデル）が
+# 必要になるのは、本モジュールのextract_relations_from_english
+# （英訳経由のSAO抽出。現在は analyze_claim_llm_direct 方式に置き換えられた
+# 旧方式）が呼ばれたときだけである。以前はここで即座に
+# `spacy.load("en_core_web_sm")` していたため、en_core_web_smが
+# インストールされていない環境（Streamlit Community Cloud等、公開デモ用
+# のクラウド環境にはインストールしていない）では、
+# `import translate_sao` の時点で即座にOSError（モデル未検出）となり、
+# analyze_claim_llm_direct（英語モデルを一切使わない方式）しか使わない
+# アプリまで起動できなくなってしまっていた。
+# nlpを遅延読み込みにすることで、実際にextract_relations_from_englishを
+# 呼ぶまではen_core_web_smを読み込まないようにし、この問題を回避する。
+# 呼び出し側（`err.nlp(text)`）から見た挙動は変わらない。
+_nlp_instance = None
+
+
+def _load_nlp():
+    global _nlp_instance
+    if _nlp_instance is None:
+        _nlp_instance = spacy.load("en_core_web_sm")
+    return _nlp_instance
+
+
+class _LazyNLP:
+    """spacy.load("en_core_web_sm")の遅延ラッパー。
+    nlp(text)としての呼び出しも、nlp.pipe(...)等の属性アクセスも、
+    実際に使われた時点で初めてモデルを読み込む。"""
+
+    def __call__(self, *args, **kwargs):
+        return _load_nlp()(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(_load_nlp(), name)
+
+
+nlp_en = _LazyNLP()
+
+TAG_RE = re.compile(r"^C\d+$")
+
+
+def is_tag(token):
+    return bool(TAG_RE.match(token.text))
+
+
+def conj_chain(token):
+    # 「A, B, C and D」のようなコンマ区切りの並列は、spaCyの小型モデルが
+    # conjではなくapposとして解析することがある（Oxfordコンマなし特有の癖）
+    # ため、conj・appos どちらの依存関係でも並列項として辿る。
+    out = [token]
+    for c in token.children:
+        if c.dep_ in ("conj", "appos"):
+            out.extend(conj_chain(c))
+    return out
+
+
+def _verb_key(token):
+    # 見慣れないタグ（COMPONENT_1等）に挟まれると、spaCyの小型モデルが
+    # 直後の動詞の原形（lemma）を誤判定することがあるため、lemma優先で、
+    # ダメなら表層形（小文字化・末尾のs除去）にフォールバックする。
+    if token.lemma_ and token.lemma_ != token.text:
+        return token.lemma_
+    return token.text.lower().rstrip("s")
+
+
+# 「有する」「備える」に相当する、能動＋並列(conj)で目的語を複数取れる動詞
+HAS_VERBS = {
+    "have": "有する", "comprise": "備える", "include": "含む",
+    "contain": "含む", "use": "用いる", "carry": "搭載する",
+}
+# 「AがBをVする」の単純な能動他動詞（対象を1つずつ取る）
+ACTIVE_VERB_LABELS = {
+    "accommodate": "収容する", "face": "対向する", "control": "制御する",
+    "join": "接合する", "support": "支える", "inject": "射出する",
+    "connect": "接続される", "cover": "覆う", "hold": "保持する",
+    "press": "押圧する", "detect": "検出する", "generate": "生成する",
+}
+ACTIVE_PREP_VERBS = {"communicate": {"with": "連通される"}}
+CONSIST_OF_VERBS = {"consist": "からなる"}
+ACOMP_LABELS = {"opposite": "反対側の面である", "higher": "より高い", "lower": "より低い", "parallel": "平行である"}
+CAPABLE_OF_GERUND_LABELS = {"inject": "射出可能である"}
+CONFIGURE_XCOMP_LABELS = {"separate": "分離するように構成される"}
+
+# 「Xに接続される/配置される/形成される」等の受身動詞。前置詞ごとに
+# ラベルを変えたい場合は"_default"以外のキーを追加する。
+PASSIVE_VERB_LABELS = {
+    "connect": {"_default": "接続される"},
+    "bond": {"_default": "接合される", "via": "を介して接合される"},
+    "form": {"_default": "形成される"},
+    "separate": {"_default": "離れている"},
+    "fix": {"_default": "固定される"},
+    "position": {"_default": "位置決めされる"},
+    "dispose": {"_default": "配置される"},
+    "arrange": {"_default": "配設される"},
+    "provide": {"_default": "設けられる"},
+    "insert": {"_default": "挿入される"},
+    "mount": {"_default": "搭載される"},
+    "attach": {"_default": "取り付けられる"},
+    "cover": {"_default": "覆われる"},
+    "hold": {"_default": "保持される"},
+    "surround": {"_default": "囲まれる"},
+    "embed": {"_default": "埋め込まれる"},
+    "insulate": {"_default": "絶縁される"},
+    "expose": {"_default": "露出される"},
+    # 最初は"C2"止まりで「of C1」まで辿れず悪化したが（旧コメント参照）、
+    # _scan_passive_targetsに「Xの主面」複合形の生成（ネストof連鎖解消）を
+    # 実装した後に再検証し、188284でf1が悪化しないことを確認できたため採用。
+    "configure": {"_default": "配置される"},
+}
+PASSIVE_ADVMOD_OVERRIDES = {
+    ("separate", "electrically"): "電気的に離れて配置される",
+}
+# 日本語の原文では能動態（「ケースが半導体チップを収容し、」）で書かれている
+# 動詞が、Ollama翻訳で受身（"C3 is accommodated in C6"）に変換されてしまう
+# ことがある（実際に532件のうちの検証claimで確認済み）。この種の動詞は、
+# 正解データでは一貫して「容器・全体側」を主語にした能動形（例:
+# 「ケース 収容する 半導体チップ」）で記録されているため、通常のPASSIVE
+# ruleとは逆に、source/targetを入れ替えて能動ラベルを使う。
+REVERSED_PASSIVE_VERB_LABELS = {
+    "accommodate": {"_default": "収容する"},
+}
+SURFACE_WORDS = {"surface": "表面に", "face": "面に"}
+# 「in <noun> with」型の熟語的表現 → 日本語ラベル
+PREP_NOUN_PATTERNS = {
+    ("in", "communication", "with"): "連通される",
+    ("in", "contact", "with"): "接触する",
+}
+
+
+def _scan_passive_targets(verb_node, vkey, override, labels_dict=None):
+    """
+    受身動詞（またはそれに相当する語）の子から、前置詞＋目的語のペアを
+    すべて拾い、(対象テキスト, 関係ラベル) のリストを返す。
+
+    「to X」がspaCyの小型モデルにより前置詞句でなくxcomp（不定詞句）と
+    誤解析され、Xがそのまま裸のタグとして残ることがある
+    （例: "C3 is bonded to C6." → bonded-xcomp->C6）。これも
+    prep+pobjと同じ意味なので、あわせて対象にする。
+
+    対象タグ自身が「C2 of C1」のようにネストした「of」属格を持つ場合
+    （例:「C3 configured on C2 of C1」＝「C3がC1のC2に配置される」）、
+    対象テキストを単なる「C2」ではなく「C1のC2」という複合形にする。
+    こうしておくと、C2が実は「主面」等の面・部位を表す語だった場合、
+    後段のpatent_pipeline._merge_surface_location_nodes（GiNZA単体版と
+    共通のロジック）が、同じクレーム内に別途出現する「C1」ノードを
+    手がかりに自動でC1へ統合してくれる（本人の指示「常に統合する」と
+    同じ扱いになる）。C2が実際には別の独立した構成要素だった場合も、
+    「C1のC2」という複合ノードのまま残るだけで、情報を失うわけではない。
+    """
+    labels = (labels_dict or PASSIVE_VERB_LABELS).get(vkey, {"_default": vkey})
+    out = []
+    for child in verb_node.children:
+        pobj = None
+        prep_text = None
+        if child.dep_ == "prep":
+            pobj = next((c for c in child.children if c.dep_ == "pobj"), None)
+            prep_text = child.text
+            if pobj is not None and pobj.lemma_ == "respect" and prep_text == "with":
+                # "positioned with respect to X"のような多語前置詞。
+                # spaCyの小型モデルは"with"のpobjを（意味の無い）"respect"に
+                # してしまい、本当の対象Xは"respect"の子の"to"のpobjとして
+                # さらに一段深くにぶら下がる（実際に検証claim（188284）の
+                # 「C5 is positioned with respect to C3 by the C9」で確認）。
+                # 「by C9」（手段）は"positioned"の直接の子ではなく"respect"の
+                # 子になってしまうが、ここでは"to"だけを辿るので混入しない。
+                to_prep = next((c for c in pobj.children if c.dep_ == "prep" and c.text == "to"), None)
+                pobj = next((c for c in to_prep.children if c.dep_ == "pobj"), None) if to_prep else None
+                prep_text = "with_respect_to"
+        elif child.dep_ == "xcomp" and is_tag(child):
+            # 誤解析: "to"がaux扱いになり、本来のpobjがxcompとして直接ぶら下がる
+            pobj = child
+            prep_text = "to"
+        if pobj is None or pobj.pos_ == "VERB":
+            continue
+        target_label = override or labels.get(prep_text, labels["_default"])
+        real_target = pobj
+        if pobj.lemma_ in SURFACE_WORDS:
+            of_prep = next((c for c in pobj.children if c.dep_ == "prep" and c.text == "of"), None)
+            real_pobj = next((c for c in of_prep.children if c.dep_ == "pobj"), None) if of_prep else None
+            if real_pobj is not None and is_tag(real_pobj):
+                real_target = real_pobj
+                target_label = SURFACE_WORDS[pobj.lemma_] + labels["_default"]
+        for tgt in conj_chain(real_target):
+            if not is_tag(tgt):
+                continue
+            tgt_text = tgt.text
+            # ネストof連鎖の複合化は、"on"/"at"（場所・面を指す前置詞）の
+            # ときだけ行う。"connected to C1 of C3"のような"to"は、場所
+            # ではなく別の独立した構成要素への関係を表すことが多く
+            # （実際に検証claim（187080）で、これも複合化すると
+            # 「半導体チップの第１電極」のような不要な複合ノードが増え、
+            # 元は正解していた単純な「第１電極」との一致が崩れて悪化した）、
+            # ここでは対象外にする。
+            if prep_text in ("on", "at"):
+                of_prep2 = next((c for c in tgt.children if c.dep_ == "prep" and c.text == "of"), None)
+                of_owner = next((c for c in of_prep2.children if c.dep_ == "pobj"), None) if of_prep2 else None
+                if of_owner is not None and is_tag(of_owner) and of_owner.text != tgt.text:
+                    tgt_text = f"{of_owner.text}の{tgt.text}"
+            out.append((tgt_text, target_label))
+    return out
+
+
+def extract_relations(doc):
+    rels = []
+    for verb in doc:
+        # spaCyの小型モデルは、直前に見慣れない大文字タグ（COMPONENT_1等）が
+        # あると、直後の動詞をNOUN/PROPNに誤タグ付けすることがある
+        # （品詞タグより依存関係ラベルの方が安定している）。そのため
+        # 品詞（pos_）では絞らず、「文の述語になり得る位置」
+        # （ROOT・従属節の述語等）かどうかで判定し、実際に動詞かどうかは
+        # 後続の辞書照合（HAS_VERBS等に載っているか）に委ねる。
+        # pcomp: "with X embedded in Y" のような with句の中の分詞構文
+        # （withの補語として動詞が来るケース）も拾う。
+        if verb.dep_ not in ("ROOT", "advcl", "xcomp", "ccomp", "relcl", "acl", "conj", "pcomp"):
+            continue
+        children = list(verb.children)
+        has_auxpass = any(c.dep_ == "auxpass" for c in children)
+        vkey = _verb_key(verb)
+
+        # --- HAS rule（能動: have/comprise/include/contain/use + conjチェーン） ---
+        if vkey in HAS_VERBS and not has_auxpass:
+            subj = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            dobj = next((c for c in children if c.dep_ == "dobj"), None)
+            if dobj is None:
+                # "C4 includes C11 provided on C10..." のように、目的語が
+                # dobjではなくccomp（従属節）の主語として誤解析される
+                # ケースも拾う（"provided"側の関係は別途ccompとして
+                # 独立に処理されるので、ここではC4-含む-C11のリンクだけ補う）。
+                ccomp = next((c for c in children if c.dep_ == "ccomp"), None)
+                if ccomp is not None:
+                    dobj = next((c for c in ccomp.children if c.dep_ == "nsubj" and is_tag(c)), None)
+            if subj is not None and dobj is not None:
+                label = HAS_VERBS[vkey]
+                if any(c.dep_ == "advmod" and c.lemma_ in ("mainly", "primarily") for c in children):
+                    label = "主成分とする"
+                seen_objs = set()
+                for obj in conj_chain(dobj):
+                    if is_tag(obj) and obj.text != subj.text:
+                        rels.append({"source": subj.text, "relation": label, "target": obj.text})
+                        seen_objs.add(obj.text)
+                # "C9 comprises C7 electrically connected to C2... and C8
+                # electrically insulated from C7" のように、2番目以降の
+                # 列挙項目が名詞の並列(dobjのconj)ではなく、修飾する動詞同士の
+                # 並列(HAS動詞自体のconj/advcl)として解析されることがある。
+                # その場合、並列した動詞の主語を列挙項目として拾う。
+                for sib in verb.children:
+                    if sib.dep_ not in ("conj", "advcl"):
+                        continue
+                    sib_subj = next(
+                        (c for c in sib.children if c.dep_ in ("nsubj", "nsubjpass") and is_tag(c)),
+                        None,
+                    )
+                    if sib_subj is not None and sib_subj.text not in seen_objs and sib_subj.text != subj.text:
+                        rels.append({"source": subj.text, "relation": label, "target": sib_subj.text})
+                        seen_objs.add(sib_subj.text)
+            continue
+
+        # --- CONSIST-OF rule（consist of） ---
+        if vkey in CONSIST_OF_VERBS:
+            subj = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            prep = next((c for c in children if c.dep_ == "prep" and c.text == "of"), None)
+            pobj = next((c for c in prep.children if c.dep_ == "pobj"), None) if prep else None
+            if subj is not None and pobj is not None:
+                for obj in conj_chain(pobj):
+                    if is_tag(obj):
+                        rels.append({"source": subj.text, "relation": CONSIST_OF_VERBS[vkey], "target": obj.text})
+            continue
+
+        # --- ACTIVE-PREP rule（communicate with等、dobjを取らない能動動詞） ---
+        if vkey in ACTIVE_PREP_VERBS and not has_auxpass:
+            subj = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            for prep in children:
+                if prep.dep_ != "prep":
+                    continue
+                label = ACTIVE_PREP_VERBS[vkey].get(prep.text)
+                if label is None:
+                    continue
+                pobj = next((c for c in prep.children if c.dep_ == "pobj"), None)
+                if subj is not None and pobj is not None and is_tag(pobj):
+                    rels.append({"source": subj.text, "relation": label, "target": pobj.text})
+            continue
+
+        # --- ACTIVE-TRANSITIVE rule（能動他動詞: nsubj + dobj） ---
+        # "connect"のように能動(ACTIVE_VERB_LABELS)・受身(PASSIVE_VERB_LABELS)
+        # 両方の辞書に載っている動詞がある。nsubj+dobjが揃った「能動」構文の
+        # ときだけこのルールで処理してcontinueする。揃わない場合（例:
+        # 主語のない分詞句 "C7 electrically connected to C2"）は、continueせずに
+        # 下のPASSIVE ruleに処理を委ねる。
+        if vkey in ACTIVE_VERB_LABELS and not has_auxpass:
+            subj = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            dobj = next((c for c in children if c.dep_ == "dobj"), None)
+            if subj is not None and dobj is not None:
+                label = ACTIVE_VERB_LABELS[vkey]
+                series_prep = next(
+                    (c for c in children if c.dep_ == "prep" and any(
+                        g.dep_ == "pobj" and g.lemma_ == "series" for g in c.children)),
+                    None,
+                )
+                if series_prep is not None:
+                    label = "直列に接続される"
+                for obj in conj_chain(dobj):
+                    if is_tag(obj) and obj.text != subj.text:
+                        rels.append({"source": subj.text, "relation": label, "target": obj.text})
+                continue
+
+        # --- CONFIGURE + xcomp rule（is configured to separate等） ---
+        if vkey == "configure" and has_auxpass:
+            nsubjpass = next((c for c in children if c.dep_ == "nsubjpass" and is_tag(c)), None)
+            xcomp = next((c for c in children if c.dep_ in ("xcomp", "advcl") and c.pos_ == "VERB"), None)
+            if nsubjpass is not None and xcomp is not None and xcomp.lemma_ in CONFIGURE_XCOMP_LABELS:
+                inner_dobj = next((c for c in xcomp.children if c.dep_ == "dobj"), None)
+                if inner_dobj is not None and is_tag(inner_dobj):
+                    rels.append({
+                        "source": nsubjpass.text,
+                        "relation": CONFIGURE_XCOMP_LABELS[xcomp.lemma_],
+                        "target": inner_dobj.text,
+                    })
+            continue
+
+        # --- PASSIVE rule（受身: nsubjpass + 前置詞連鎖。surface-of補正込み） ---
+        nsubjpass = next((c for c in children if c.dep_ == "nsubjpass" and is_tag(c)), None)
+        if nsubjpass is None and verb.dep_ == "acl" and is_tag(verb.head):
+            # "C1 comprises at least one C3 configured on C2 of C1." のように、
+            # be動詞も関係代名詞も無い縮約分詞構文（名詞を直接後置修飾する形）
+            # では、この分詞(acl)の主語は常にそれが修飾している名詞そのもの
+            # （UD文法上のacl.head）である。この関係は構造的に一意に決まるので、
+            # verb.headがタグ自身であれば無条件に暗黙の主語として使ってよい。
+            # （最初はこれだけだと"C2"止まりで悪化したが、_scan_passive_targets
+            # 側にネストof連鎖の解消を実装した後は悪化しないことを確認済み。）
+            nsubjpass = verb.head
+        if nsubjpass is None and verb.tag_ in ("VBN", "VBD") and not any(c.dep_ == "dobj" for c in children):
+            # "with C5 embedded in C6" のような、be動詞を伴わない分詞構文
+            # （本来nsubjpassになるはずが、is/wasが省略されているため
+            #  spaCyがnsubjとして解析してしまうケース）も受身として拾う。
+            # tag_はVBN/VBDどちらに解析されるかが不安定なので両方許容する。
+            nsubjpass = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            if nsubjpass is None and verb.dep_ in ("advcl", "acl"):
+                # 主語まで省略された分詞句（"C9 comprises C7 electrically
+                # connected to C2..."のように、"C7 [which is] connected..."の
+                # 主語C7が丸ごと落ちるケース）。この場合、実際の主語は
+                # 親動詞（comprises等）の目的語であることが多いので、それを
+                # 暗黙の主語とみなす。
+                nsubjpass = next(
+                    (c for c in verb.head.children if c.dep_ == "dobj" and is_tag(c)), None
+                )
+        # --- REVERSED-PASSIVE rule（原文は能動だが翻訳で受身化された動詞。
+        # 「容器・全体側」を主語にした能動ラベルでsource/targetを入れ替える） ---
+        if nsubjpass is not None and vkey in REVERSED_PASSIVE_VERB_LABELS:
+            for tgt, target_label in _scan_passive_targets(verb, vkey, None, labels_dict=REVERSED_PASSIVE_VERB_LABELS):
+                if tgt != nsubjpass.text:
+                    rels.append({"source": tgt, "relation": target_label, "target": nsubjpass.text})
+            continue
+
+        if nsubjpass is not None and vkey in PASSIVE_VERB_LABELS:
+            advmod = next((c for c in children if c.dep_ == "advmod"), None)
+            override = PASSIVE_ADVMOD_OVERRIDES.get((vkey, advmod.lemma_)) if advmod else None
+            for tgt, target_label in _scan_passive_targets(verb, vkey, override):
+                if tgt != nsubjpass.text:
+                    rels.append({"source": nsubjpass.text, "relation": target_label, "target": tgt})
+            continue
+
+        # --- COPULA rule（be + acomp [+ prep] : opposite to / higher than 等） ---
+        if vkey == "be":
+            nsubj = next((c for c in children if c.dep_ == "nsubj" and is_tag(c)), None)
+            acomp = next((c for c in children if c.dep_ == "acomp"), None)
+            # spaCyの小型モデルが受身動詞をROOTでなくacomp（形容詞的補語）として
+            # 誤解析することがある（"C4 is disposed on C8"のdisposed等）。
+            # その場合もPASSIVE ruleと同じ要領で処理する。
+            if nsubj is not None and acomp is not None and acomp.pos_ == "VERB":
+                acomp_key = _verb_key(acomp)
+                if acomp_key in PASSIVE_VERB_LABELS:
+                    found = False
+                    for tgt, target_label in _scan_passive_targets(acomp, acomp_key, None):
+                        if tgt != nsubj.text:
+                            rels.append({"source": nsubj.text, "relation": target_label, "target": tgt})
+                            found = True
+                    if found:
+                        continue
+            if nsubj is not None and acomp is not None:
+                if acomp.text in ACOMP_LABELS:
+                    prep = next((c for c in acomp.children if c.dep_ == "prep"), None)
+                    pobj = next((c for c in prep.children if c.dep_ == "pobj"), None) if prep else None
+                    if pobj is not None and is_tag(pobj):
+                        rels.append({"source": nsubj.text, "relation": ACOMP_LABELS[acomp.text], "target": pobj.text})
+                        continue
+                if acomp.text == "capable":
+                    prep = next((c for c in acomp.children if c.dep_ == "prep" and c.text == "of"), None)
+                    pcomp = next((c for c in prep.children if c.dep_ == "pcomp"), None) if prep else None
+                    if pcomp is not None and pcomp.lemma_ in CAPABLE_OF_GERUND_LABELS:
+                        dobj = next((c for c in pcomp.children if c.dep_ == "dobj"), None)
+                        if dobj is not None:
+                            label = CAPABLE_OF_GERUND_LABELS[pcomp.lemma_]
+                            for obj in conj_chain(dobj):
+                                if is_tag(obj):
+                                    rels.append({"source": nsubj.text, "relation": label, "target": obj.text})
+                        continue
+            # COPULA-GENITIVE rule（X is the <attr> of Y → 「の」関係、向きはY→X）
+            attr = next((c for c in children if c.dep_ == "attr"), None)
+            if nsubj is not None and attr is not None:
+                prep = next((c for c in attr.children if c.dep_ == "prep" and c.text == "of"), None)
+                pobj = next((c for c in prep.children if c.dep_ == "pobj"), None) if prep else None
+                if pobj is not None and is_tag(pobj):
+                    rels.append({"source": pobj.text, "relation": "の", "target": nsubj.text})
+                    continue
+            # COPULA-PREP-NOUN-PREP rule（X is in <noun> with Y 等の慣用表現）
+            if nsubj is not None:
+                prep1 = next((c for c in children if c.dep_ == "prep" and c.text in ("in", "into")), None)
+                noun = next((c for c in prep1.children if c.dep_ == "pobj"), None) if prep1 else None
+                if noun is not None and not is_tag(noun):
+                    prep2 = next((c for c in noun.children if c.dep_ == "prep"), None)
+                    pobj2 = next((c for c in prep2.children if c.dep_ == "pobj"), None) if prep2 else None
+                    key = (prep1.text, noun.lemma_, prep2.text if prep2 else None)
+                    label = PREP_NOUN_PATTERNS.get(key)
+                    if label is not None and pobj2 is not None and is_tag(pobj2):
+                        rels.append({"source": nsubj.text, "relation": label, "target": pobj2.text})
+            continue
+    return rels
+
+
+def dedup(rels):
+    seen = set()
+    out = []
+    for r in rels:
+        key = (r["source"], r["relation"], r["target"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def extract_relations_from_text(english_text):
+    """英訳済みテキスト（COMPONENT_N タグ入り）からSAOトリプルを抽出する。"""
+    doc = nlp_en(english_text)
+    return dedup(extract_relations(doc))
+
+
+# ===========================================================================
+# 【統合】translate_sao.py
+# 名前の付け替え: analyze_claim_translate → analyze_claim_translate_llm
+# ===========================================================================
+"""
+translate_sao.py
+=================
+「日本語クレーム → 構成要素をタグ化 → ローカルLLM(Ollama)で英訳
+→ 英語の依存構造解析でSAO抽出 → タグを元の日本語に戻す」方式の
+実装。
+
+10クレームでのオラクル検証（正解ノード分割を使った検証）では
+macro F1 96〜98%程度を確認済み（GiNZA単体では同じクレームで
+macro F1 43.8%）。ただしそれは「ノード分割は完璧」という前提での
+ベストケースなので、この実装（自動タグ付け＋実際のOllama翻訳）での
+end-to-endの精度は必ず eval_translate_sao.py で確認すること。
+
+使い方（自分のPC上、Ollamaが起動している状態で）:
+    pip install spacy ollama
+    python -m spacy download en_core_web_sm
+
+    import sys
+    sys.path.insert(0, "/path/to/real_app")  # patent_pipeline.pyのあるフォルダ
+    ts = sys.modules[__name__]  # 統合後はこのファイル自身
+    components, relations = ts.analyze_claim_translate(claim_text)
+
+タグ形式について:
+    構成要素は日本語原文中では "《C1》" のような記号付きタグに置き換える
+    （LLM翻訳時に「これは翻訳しない特殊トークンだ」と認識されやすいように、
+    通常の英数字だけのタグより機械的に目立つ記号《》を使っている）。
+    英訳後は 《C1》→C1 のように記号を外してからspaCyで解析する
+    （C1のような短い記号のほうが、英語の小型モデルの依存構造解析が
+    安定することを確認済み。COMPONENT_1のような長いタグだと、
+    直後の動詞の解析を誤ることがあった）。
+"""
+import hashlib
+import os
+import re
+import sys
+
+try:
+    import ollama
+except ImportError:  # pragma: no cover
+    ollama = None
+
+try:
+    import deepl
+except ImportError:  # pragma: no cover
+    deepl = None
+
+pass  # （統合済み）import en_relation_rules as err
+
+DEFAULT_MODEL = "qwen2.5:7b"
+
+_TAG_OPEN = "《"
+_TAG_CLOSE = "》"
+# 《C1》が本来の形だが、翻訳モデルが《》の代わりに〈〉や<>、{}を使って
+# しまうことがあるため、フォールバックとして主要な括弧パターンも許容する。
+_BRACKET_TAG_RE = re.compile(r"[《〈<{\[]\s*(C\d+)\s*[》〉>}\]]")
+
+
+def _load_pipeline(pipeline_dir=None):
+    if pipeline_dir:
+        sys.path.insert(0, pipeline_dir)
+    pp = sys.modules[__name__]  # 統合後はこのファイル自身
+    return pp
+
+
+def tag_components(text, pp):
+    """
+    日本語クレームの構成要素をGiNZAで検出し、《C1》のようなタグに
+    置き換えたテキストと、タグ→元のテキストの対応表を返す。
+
+    同じ文字列の構成要素（複数回出てくる「前記半導体チップ」等）には
+    同じタグを割り当てる。重複・入れ子の区間は、テキスト上で先に
+    始まる方を優先し、後から重なる区間は捨てる（貪欲区間スケジューリング）。
+
+    GiNZA単体版（analyze_claim_ginza_only）と同じく、まず
+    _clean_claim_text で表記ゆれを正規化してから解析する
+    （正規化前のテキストのままでは構成要素検出の精度が落ちるため）。
+    戻り値のtagged_textは、この正規化後のテキストをベースにしている。
+    """
+    text = pp._clean_claim_text(text)
+    doc = pp.nlp(text)
+    comps = pp.extract_patent_components_general(doc)
+
+    # 「パワーモジュールの製造方法」のように、クレームタイトル（依存構造上の
+    # ROOT）が「Ｘの＜基本語＞」という所有格付き複合語になっている場合、
+    # GiNZA単体版のextract_has_relations同様、直前の「Ｘの」チェーンを
+    # 含めた最大限の複合語に拡張してから1つのタグにする（532件の検証で、
+    # このタイトル拡張がGiNZA単体版のプレシジョン・リコールの両方を
+    # 改善することを確認済み）。ここでタグ付けの段階で拡張しておかないと、
+    # LLM直接抽出方式ではタイトルの「Ｘ」と「＜基本語＞」が別々の2つのタグ
+    # になってしまい、LLMがどう頑張っても正解データの結合したタイトル名
+    # （例："パワーモジュールの製造方法"）を1つのSubjectとして出力できない。
+    root_token = next((t for t in doc if t.head == t), None)
+    if root_token is not None:
+        for i, c in enumerate(comps):
+            if c["end"] == root_token.i:
+                extended = pp.find_full_title_component(doc, comps, c)
+                if extended is not c:
+                    comps[i] = extended
+                break
+
+    spans = []
+    for c in comps:
+        if c["start"] < 0 or c["end"] < 0 or c["end"] >= len(doc):
+            continue
+        # 「電気的に」「機械的に」のような副詞的表現の語幹（「電気」等）が、
+        # 単独の構成要素として誤検出されることがある。直後が「的」なら
+        # 実体を指す名詞ではないので、タグ化の対象から外す
+        # （タグ化してしまうと「電気的に」が壊れ、英訳が意味不明になる）。
+        if c["end"] + 1 < len(doc) and doc[c["end"] + 1].text == "的":
+            continue
+        # GiNZA/SudachiPyの辞書に「延在する」が複合サ変動詞として登録されて
+        # おらず、「延」(NOUN)＋「在す」(VERB)＋「る」(AUX) に誤分割される
+        # ケースを確認した（「介在する」「点在する」「対向する」「混在する」
+        # 「存在する」等、他の「〜在する」型動詞はすべて正しく1つの動詞
+        # トークンとして解析される中、「延在する」だけがこの誤分割の対象に
+        # なっていた）。この場合、直後のトークンが「在す」で始まるVERBに
+        # なるので、そのパターンを検出したら「延」側は動詞の一部であって
+        # 独立した構成要素ではないため、タグ化の対象から外す
+        # （タグ化すると「延在する」が壊れ、LLM側のSAO抽出で
+        # 「壁部 在する 延」のような意味不明な関係が生成されてしまう）。
+        if (c["end"] + 1 < len(doc)
+                and doc[c["end"] + 1].pos_ == "VERB"
+                and doc[c["end"] + 1].text.startswith("在す")):
+            continue
+        # 「（ａ）」「（ｂ）」の工程ラベル除外は、extract_patent_components_general
+        # 側（patent_pipeline.py）で一元的に対応済み（_is_paren_step_label）。
+        # ここでは重複対応しない。
+        start_char = doc[c["start"]].idx
+        end_tok = doc[c["end"]]
+        end_char = end_tok.idx + len(end_tok.text)
+        spans.append((start_char, end_char, c["text"]))
+
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+
+    text_to_tag = {}
+    next_id = 1
+    chosen = []
+    last_end = -1
+    for start_char, end_char, comp_text in spans:
+        if start_char < last_end:
+            continue
+        if comp_text not in text_to_tag:
+            text_to_tag[comp_text] = f"C{next_id}"
+            next_id += 1
+        chosen.append((start_char, end_char, text_to_tag[comp_text]))
+        last_end = end_char
+
+    chosen.sort(key=lambda s: s[0])
+    pieces = []
+    cursor = 0
+    for start_char, end_char, tag in chosen:
+        pieces.append(text[cursor:start_char])
+        pieces.append(f"{_TAG_OPEN}{tag}{_TAG_CLOSE}")
+        cursor = end_char
+    pieces.append(text[cursor:])
+    tagged_text = "".join(pieces)
+
+    tag_to_text = {tag: comp_text for comp_text, tag in text_to_tag.items()}
+    return tagged_text, tag_to_text, doc, comps
+
+
+_SYSTEM_PROMPT = (
+    "You are a technical patent translator.\n\n"
+    "TASK: Translate the Japanese patent claim text into English. "
+    "Break it into SEPARATE, SIMPLE, GRAMMATICALLY COMPLETE sentences — "
+    "exactly ONE clear subject-verb-object relationship per sentence. "
+    "Never output a bare noun phrase or a phrase missing its verb "
+    "(e.g. never write \"an electrically connected component C4 to C1\" — "
+    "instead write \"C4 is electrically connected to C1.\"). "
+    "Every sentence must have an explicit subject and a real verb "
+    "(is / comprises / has / includes / is connected to / is provided on / "
+    "is inserted into / is embedded in / etc.).\n\n"
+    f"The text contains placeholder tokens shaped exactly like {_TAG_OPEN}C1{_TAG_CLOSE}, "
+    f"{_TAG_OPEN}C2{_TAG_CLOSE}, etc. — note the brackets are {_TAG_OPEN} and {_TAG_CLOSE} "
+    "(NOT angle brackets < >, NOT 〈 〉, NOT parentheses). "
+    f"Copy every such token EXACTLY as it appears, including the {_TAG_OPEN}{_TAG_CLOSE} "
+    "brackets and the number — never translate, reorder, merge, or drop them, never change "
+    "the bracket characters, and never invent new ones.\n\n"
+    "IMPORTANT — Japanese patent claims typically name the overall device/apparatus "
+    "as its OWN tagged token at the very END of the claim, right before the final "
+    "\"。\" (e.g. \"...を備え、(details)、"
+    f"{_TAG_OPEN}C9{_TAG_CLOSE}。\" — here {_TAG_OPEN}C9{_TAG_CLOSE} IS the device). "
+    "You MUST NOT drop or ignore this final tag. Whenever earlier text lists items "
+    "with \"を備え\"/\"を有し\"/\"を含み\" (comprising/having/including), output an "
+    "explicit sentence naming that final device tag as the subject, e.g. "
+    f"\"{_TAG_OPEN}C9{_TAG_CLOSE} comprises ...\" listing the top-level items that "
+    "were introduced with \"を備え\" — never silently omit this sentence just because "
+    "the tag happens to sit at the end of the Japanese sentence.\n\n"
+    "EXAMPLE 1\n"
+    f"Input: {_TAG_OPEN}C1{_TAG_CLOSE}と{_TAG_OPEN}C2{_TAG_CLOSE}とを有する"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE}と、前記{_TAG_OPEN}C3{_TAG_CLOSE}の前記{_TAG_OPEN}C1{_TAG_CLOSE}"
+    f"に電気的に接続された{_TAG_OPEN}C4{_TAG_CLOSE}と、を備える装置。\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} comprises {_TAG_OPEN}C1{_TAG_CLOSE} and "
+    f"{_TAG_OPEN}C2{_TAG_CLOSE}. "
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} is electrically connected to the "
+    f"{_TAG_OPEN}C1{_TAG_CLOSE} of {_TAG_OPEN}C3{_TAG_CLOSE}.\n\n"
+    "EXAMPLE 2 (the device itself is a tagged token at the end — the common case)\n"
+    f"Input: {_TAG_OPEN}C1{_TAG_CLOSE}と、{_TAG_OPEN}C2{_TAG_CLOSE}とを備え、"
+    f"前記{_TAG_OPEN}C1{_TAG_CLOSE}は{_TAG_OPEN}C3{_TAG_CLOSE}を含み、"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE}。\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} comprises {_TAG_OPEN}C1{_TAG_CLOSE} and "
+    f"{_TAG_OPEN}C2{_TAG_CLOSE}. "
+    f"{_TAG_OPEN}C1{_TAG_CLOSE} includes {_TAG_OPEN}C3{_TAG_CLOSE}.\n\n"
+    "EXAMPLE 3 (two coordinated items, EACH with its own modifier, both "
+    "belonging to the SAME containing 'includes' list — do not merge them "
+    "into one sentence, and do not drop either item)\n"
+    f"Input: 前記{_TAG_OPEN}C1{_TAG_CLOSE}に電気的に接続された{_TAG_OPEN}C2{_TAG_CLOSE}と"
+    f"前記{_TAG_OPEN}C2{_TAG_CLOSE}から電気的に絶縁された{_TAG_OPEN}C3{_TAG_CLOSE}とを含む"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE}と、を備え、\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} includes {_TAG_OPEN}C2{_TAG_CLOSE} and "
+    f"{_TAG_OPEN}C3{_TAG_CLOSE}. "
+    f"{_TAG_OPEN}C2{_TAG_CLOSE} is electrically connected to {_TAG_OPEN}C1{_TAG_CLOSE}. "
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} is electrically insulated from {_TAG_OPEN}C2{_TAG_CLOSE}.\n"
+    "(Note: the WRONG way to translate this — do not do this — would be to "
+    f"write something like \"{_TAG_OPEN}C4{_TAG_CLOSE} comprises {_TAG_OPEN}C1{_TAG_CLOSE} "
+    f"that is connected to {_TAG_OPEN}C2{_TAG_CLOSE}\", which drops "
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} entirely and puts the wrong tag as the object of "
+    "'comprises'. Always give the containing item — here "
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} — BOTH coordinated tags as its direct objects in "
+    "one sentence, then describe each one's own modifier in its own separate "
+    "sentence.)\n\n"
+    "Output ONLY the translated English text as plain sentences separated by "
+    "periods, nothing else (no bullet points, no numbering, no explanations)."
+)
+
+
+_CHUNK_MAX_TAGS = 4  # 1回のOllama呼び出しに含めるタグ数の目安上限
+
+
+def _split_into_chunks(tagged_text, max_tags=_CHUNK_MAX_TAGS):
+    """
+    タグ付き原文を、Ollamaに一度に渡すタグ数を抑えるため、節境界の「、」で
+    分割する（タグ数が多いクレームほど、1回の翻訳呼び出しで主語の取り違えや
+    列挙の脱落が起きやすいことが確認されたため）。
+
+    分割候補として使えるのは、直前の文字が「》」ではない「、」だけにする。
+    「《C1》と、《C2》とを備え、」の「と、」や「…を含み、」「…されている、」
+    のような動詞の連用形＋「、」はここで切ってよいが、
+    「《C6》、《C7》および《C8》」のようにタグの直後にそのまま「、」が続く
+    並列列挙の区切りは分割点にしない（そこで切ると列挙が分断され、
+    片方のチャンクだけでは意味が通らなくなるため）。
+
+    もう一つ避けるべきパターンがある。「《C1》と、《C2》と、を備え、」の
+    ように、列挙の最後の項目の直後の「と、」で切ってしまうと、「を備え」
+    という動詞だけが主語（列挙全体）を失って次のチャンクの先頭に取り残され、
+    翻訳がおかしくなる（実際に確認済み）。そこで、「、」の直後（空白・改行を
+    除く）が「を＋動詞＋、」の形（「を備え、」「を有し、」「を含み、」等）で
+    始まっている場合は分割点にしない。この「を〜、」自体はその内側にある
+    独立した「、」で後から切れるので、結果的に「列挙＋を備え」の部分が
+    ひとまとまりのチャンクになる（なお、この「Ｘを備える」というクレーム
+    全体を貫く関係は、GiNZA単体版から借用する既存ロジックで別途正しく
+    補完されるので、翻訳チャンク側で多少ぶつ切りになっても実害は無い）。
+
+    実際に切るのは、直前の分割位置からのタグ数がmax_tags以上になった
+    候補点だけ（タグ数が少ない間はまとめた方が文脈が保たれ、翻訳品質が
+    上がるため）。候補が無い、またはタグ数がmax_tags未満の短いクレームは
+    分割せず1チャンクのまま返す＝1回のOllama呼び出しのみで、従来と同じ
+    挙動になる。
+    """
+    _VERB_CONTINUATION_RE = re.compile(r"^\s*を[^\s《》、。]{1,6}、")
+    # 「Ａ、Ｂおよび《Ｃ》と、《Ｄ》との間に位置する」のように、列挙の
+    # 締めの「と、」の直後が「を＋動詞」ではなく、さらに別のタグへの
+    # 「タグとの」（比較・位置関係の格助詞）に続く場合も、動詞（位置する等）
+    # から見た主語側の列挙が丸ごと切り離されてしまう（実際に特開2025-188284で
+    # 確認済み：「間に位置する」の対象タグが翻訳から丸ごと消えた）。
+    # この場合も分割点にしない。
+    _AND_CONTINUATION_RE = re.compile(r"^\s*(前記)?《[^》]+》との")
+
+    candidates = []
+    for m in re.finditer("、", tagged_text):
+        pos = m.start()
+        if pos > 0 and tagged_text[pos - 1] == _TAG_CLOSE:
+            continue  # タグ直後の「、」は並列列挙の区切りなのでスキップ
+        if pos > 0 and tagged_text[pos - 1] == "は":
+            continue  # 「Ｘは、」の直後は、まだ述語が来ていない主題化直後なのでスキップ
+        if _VERB_CONTINUATION_RE.match(tagged_text[pos + 1:]):
+            continue  # 「と、を備え、」のように、直後が列挙をまとめる動詞の続きならスキップ
+        if _AND_CONTINUATION_RE.match(tagged_text[pos + 1:]):
+            continue  # 「と、《Ｄ》との間に…」のように、直後が別タグへの「との」続きならスキップ
+        candidates.append(pos + 1)
+
+    if not candidates:
+        return [tagged_text]
+
+    chunks = []
+    chunk_start = 0
+    for cut in candidates:
+        n_tags = len(_BRACKET_TAG_RE.findall(tagged_text[chunk_start:cut]))
+        if n_tags >= max_tags:
+            chunks.append(tagged_text[chunk_start:cut])
+            chunk_start = cut
+    if chunk_start < len(tagged_text):
+        chunks.append(tagged_text[chunk_start:])
+
+    # タグを一つも含まないチャンク（末尾の「。」だけ等）は単独でOllamaに
+    # 渡す意味が無いので、前のチャンクに吸収する
+    merged = []
+    for c in chunks:
+        if merged and len(_BRACKET_TAG_RE.findall(c)) == 0:
+            merged[-1] += c
+        else:
+            merged.append(c)
+
+    return merged if merged else [tagged_text]
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+# チャンク分割（_split_into_chunks）によって節の途中で切れた入力を、
+# モデル（特にShisa V2.1等）が「入力が不完全に見える」と判断し、
+# 翻訳本文の中に "(Note: The original Japanese text seems incomplete...)"
+# のような注釈を混入させることがある（特開2025-174033/2023-126262の
+# 実運用ログで確認済み）。この注釈は本来のシステムプロンプトの指示
+# （「翻訳された英語テキストのみを出力する」）に反しており、これが
+# そのまま英語の依存構造解析に渡ると、注釈内の単語（"incomplete"
+# "specification"等）から無関係なSAOが誤抽出されてしまうため、
+# 英語解析にかける前に除去する。
+_NOTE_BLOCK_RE = re.compile(r"[\(\[]\s*note\s*:.*?[\)\]]", re.IGNORECASE | re.DOTALL)
+
+
+# 特開2025-175399のように、正極側／負極側のような対称構造が何度も
+# 繰り返される複雑なクレームでは、タグの種類・数が多くなり、ローカルの
+# 小型モデル（qwen2.5:7b等）が同じような関係を延々と繰り返し出力する
+# 「繰り返しループ」に陥ることがある（実運用ログで、この請求項でだけ
+# eval_translate_sao.pyが応答なしのまま止まることを確認済み）。
+# ollamaパッケージのデフォルトはtimeout=None（＝無制限に待つ）ため、
+# こうなると1件のクレームで処理全体が無期限に固まってしまう。
+# num_predictで生成トークン数の上限を設け、さらにHTTPタイムアウトも
+# 設定することで、異常な1件のせいで全体が止まることを防ぐ
+# （eval_translate_sao.py側は元々1件ごとにtry/exceptで囲んであるが、
+# 例外が飛んでこない＝ハングする限り、そのtry/exceptは機能しない。
+# タイムアウトを設定して初めて、ハングが「例外」に変換され、
+# 既存のtry/exceptが機能するようになる）。
+_OLLAMA_REQUEST_TIMEOUT_SECONDS = 400
+_OLLAMA_MAX_OUTPUT_TOKENS = 1200
+# 【追記】特開2025-175399は180秒でも間に合わずタイムアウトしていた
+# （実運用ログで確認）。この請求項はスキップされず結果が欲しいとの
+# 要望のため、180→400秒に延長した。
+
+
+def _ollama_chat(system_prompt, user_text, model=DEFAULT_MODEL, host=None):
+    """
+    Ollamaへの低レベル呼び出しを共通化したヘルパー。
+    translate_tagged（タグ付き日本語→英訳）と、analyze_claim_llm_direct
+    （タグ付き日本語→SAO直接抽出）の両方から使う。
+    """
+    if ollama is None:
+        raise RuntimeError(
+            "ollamaパッケージが見つかりません。`pip install ollama` を実行し、"
+            "Ollamaサーバー（`ollama serve`）を起動してください。"
+        )
+    client = ollama.Client(host=host, timeout=_OLLAMA_REQUEST_TIMEOUT_SECONDS)
+    kwargs = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        options={"temperature": 0, "num_predict": _OLLAMA_MAX_OUTPUT_TOKENS},
+    )
+    # Qwen3系（Shisa V2.1等）はデフォルトで「思考モード」が有効で、実際の
+    # 回答の前に長い<think>...</think>推論ブロックを出力する。これが
+    # 長すぎると、回答本体を出す前にトークン上限に達してcontentが
+    # 空文字列になることがある（実際に確認済み：188284等で英訳が空）。
+    # think=Falseで思考モード自体を止めるのが第一の対策。
+    # 古いollamaや、この設定に対応していないモデルではエラーになりうる
+    # ので、その場合は思考モードありのままフォールバックする。
+    try:
+        response = client.chat(**kwargs, think=False)
+    except TypeError:
+        response = client.chat(**kwargs)
+    content = response["message"]["content"]
+    # think=Falseが効かない/未対応のモデルでも、<think>ブロックが
+    # contentに残ったまま返ってくることがあるため、念のため除去する
+    # （除去しないとその推論文がそのまま後段の解析に渡り、
+    # 無関係なSAOが大量に誤抽出されてしまう）。
+    content = _THINK_BLOCK_RE.sub("", content).strip()
+    # 上記_NOTE_BLOCK_RE参照：チャンクが節の途中で切れたことに対する
+    # モデル自身の注釈文を除去する。
+    content = _NOTE_BLOCK_RE.sub("", content).strip()
+    return content
+
+
+def translate_tagged(tagged_text, model=DEFAULT_MODEL, host=None):
+    return _ollama_chat(_SYSTEM_PROMPT, tagged_text, model=model, host=host)
+
+
+_DEEPL_TAG_OPEN_RE = re.compile(r"《(C\d+)》")
+_DEEPL_PLACEHOLDER_RE = re.compile(r"<(C\d+)\s*/>")
+
+
+def translate_tagged_deepl(tagged_text, api_key=None, target_lang="EN-US"):
+    """
+    Ollamaの代わりにDeepL API（無料枠あり、1回だけ課金なしで合計100万文字まで
+    利用可能なDeepL API Developerプランを想定）で翻訳する。
+    DeepLは専用の機械翻訳エンジンなので、Ollamaの小型LLMのように「タグを
+    翻訳するな」という指示を無視したり<think>ブロックで潰れたりする心配が
+    ない一方、DeepL自身はプレーンテキスト中の《C1》のような記号を自然に
+    保持する保証はないため、DeepLの「XMLタグ処理」機能
+    （https://developers.deepl.com/docs/resources/examples-and-guides/placeholder-tags）
+    を使い、《C1》を自己完結型のXMLタグ<C1/>に変換してから渡し、
+    訳文中でDeepLが位置を保ったまま返してくる<C1/>を《C1》に戻す。
+    """
+    if deepl is None:
+        raise RuntimeError(
+            "deeplパッケージが見つかりません。`pip install deepl` を実行してください。"
+        )
+    api_key = api_key or os.environ.get("DEEPL_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "DeepL APIキーが必要です。https://www.deepl.com/ja/your-account/keys で取得した"
+            "キーを環境変数 DEEPL_API_KEY に設定するか、api_key引数で渡してください。"
+        )
+    translator = deepl.Translator(api_key)
+    xml_text = _DEEPL_TAG_OPEN_RE.sub(lambda m: f"<{m.group(1)}/>", tagged_text)
+    result = translator.translate_text(
+        xml_text, source_lang="JA", target_lang=target_lang, tag_handling="xml",
+    )
+    return _DEEPL_PLACEHOLDER_RE.sub(lambda m: f"{_TAG_OPEN}{m.group(1)}{_TAG_CLOSE}", result.text)
+
+
+def strip_bracket_tags(english_text):
+    """《C1》 → C1 （英語側の依存構造解析にかける前の整形）"""
+    return _BRACKET_TAG_RE.sub(lambda m: m.group(1), english_text)
+
+
+def extract_relations_from_english(english_text):
+    """
+    英訳済みテキスト（《C1》タグ入り、または既にC1形式）からSAOを抽出する。
+    文単位で解析する（文をまたいだ誤った係り受けを避けるため）。
+    """
+    clean = strip_bracket_tags(english_text)
+    doc = nlp_en(clean)
+    rels = []
+    for sent in doc.sents:
+        rels.extend(extract_relations(sent.as_doc()))
+    return dedup(rels)
+
+
+# ============================================================
+# 日本語タグ付きテキストからLLMに直接SAOを抽出させる方式
+# ============================================================
+# 「タグ付き日本語→英訳→英語で依存構造解析」という2段階では、英訳自体が
+# 「Ａを備えたＢ」の主語・目的語を取り違えたり、「工程」を"device"に
+# 変換したりするなど、SAO抽出の前段で不可逆な変形を起こしてしまうことが
+# 判明した（特開2025-174033等の実運用ログで確認）。この誤差は翻訳段と
+# 抽出段の2つが混ざったものであり、「LLM単独のSAO抽出精度」を測っている
+# とは言えない。そこで、英訳を完全に外し、タグ付き日本語テキストを
+# そのままLLMに渡してSAOを直接出力させる方式を用意する。
+_SAO_EXTRACTION_PROMPT = (
+    "あなたは特許請求項の構造解析器です。タグ付き日本語テキストから\n"
+    "SAO（Subject-Action-Object）関係だけを抽出してください。\n"
+    "\n"
+    "【出力形式】\n"
+    "1行に1関係、次の形式のみで出力する（他の文章・説明・見出し・番号付けは\n"
+    "一切出力しない）：\n"
+    "《タグ》 | 関係語 | 《タグ》\n"
+    "\n"
+    "【SAOのルール】\n"
+    "1. SubjectとObjectは、必ずテキスト中の《C1》のようなタグそのものを使う\n"
+    "   （タグの内容を書き換えたり、タグ以外の語をSubject/Objectにしたり\n"
+    "   しない）。\n"
+    "2. 「AをBに備える／有する／含む／具備する」は\n"
+    "   B | 備える | A の向きにする（備える主体が常にSubject。AとBを\n"
+    "   取り違えない）。\n"
+    "3. 「Aに設けられたB」「Aに接続されたB」のような修飾関係は\n"
+    "   B | 設けられる | A のように、修飾されている側（B）をSubjectにする。\n"
+    "4. 「前記A」は同一請求項内の同じAを指すので、Aと同じタグを使う。\n"
+    "5. 工程名（〜工程）も他の構成要素と全く同じ扱いにする（品詞や種類を\n"
+    "   勝手に変換・言い換えない）。\n"
+    "6. 原文に明示的に書かれている関係だけを抽出し、推測や補完で関係を\n"
+    "   追加しない。\n"
+    "7. SubjectとObjectの向きを変更しない。関係語は元の日本語の動詞・\n"
+    "   表現をできるだけそのまま使う（言い換えない）。\n"
+    "8. 「Ａに（おいて）Ｂを形成する／設ける／配置する／注入する」のように、\n"
+    "   場所・対象Ａに対して新たにＢを作る・置くという能動文の場合は、\n"
+    "   Ｂ | 形成される（またはその動詞の受動形） | Ａ の向きにする\n"
+    "   （ルール3の能動文バージョン）。ただし、これは「〜する工程」\n"
+    "   「〜すること」を置き換えるのではなく追加する処理である。\n"
+    "   「装置は〜する工程を備える」のように工程・処理全体を備える／含む\n"
+    "   の対象にしている記述があれば、そのタグ | 備える（または含む） | \n"
+    "   工程のタグ の関係は必ず出力し、その上で、工程の内容にある\n"
+    "   タグ同士の関係も原文にある範囲で追加で抽出する（両方を出す。\n"
+    "   工程・処理を分解したからといって、備える／含むの関係を省略しない）。\n"
+    "9. 「ＡはＢより／よりも大きい／小さい／高い／低い」のような比較文は、\n"
+    "   Ａ | （原文の比較語をそのまま） | Ｂ の1関係として出力する\n"
+    "   （比較語を「大きい」→「多い」等に言い換えない）。\n"
+    "10. 同じSubject・Objectのタグの組に対して、意味が同じ関係を\n"
+    "    言い換えて複数回出力しない（1つのタグの組につき、原文に基づく\n"
+    "    関係は基本的に1つ）。例えば「Ｃ５は前記開口部により前記Ｃ３に\n"
+    "    対して位置決めされており」という原文に対して、\n"
+    "    Ｃ５|位置決めされる|Ｃ３ を既に出力したら、同じＣ５とＣ３の組に\n"
+    "    対して Ｃ５|配置される|Ｃ３ のような言い換えを追加で出力しない。\n"
+    "    比較文（ルール9）でも同様に、「ＡはＢより小さい」を\n"
+    "    Ａ|より小さい|Ｂ として出力したら、逆方向の Ｂ|より大きい|Ａ を\n"
+    "    重複して追加で出力しない（原文に書かれている向きの1関係だけでよい）。\n"
+    "11. 「Ａと、Ｂと、Ｃとを備え（有し／含み）、…（Ａ・Ｂ・Ｃの説明が続く）…、\n"
+    "    Ｄ。」のように、複数の要素をまず列挙してから「を備え」等で結び、\n"
+    "    実際の主体（備える側）Ｄがクレームの最後（末尾のタグ、通常は句点\n"
+    "    の直前）に1回だけ出てくる構造がある。この場合、Ｄ|備える|Ａ、\n"
+    "    Ｄ|備える|Ｂ、Ｄ|備える|Ｃ のように、末尾のＤを備える主体にする\n"
+    "    （列挙の途中に出てくるＡやＢを誤って備える主体にしない）。\n"
+    "    重要：この「末尾のＤを主体にする」のは、冒頭の列挙＋備える／\n"
+    "    有する／含むの関係だけに適用する。その後に続く別の文（例：\n"
+    "    「前記Ｃの一部は…との間に位置する」）には、Ｄを主体として\n"
+    "    使わない。それらの文の主体は、その文中に明示されている\n"
+    "    「前記Ｘ」等のタグをそのまま使う。同じ関係（同じ意味の\n"
+    "    Subject-Object）を、Ｄを主体にしたものと、本来の主体にした\n"
+    "    ものの両方で重複して出力しない。\n"
+    "12. 原文の文・読点区切りの記述を1つも読み飛ばさない。「前記Ｘは、\n"
+    "    Ｙ、Ｚを含み」のような短い記述も、他の複雑な記述と同じように\n"
+    "    必ず関係を抽出する（前後に複雑な記述があっても、この種の単純な\n"
+    "    記述を省略しない）。\n"
+    "\n"
+    "EXAMPLE 1\n"
+    f"Input: {_TAG_OPEN}C1{_TAG_CLOSE}と{_TAG_OPEN}C2{_TAG_CLOSE}とを有する"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE}と、前記{_TAG_OPEN}C3{_TAG_CLOSE}の前記{_TAG_OPEN}C1{_TAG_CLOSE}"
+    f"に電気的に接続された{_TAG_OPEN}C4{_TAG_CLOSE}と、を備える装置。\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} | 有する | {_TAG_OPEN}C1{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} | 有する | {_TAG_OPEN}C2{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} | 電気的に接続される | {_TAG_OPEN}C1{_TAG_CLOSE}\n"
+    "\n"
+    "EXAMPLE 2（ルール8・9）\n"
+    f"Input: 前記{_TAG_OPEN}C1{_TAG_CLOSE}の表面に{_TAG_OPEN}C2{_TAG_CLOSE}を形成することと、"
+    f"前記{_TAG_OPEN}C3{_TAG_CLOSE}の{_TAG_OPEN}C4{_TAG_CLOSE}は、前記{_TAG_OPEN}C5{_TAG_CLOSE}"
+    f"の{_TAG_OPEN}C6{_TAG_CLOSE}よりも小さい。\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C2{_TAG_CLOSE} | 形成される | {_TAG_OPEN}C1{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C4{_TAG_CLOSE} | より小さい | {_TAG_OPEN}C6{_TAG_CLOSE}\n"
+    "\n"
+    "EXAMPLE 3（ルール11・12：列挙してから末尾で主体が示される構造、"
+    "その後の文では末尾のタグを使い回さない、単純な記述も省略しない）\n"
+    f"Input: {_TAG_OPEN}C1{_TAG_CLOSE}と、前記{_TAG_OPEN}C1{_TAG_CLOSE}に配置された"
+    f"{_TAG_OPEN}C2{_TAG_CLOSE}と、{_TAG_OPEN}C3{_TAG_CLOSE}と、を備え、"
+    f"前記{_TAG_OPEN}C3{_TAG_CLOSE}は、{_TAG_OPEN}C4{_TAG_CLOSE}および"
+    f"{_TAG_OPEN}C5{_TAG_CLOSE}を含み、"
+    f"前記{_TAG_OPEN}C2{_TAG_CLOSE}の一部は、前記{_TAG_OPEN}C4{_TAG_CLOSE}との間に位置する、"
+    f"{_TAG_OPEN}C6{_TAG_CLOSE}。\n"
+    "Output:\n"
+    f"{_TAG_OPEN}C6{_TAG_CLOSE} | 備える | {_TAG_OPEN}C1{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C6{_TAG_CLOSE} | 備える | {_TAG_OPEN}C2{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C6{_TAG_CLOSE} | 備える | {_TAG_OPEN}C3{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C2{_TAG_CLOSE} | 配置される | {_TAG_OPEN}C1{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} | 含む | {_TAG_OPEN}C4{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C3{_TAG_CLOSE} | 含む | {_TAG_OPEN}C5{_TAG_CLOSE}\n"
+    f"{_TAG_OPEN}C2{_TAG_CLOSE} | 間に位置する | {_TAG_OPEN}C4{_TAG_CLOSE}\n"
+    "（最後の文の主体は前記C2＝文中に明示されたタグであり、末尾のC6を\n"
+    "ここで使い回して「C6|間に位置する|C4」のように出力してはいけない）\n"
+)
+
+
+_SAO_LINE_RE = re.compile(
+    r"[《\[<{]\s*(C\d+)\s*[》\]>}]\s*[|｜]\s*(.+?)\s*[|｜]\s*[《\[<{]\s*(C\d+)\s*[》\]>}]"
+)
+
+
+def extract_relations_from_llm_output(llm_output, tag_to_text):
+    """
+    _SAO_EXTRACTION_PROMPTで指示した「《タグ》 | 関係語 | 《タグ》」形式の
+    出力行をパースし、タグを元のテキストに戻したSAOリストを返す。
+
+    形式に従わない行（説明文の混入等）は無視する（パースできる行だけを
+    採用する、というfail-soft方針。英訳経由の方式と同じく、原文に無い
+    説明文が混ざっても後段の評価に影響しないようにするため）。
+    """
+    relations = []
+    seen = set()
+    for line in llm_output.splitlines():
+        m = _SAO_LINE_RE.search(line)
+        if not m:
+            continue
+        source_tag, relation_text, target_tag = m.groups()
+        source = tag_to_text.get(source_tag)
+        target = tag_to_text.get(target_tag)
+        if source is None or target is None:
+            continue
+        relation_text = relation_text.strip()
+        if not relation_text or source == target:
+            continue
+        key = (source, relation_text, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        relations.append({"source": source, "relation": relation_text, "target": target, "type": "llm_direct"})
+    return relations
+
+
+def analyze_claim_translate_llm(text, pipeline_dir=None, model=DEFAULT_MODEL, host=None, pp=None,
+                             debug=False, debug_out=None, max_tags_per_chunk=_CHUNK_MAX_TAGS,
+                             backend="ollama", deepl_api_key=None):
+    """
+    日本語クレームテキストを渡すと (構成要素リスト, 関係リスト) を返す。
+    patent_pipeline.analyze_claim_ginza_only と同じ戻り値の形なので、
+    既存の evaluate_triples / batch_evaluate にそのまま渡せる。
+
+    タグ数が多いクレーム（目安でmax_tags_per_chunkを超える）は、
+    _split_into_chunks で節境界ごとに分割し、それぞれ個別に翻訳させてから
+    結果を連結する（1回の翻訳呼び出しに含まれるタグ数が多いと、主語の
+    取り違えや列挙の脱落が起きやすいことが確認されたため）。
+    タグ数が少ないクレームは分割されず、1回の呼び出しのみ。
+
+    backend="ollama"（デフォルト）ならローカルのOllamaモデルを、
+    backend="deepl"なら課金なしで使えるDeepL API（DEEPL_API_KEY環境変数、
+    またはdeepl_api_key引数でキーを指定）を使って翻訳する。
+
+    debug_out に辞書を渡すと、タグ付き原文・分割チャンク・英訳・タグ対応表を
+    書き込む（Streamlit等、printではなく画面表示したい呼び出し元向け）。
+    """
+    pp = pp or _load_pipeline(pipeline_dir)
+    tagged_text, tag_to_text, tag_doc, tag_comps = tag_components(text, pp)
+
+    chunks = _split_into_chunks(tagged_text, max_tags=max_tags_per_chunk)
+    if backend == "deepl":
+        english_parts = [translate_tagged_deepl(c, api_key=deepl_api_key) for c in chunks]
+    else:
+        english_parts = [translate_tagged(c, model=model, host=host) for c in chunks]
+    english = " ".join(p.strip() for p in english_parts if p and p.strip())
+
+    if debug:
+        print("---タグ付き原文---", tagged_text, sep="\n")
+        if len(chunks) > 1:
+            print(f"---{len(chunks)}個のチャンクに分割して翻訳---")
+            for i, c in enumerate(chunks, 1):
+                print(f"[chunk {i}] {c}")
+        print("---英訳---", english, sep="\n")
+    if debug_out is not None:
+        debug_out["tagged_text"] = tagged_text
+        debug_out["chunks"] = list(chunks)
+        debug_out["english"] = english
+        debug_out["tag_to_text"] = dict(tag_to_text)
+    raw_rels = extract_relations_from_english(english)
+
+    _TAG_TOKEN_RE = re.compile(r"C\d+")
+
+    def _resolve_tag_text(s):
+        # 通常は"C1"のような単一タグだが、en_relation_rules._scan_passive_targets
+        # が「C2 of C1」のようなネストした属格を「C1のC2」という複合タグ文字列
+        # として返すことがある。dict.get一発ではこの複合形を素通りさせてしまう
+        # ため、文字列内のタグをすべて正規表現で個別に置換する
+        # （単一タグの場合も同じ結果になるので後方互換）。
+        return _TAG_TOKEN_RE.sub(lambda m: tag_to_text.get(m.group(0), m.group(0)), s)
+
+    mapped = []
+    seen = set()
+    for r in raw_rels:
+        source = _resolve_tag_text(r["source"])
+        target = _resolve_tag_text(r["target"])
+        if source == target:
+            continue
+        key = (source, r["relation"], target)
+        if key in seen:
+            continue
+        seen.add(key)
+        mapped.append({"source": source, "relation": r["relation"], "target": target, "type": "translate"})
+
+    return _apply_ginza_fallback_and_normalize(text, mapped, pp, tag_doc, tag_comps, tag_to_text)
+
+
+# ============================================================
+# 【実験2】条件付きGiNZA（検証型）
+# ============================================================
+# 532件のbaseline結果を分析した結果、ginza_has_fallback|有する候補の
+# Precisionを下げている主因は「構成要素数」ではなく「同一請求項内での
+# 候補数（gh_n）」であることが判明した（gh_n 1〜8ではPrecision 68〜94%、
+# gh_n 16以上の13件だけでPrecisionが25.3%まで落ち、しかもこの13件が
+# 候補総数1208件のうち482件（約40%）を占めていた）。
+# 単純に「gh_n>=16なら候補を全削除」するだけでもMICRO F1は改善する
+# （+0.6pt、Recall低下は-1.2pt）が、その13件の中にも約36%は正しい候補が
+# 含まれているため、削除ではなくLLMに個別確認させる「検証型」の方が
+# Recallの犠牲をさらに抑えられる可能性がある、という南々香さんの判断で
+# こちらを採用する。
+_RISK_VERIFY_TYPE = "ginza_has_fallback"
+_RISK_VERIFY_RELATION = "有する"
+_DEFAULT_RISK_THRESHOLD = 16  # 上記分析に基づく既定値（gh_n>=16件で検証対象とする）
+
+# ============================================================
+# 【実験8】ginza_has_fallback|有するのfan-out型検証（1請求項の総数ではなく、
+# 1つのsourceが何個の別々のtargetに繋がっているかで見る）
+# ============================================================
+# 実験2のgh_n（1請求項あたりのginza_has_fallback|有する候補の総数）は粗い
+# 指標で、532件中わずか13件（gh_n>=16）しか捕まえられない。しかし実際の
+# FP事例（「係合爪の各々」が「第１部材」「第２部材」「係合爪」「係合部」
+# 「側壁」「半導体装置」の6つに、「外部端子」が「ベースプレート」
+# 「絶縁基板」「絶縁板」「導体パターン」の4つに、それぞれ「有する」で
+# 繋がってしまう、といったケース）を精査したところ、gh_nが16未満の請求項
+# でも、1つのsourceが同じ請求項内で何個の別々のtargetと「有する」で
+# 繋がっているか（fan-out数）で見ると、精度が急落することが判明した。
+# 532件全体（GiNZAのraw候補×gold_sao_532_merged.jsonとの突き合わせによる
+# シミュレーション）: fan-out=1で55.9%、2で66.5%、3で53.1%、4で49.2%、
+# 5で27.3%、6以上で20.9%。gh_n（請求項全体の総数）とは独立した、より
+# 細かい粒度のリスク指標であり、両方を併用できる（_verify_risky_candidates_
+# in_listが同じ(type,relation)に対する複数ルールの発火をrisky_idxの
+# 和集合として扱うため）。
+# デフォルトはverify_fanout=False（無効）のため、実験1〜7のbaseline
+# 再現性には影響しない。実際のF1への効果は、gh_n同様Ollamaでの532件本番
+# 評価でのみ確定できる（ここでのシミュレーションは「raw候補×gold」の
+# 突き合わせであり、LLM無言／一致／矛盾の分類を経た実際の採用候補数とは
+# 厳密には異なるため、参考値として扱うこと）。
+_DEFAULT_FANOUT_RISK_THRESHOLD = 3  # 上記分析に基づく既定値（同一source→3個以上の異なるtargetで検証対象とする）
+
+# ============================================================
+# 【実験3】検証型の対象を、ginza_has_fallback|有する以外にも拡張
+# ============================================================
+# 「削除するか残すかの0/1」ではなく、危険な(type, 関係語)を見つけたら
+# 同じ「LLMに再確認させる」処理を適用する、という考え方に基づく。
+# 532件baselineの精査（実験2の直前に実施）で見つかった、他に検証型が
+# 有効そうな候補：
+#   ・claim_title_ginza|有する：gh_nと同じ「1請求項あたりの候補数」で見ると、
+#     全体は75.5%と健全だが、候補数14件以上の12クレームだけPrecisionが
+#     54.0%まで落ちる（gh_nほど極端ではないが、同じ形の偏りがある）。
+#     単純削除では常にF1が悪化することを確認済みなので、検証型で狙う。
+#   ・attribute|の（Xの深さ、のような出自関係）：全体でPrecision53.5%だが、
+#     候補数1件のクレームでも52.6%と、gh_nと違って「量が多いから危険」
+#     ではなく最初から一様に怪しい。なので閾値は1（＝出現したら常に検証）。
+#   ・llm_direct（LLM自身の直接抽出）側にも、文脈非依存でほぼ誤りな
+#     関係語がある：「超える」（10.0%）「方向」（37.5%）「より小さい」
+#     （55.6%）「位置する」（67.4%）。数値の閾値表現や方向・位置を表す
+#     修飾句をSAO関係として誤抽出しているケースが多い（例：
+#     「温度 超える 値」「通路 方向 全域」）。絶対件数は小さいが、
+#     precisionが低いままにしておく理由もないので、同じ検証の仕組みに乗せる。
+# ルールは {"type":..., "relation":..., "threshold":...} の辞書のリストで表す。
+# typeによって検証対象のリストが変わる（_apply_ginza_fallback_and_normalize
+# 側で振り分ける）：
+#   "llm_direct" → LLM直接抽出の生候補（mapped、GiNZA補完より前）
+#   "claim_title_ginza"/"ginza_has_fallback"とその*_conflict → GiNZA補完候補
+#   "attribute" → 出自関係補完後のmapped
+_LLM_DIRECT_RISK_RULES = [
+    {"type": "llm_direct", "relation": "超える", "threshold": 1},
+    {"type": "llm_direct", "relation": "方向", "threshold": 1},
+    {"type": "llm_direct", "relation": "より小さい", "threshold": 1},
+    {"type": "llm_direct", "relation": "位置する", "threshold": 1},
+]
+_DEFAULT_CLAIM_TITLE_RISK_THRESHOLD = 14  # 実験3時点の既定値（ct_n>=14でPrecisionが54.0%まで落ちる分析に基づく）
+_GINZA_EXTRA_RISK_RULES = [
+    {"type": "claim_title_ginza", "relation": "有する", "threshold": _DEFAULT_CLAIM_TITLE_RISK_THRESHOLD},
+]
+_ATTRIBUTE_RISK_RULES = [
+    {"type": "attribute", "relation": "の", "threshold": 1},
+]
+# --verify-extra-risky 1つで全部まとめて有効化するための既定セット
+# （ginza_has_fallback|有するは既存のverify_risky_ginza/risk_thresholdが担当するので含めない）
+_ALL_EXTRA_RISK_RULES = _LLM_DIRECT_RISK_RULES + _GINZA_EXTRA_RISK_RULES + _ATTRIBUTE_RISK_RULES
+
+
+def _build_extra_risk_rules(claim_title_risk_threshold=_DEFAULT_CLAIM_TITLE_RISK_THRESHOLD):
+    """【実験5】claim_title_ginza|有するの検証閾値だけを差し替えられるようにした
+    _ALL_EXTRA_RISK_RULES のビルダー版。
+
+    実験4後の残存FP分析で、claim_title_ginza|有する（ct_n）・ginza_has_fallback|
+    有する（gh_n）とも、既存の検証済み最上位バケットでまだ精度が低いままな
+    上に、閾値のすぐ下（ct_n 10〜13でPrecision72.0%、gh_n 10〜13で55.6%）にも
+    まだ検証対象外の危険な塊が残っていることが判明した。このうちgh_n側の
+    閾値は既存の--risk-thresholdでそのまま変更できるが、ct_n側は
+    _GINZA_EXTRA_RISK_RULESに埋め込まれた固定値だったため、ここだけ差し替え
+    られるようにする（llm_direct側の4関係・attribute|のは実験3のまま変更しない）。
+    引数を省略すればデフォルト（_DEFAULT_CLAIM_TITLE_RISK_THRESHOLD=14）となり、
+    _ALL_EXTRA_RISK_RULESと完全に同じ内容を返すため、実験3までの再現性には
+    影響しない。
+    """
+    ginza_rules = [
+        {"type": "claim_title_ginza", "relation": "有する", "threshold": claim_title_risk_threshold},
+    ]
+    return _LLM_DIRECT_RISK_RULES + ginza_rules + _ATTRIBUTE_RISK_RULES
+
+# ============================================================
+# 【実験4】target無条件フィルタ（gh_n等の「危険候補数」ベースではなく、
+# Goldデータそのものから「絶対に正解になり得ないtarget」を確定させる方式）
+# ============================================================
+# 実験3の532件結果（llm_direct|有するのFP事例）を精査したところ、
+# 「基板 有する 複数」「配線基板 含む 互い」のように、targetが
+# 「複数」「互い」のような抽象語・代名詞語**だけ**になっている誤抽出が
+# 目立った（元の名詞句「複数の端子」等から、肝心の名詞部分が欠落した
+# パターンとみられる）。
+# gold_sao_532_merged.json（正解データ全10,497件、relation種別を問わず全件）
+# を確認した結果、この18語がtargetになっている正解は**1件も存在しない**
+# ことを確認済み。つまり「危険だから検証する」ではなく、「targetがこの
+# 語なら、システム抽出は数学的に確定でFP」という決定的フィルタであり、
+# LLMによる再確認は不要（Ollama呼び出しゼロで適用できる）。
+# relationの種類やtypeに関わらず、target一致だけで判定する
+# （llm_direct|有するに限定しない――根拠が「relationが危険」ではなく
+# 「targetそのものがgold上で正解になり得ない」という性質のため）。
+# 532件全体でのシミュレーション: 該当144件を除去してMICRO F1 80.14%→80.65%
+# （+0.51pt）、MACRO F1 79.78%→80.27%（+0.49pt）。Recallコストは理論上ゼロ
+# （goldに存在しない語なので、除去してもTPは一切減らない）。
+# デフォルト（filter_invalid_targets=False）では一切変更を加えないため、
+# 実験1〜3のbaseline再現性には影響しない。
+#
+# 追加検証（「一方」「他方」）: 「冷却器 有する 一方」「第１ヘッダ 備える 一方」
+# のように、「○○の一方」「○○の他方」という名詞句から肝心の「○○」部分が
+# 欠落し、「一方」「他方」単体がtargetになる誤抽出を確認。gold_sao_532_merged.json
+# 全10,497件を確認したところ、「一方」「他方」がtargetまたはsourceとして
+# 単体で（完全一致で）登場する正解は1件も存在しない（gold上では必ず
+# 「一方の面」「絶縁基板の他方の面」のように、他の語と結合した複合語としてのみ
+# 登場する）。実験4適用済みのExperiment4結果（532件）に対するシミュレーション:
+# 該当13件（6請求項）を除去してMICRO F1 80.65%→80.70%（+0.05pt）、
+# MACRO F1 80.27%→80.32%（+0.05pt）。Recallコストは理論上ゼロ（上記18語と同じ理由）。
+#
+# 追加検証（「それぞれの一方」「それぞれの他方」）: 「一方」「他方」を除去した後も、
+# 「前記複数の多穴管のそれぞれの一方が接続される」のような原文から、LLMが
+# タグを裸のまま使わず「それぞれの《C6》」のように周辺の語ごと出力してしまい、
+# 結果としてtargetが「それぞれの一方」「それぞれの他方」という複合語のまま
+# 残るケースを確認（実質「一方」「他方」と同じ問題の別表記）。同様に
+# gold_sao_532_merged.json全10,497件を確認し、この2語が単体で（完全一致で）
+# targetまたはsourceとして登場する正解が1件も存在しないことを確認済み。
+_INVALID_TARGET_WORDS = {
+    "複数", "互い", "こと", "もの", "場合", "状態", "様子",
+    "全体", "一部", "両方", "それぞれ", "いずれか", "各々",
+    "これ", "それ", "あれ", "ここ", "そこ",
+    "一方", "他方", "それぞれの一方", "それぞれの他方",
+}
+
+
+def _filter_invalid_targets(relations):
+    """targetが_INVALID_TARGET_WORDSに完全一致する関係を無条件で除外する。
+
+    gold側にこれらの語がtargetとして一件も存在しないことを確認済みのため、
+    typeやrelationの種類を問わず一律に除去してよい（詳細は上のコメント参照）。
+    """
+    return [r for r in relations if r.get("target", "").strip() not in _INVALID_TARGET_WORDS]
+
+# ============================================================
+# 【実験7】クレームタイトル（総称ノード）による二重所有の除去
+# ============================================================
+# 実験4後のFP分析（gold_sao_532_merged.jsonとの同一claim単位の突き合わせ）で、
+# 「有する」系FPのうち、sourceがクレームタイトル相当の構成要素
+# （_apply_ginza_fallback_and_normalize内でclaim_title_ginza判定に使っている
+# ものと同じtitle_text）であるものだけを抜き出したところ、664件中371件
+# （55.9%）は、targetがgold上で「titleとは別の、より具体的な下位構成要素」
+# から正しく所有されていることが判明した（例：「パワーモジュール 有する
+# 第１素子裏面」は誤りで、正しくは「第１パワー半導体素子 有する 第１素子
+# 裏面」）。これは、階層構造の末端に近い構成要素を、本来の直接の親では
+# なく、クレーム全体のタイトル（総称ノード）が二重に「有する」と主張して
+# しまう過大包摂（over-generalization）パターンであり、GiNZA補完由来
+# （claim_title_ginza）だけでなくLLM直接抽出（llm_direct）でも起きている
+# ことを確認済み（type別内訳：claim_title_ginza 503件、llm_direct 146件、
+# ginza_has_fallback 4件、claim_title_ginza_conflict 11件）。
+# 532件全体でのシミュレーション: 該当371件を除去してMICRO F1 80.65%→80.99%
+# 相当（+1.35pt、実験4単独の+0.51ptを上回る規模）。
+# ただし実験4のtargetフィルタとは異なり、goldには稀に同一targetが複数の
+# 妥当なsourceを持つケースが存在する（4,437件中61件、1.37%）ため、理論上は
+# 正しいtitle起点の関係を誤って除去するリスクがゼロではない。そのため、
+# この処理は「target無条件フィルタ」と異なり、Recallに与える実際の影響を
+# 532件全体の再実行で確認することとし、デフォルト
+# （filter_redundant_root_ownership=False）では一切変更を加えないため、
+# 実験1〜6のbaseline再現性には影響しない。
+#
+# 【実験7実測後の追記（実験7b）】532件中268件分の実測結果で検証したところ、
+# claim_title_ginza|有するのTPが997→699（-298件）、FPが301→97（-204件）と、
+# 除去されたFPよりも除去された「正しい」関係（TP）の方が多く、Recallを
+# マクロで3pt以上悪化させる、当初のシミュレーションに反する結果となった。
+# 原因を実例（特開2023-128709等）で追跡したところ、_HAS_SYNONYMS_FOR_DEDUP
+# に「の」を含めていたことが over-trigger の主因と判明した：「の」は
+# 属性・部分参照（例：「主端子の一部」）を表す構文であり、「有する／備える」
+# のような所有関係とは意味的に別物であるにもかかわらず、たまたま同じ
+# targetを指す無関係な「の」関係が1件でも存在するだけで、
+# targets_with_other_owner に登録され、タイトルの正当な所有関係が
+# 「二重所有」と誤判定されて除去されてしまっていた（単体再現テスト済み、
+# test_filter_redundant_root_ownership.py参照）。この設計は532件全件での
+# 事前シミュレーション（word-list版・real-title版いずれも）では検出できて
+# おらず、実際の関係集合でしか顕在化しない失敗モードだった。
+# 対策として、「他のsourceが既に所有している」と判定するための関係語集合
+# から「の」を除外し、真の所有関係を表す語（有する／備える／具備する／
+# 含む／含める）のみに限定する。
+def _filter_redundant_root_ownership(relations, title_text):
+    """title_textを主体とする「有する」系関係のうち、同じtargetをtitle_text
+    以外のsourceからの「有する」系関係で既に他の構成要素が所有している
+    ものを、クレームタイトルによる二重所有（過大包摂）とみなして除去する。
+
+    「他のsourceによる所有」の判定には、真の所有・包含関係を表す語
+    （_OWNERSHIP_RELATIONS_FOR_DEDUP）のみを用いる。「の」による属性・
+    部分参照は所有関係ではないため対象外とする（実験7の実測で、これを
+    含めるとタイトルの正当な所有関係まで誤って除去されることが判明した
+    ため、実験7bで除外した）。
+
+    title_textがNone（クレームタイトルに相当する構成要素が検出できな
+    かった場合）は何もしない。
+    """
+    if not title_text:
+        return relations
+    has_synonyms = _OWNERSHIP_RELATIONS_FOR_DEDUP
+    targets_with_other_owner = {
+        r["target"] for r in relations
+        if r["relation"] in has_synonyms and r["source"] != title_text
+    }
+    return [
+        r for r in relations
+        if not (
+            r["relation"] in has_synonyms
+            and r["source"] == title_text
+            and r["target"] in targets_with_other_owner
+        )
+    ]
+
+
+# 【実験7b】真の所有・包含関係のみ（「の」による属性・部分参照は含めない）。
+_OWNERSHIP_RELATIONS_FOR_DEDUP = {"有する", "備える", "具備する", "含む", "含める"}
+# 後方互換のため旧名も残す（実験7の値と同一の意味では使わないこと）。
+_HAS_SYNONYMS_FOR_DEDUP = _OWNERSHIP_RELATIONS_FOR_DEDUP
+
+_VERIFY_PROMPT_SYSTEM = (
+    "あなたは特許請求項の構造解析の検証者です。与えられた関係の候補一覧について、"
+    "それぞれが請求項原文の記載から実際に読み取れる正しい関係かどうかを判定します。\n"
+    "\n【出力形式】\n"
+    "候補と同じ番号で、1行に1つ、次の形式のみで出力する（他の文章・説明・見出しは"
+    "一切出力しない）：\n"
+    "番号 | はい または いいえ\n"
+    "\n【判定基準】\n"
+    "・その関係が原文に明示的に書かれている、または一意に読み取れる場合のみ「はい」。\n"
+    "・原文には別の構成要素との関係として書かれている、根拠が薄い、推測が必要な場合は"
+    "「いいえ」。\n"
+    "・候補は構文解析による自動抽出なので、誤って生成されたものも混ざっている前提で、"
+    "厳密に判定してください。"
+)
+
+_VERIFY_VERDICT_RE = re.compile(r"^\s*(\d+)\s*[|｜:：]\s*(はい|いいえ|yes|no)", re.IGNORECASE)
+
+
+def _build_verify_prompt_user(text, candidates):
+    lines = [f"{i}. 「{r['source']}」は「{r['target']}」を「{r['relation']}」"
+              for i, r in enumerate(candidates, 1)]
+    return (
+        "請求項の原文:\n" + text + "\n\n"
+        "以下は、この請求項からGiNZA（構文解析）で自動抽出した関係の候補です。\n"
+        "各候補が、請求項の記載から実際に読み取れる正しい関係かどうかを判定してください。\n\n"
+        + "\n".join(lines)
+    )
+
+
+def _verify_ginza_candidates_llm(text, candidates, model=DEFAULT_MODEL, host=None,
+                                  verify_cache=None, claim_id=None, debug=False):
+    """
+    risk_threshold件以上の「有する」候補が生成された請求項について、各候補を
+    LLMに個別確認させ、確認できた候補だけを返す（判定できなかった候補は
+    安全側＝従来通り採用に倒す）。
+
+    verify_cache（dict）とclaim_idを渡すと、analyze_claim_llm_direct側の
+    llm_cacheと同じ考え方で、候補一覧のハッシュが変わらない限りLLM呼び出しを
+    再利用する（実験3以降でGiNZA側のロジックを変えずに再評価したい場合に、
+    この検証呼び出し分もOllama不要にするため）。
+    """
+    if not candidates:
+        return candidates, None
+
+    cand_hash = _hash_text(_build_verify_prompt_user(text, candidates))
+    cache_entry = verify_cache.get(claim_id) if (verify_cache is not None and claim_id is not None) else None
+
+    if cache_entry is not None and cache_entry.get("candidates_hash") == cand_hash:
+        raw = cache_entry["raw_verify_output"]
+        from_cache = True
+    else:
+        raw = _ollama_chat(_VERIFY_PROMPT_SYSTEM, _build_verify_prompt_user(text, candidates),
+                            model=model, host=host)
+        from_cache = False
+        if verify_cache is not None and claim_id is not None:
+            verify_cache[claim_id] = {"candidates_hash": cand_hash, "raw_verify_output": raw}
+
+    if debug:
+        print(f"---GiNZA候補検証（{len(candidates)}件、{'キャッシュ利用' if from_cache else '新規呼び出し'}）---")
+        print(raw)
+
+    verdicts = {}
+    for line in raw.splitlines():
+        m = _VERIFY_VERDICT_RE.match(line)
+        if m:
+            verdicts[int(m.group(1))] = m.group(2).strip().lower() in ("はい", "yes")
+
+    # 判定が得られなかった候補（LLM出力の解析失敗等）は、安全側＝従来通り
+    # 採用に倒す（検証できなかったことを理由に正しい候補まで失わないため）。
+    kept = [r for i, r in enumerate(candidates, 1) if verdicts.get(i, True)]
+    return kept, from_cache
+
+
+def _verify_risky_candidates_in_list(candidates, rules, text, model, host, verify_cache, claim_id,
+                                      debug, verify_cache_key_suffix, stage_label):
+    """
+    【実験3】ginza_has_fallback|有する以外にも検証型を適用するための汎用ヘルパー。
+
+    candidates: 関係リスト（source/relation/target/typeを持つ辞書のリスト）。
+    rules: [{"type":..., "relation":..., "threshold":...}, ...]。
+    同じcandidatesリストの中で複数のルールが同時に閾値を超えた場合も、
+    LLM呼び出しは1回にまとめる（無駄なOllama呼び出しを増やさないため）。
+    却下された候補だけをcandidatesから除いたリストを返す（1件もルールが
+    発火しなければcandidatesをそのまま返す＝変更なし）。
+
+    verify_cache_key_suffixは、同じclaim_idでも検証対象リスト（mapped側の
+    llm_directなのか、extra_from_ginza側のGiNZA補完候補なのか、attribute側
+    なのか）ごとにキャッシュエントリが衝突しないようにするための識別子。
+    """
+    risky_idx = set()
+    triggered = []
+    for rule in rules:
+        idx = [i for i, r in enumerate(candidates)
+               if r["type"] == rule["type"] and r["relation"] == rule["relation"]]
+        if rule.get("group_by") == "source":
+            # 【実験8】fan-out型：請求項全体での候補数ではなく、同じsourceを
+            # 持つ候補どうしでグループ化し、グループごとに閾値判定する
+            # （1つの語が何個の別々のtargetに繋がっているかを見る、より
+            # 細かい粒度のリスク指標。既存のgh_n型ルールと同じ(type,relation)
+            # を指定しても、risky_idxは和集合なので両方併用できる）。
+            by_source = {}
+            for i in idx:
+                by_source.setdefault(candidates[i]["source"], []).append(i)
+            for source_idx in by_source.values():
+                if len(source_idx) >= rule["threshold"]:
+                    risky_idx.update(source_idx)
+                    triggered.append((rule, len(source_idx)))
+        elif len(idx) >= rule["threshold"]:
+            risky_idx.update(idx)
+            triggered.append((rule, len(idx)))
+    if not risky_idx:
+        return candidates
+
+    risky_candidates = [candidates[i] for i in sorted(risky_idx)]
+    cache_key = f"{claim_id}{verify_cache_key_suffix}" if claim_id is not None else None
+    kept, from_cache = _verify_ginza_candidates_llm(
+        text, risky_candidates, model=model, host=host,
+        verify_cache=verify_cache, claim_id=cache_key, debug=debug,
+    )
+    summary = ", ".join(f"{r['type']}|{r['relation']}={n}件（閾値{r['threshold']}）" for r, n in triggered)
+    # --debugを付けていない通常実行でも、検証が実際に発火したことと結果が
+    # 分かるようにする（532件のような長時間実行を眺めている間に「本当に
+    # 発火しているか」を確認できるようにするため）。
+    print(f"  [{claim_id or '?'}] 条件付き検証発火［{stage_label}］（{summary}） "
+          f"→ 対象{len(risky_candidates)}件中{len(kept)}件採用"
+          f"{'（verify-cache利用）' if from_cache else ''}")
+    kept_keys = {(r["source"], r["relation"], r["target"]) for r in kept}
+    return [
+        r for i, r in enumerate(candidates)
+        if i not in risky_idx or (r["source"], r["relation"], r["target"]) in kept_keys
+    ]
+
+
+def _apply_ginza_fallback_and_normalize(text, mapped, pp, tag_doc, tag_comps, tag_to_text,
+                                         enable_has_fallback=True, verify_risky_ginza=False,
+                                         risk_threshold=_DEFAULT_RISK_THRESHOLD,
+                                         verify_fanout=False,
+                                         fanout_risk_threshold=_DEFAULT_FANOUT_RISK_THRESHOLD,
+                                         extra_risk_rules=None,
+                                         model=DEFAULT_MODEL, host=None,
+                                         verify_cache=None, claim_id=None, debug=False,
+                                         filter_invalid_targets=False,
+                                         filter_redundant_root_ownership=False):
+    """
+    英訳経由（analyze_claim_translate）・LLM直接抽出（analyze_claim_llm_direct）
+    の両方で共通の後処理。どちらも「タグ付き日本語→タグ付き関係リスト」までは
+    別々のロジックで作るが、そこから先（GiNZA単体版からの補完＋ノード正規化）
+    は全く同じ処理なので、1箇所にまとめて重複・食い違いを防ぐ。
+
+    「Ａと、Ｂと、…とを備え、（詳細説明）、Ｃ。」のように、装置名Ｃがクレームの
+    一番最後にしか出てこない構造や、「ＸはＹとＺとを含む」のような並列列挙は、
+    翻訳／LLM直接抽出のどちらでも取り違えや訳し漏らしが起きることがある一方、
+    GiNZA単体版（analyze_claim_ginza_only）はこの「含む/有する/備える」系の
+    直接関係を比較的安定して抽出できるので、そちらから補完する（既存の結果は
+    上書きしない＝取り違えた誤った関係が残る可能性はあるが、正しい関係が
+    足される分は必ず改善になる）。
+
+    上記は、GiNZA単体版やanalyze_claim_translate（英訳経由）の抽出力が
+    弱かった頃を前提にした設計だったが、532件実測（244/532件時点）で
+    (type, 関係語)ごとのTP/FP/Precisionを集計・シミュレーションした結果、
+    claim_title_ginza／ginza_has_fallbackを丸ごとON/OFFしたり、
+    Precisionが低い(type, 関係語)を単純に不採用にしたりすると、削れる
+    FPよりも失うTPの方が多く、F1は必ず下がることを確認済み（詳細は
+    eval_translate_sao.pyのコメント参照）。つまり今の無条件統合が、
+    単純な絞り込みでは超えられない実質的な最良構成になっている。
+
+    【LLM無言／LLM矛盾の分離】そこで、GiNZAの各候補を、同じ(source, target)
+    についてLLM（mapped）が何を言っているかで3つに分けるようにした。
+    （1）LLM無言：LLMが何も出していない → 従来通りclaim_title_ginza／
+    ginza_has_fallbackとして追加。（2）LLMと一致（同義語含む、
+    _relation_synonym_match）：表記が違うだけの重複関係なので追加しない
+    （【バグ修正】以前はclaim_title_ginza側にこのチェックが無く、LLMが
+    既に「有する」を出していてもGiNZAが「備える」のような表記違いの
+    候補を無条件に追加してしまっていた＝純粋なFPを生んでいた）。
+    （3）LLM矛盾：LLMが同じ(source,target)について同義語ではない別の
+    関係を出している → claim_title_ginza_conflict／
+    ginza_has_fallback_conflictとして追加する（採用するかどうかはまだ
+    決めない。まずeval_translate_sao.pyのtp_fp_by_type_relationで
+    この新しいtypeのTP/FP/Precisionを実測してから、無言タイプとは別に
+    採用/不採用を判断する）。
+
+    【実験3：検証型の対象拡張】
+    extra_risk_rules（_ALL_EXTRA_RISK_RULES等、[{"type":..., "relation":...,
+    "threshold":...}, ...]の形）を渡すと、実験2で作ったLLM再確認の仕組みを
+    ginza_has_fallback|有する以外の(type, 関係語)にも適用できる。ルールの
+    typeによって検証対象のリストが変わる：
+      - "llm_direct" → LLM直接抽出の生候補（mapped、GiNZA補完より前）
+      - "claim_title_ginza"/"ginza_has_fallback"とその*_conflict →
+        GiNZA補完候補（extra_from_ginza、mapped統合より前）
+      - "attribute" → 出自関係補完後のmapped（_add_genitive_provenance_relations後）
+    extra_risk_rules=None（デフォルト）では一切変更しない。
+
+    【実験8：fan-out型検証】
+    verify_fanout=Trueにすると、ginza_has_fallback|有するの候補群を、請求項
+    全体での総数（gh_n、実験2）ではなく、同じsourceが何個の別々のtargetと
+    繋がっているか（fan-out数）で見て、fanout_risk_threshold件以上の
+    グループだけをLLMに個別確認させる。verify_risky_ginzaと独立に指定でき、
+    両方Trueなら両方の基準（総数・fan-out）のいずれかに該当する候補が
+    まとめて1回のLLM呼び出しで検証される。デフォルト（verify_fanout=False）
+    では一切変更を加えないため、実験1〜7のbaseline再現性には影響しない。
+    """
+    # 【実験3】LLM直接抽出自体の危険候補（超える・方向 等）を検証する。
+    # GiNZA補完より前の、LLMの生の出力（type="llm_direct"）だけが対象。
+    llm_direct_rules = [r for r in (extra_risk_rules or []) if r["type"] == "llm_direct"]
+    if llm_direct_rules:
+        mapped = _verify_risky_candidates_in_list(
+            mapped, llm_direct_rules, text, model, host, verify_cache, claim_id, debug,
+            verify_cache_key_suffix="::llm_direct", stage_label="LLM直接抽出",
+        )
+
+    try:
+        _, ginza_relations = pp.analyze_claim_ginza_only(text)
+    except Exception:
+        ginza_relations = []
+
+    # 表現形式（順次列挙形式／構成要素列挙形式／ジェプソン的形式）によって、
+    # GiNZA単体版からの補完（下記extra_from_ginza）をどこまで信用するかを
+    # 切り替える。順次列挙形式（方法クレーム）では、GiNZA単体版の
+    # extract_has_relationsにある「同じ語の繰り返し列挙→root_componentへ」
+    # ヒューリスティックが、「〜すること」という動詞の名詞化節による列挙
+    # （「基板とエピタキシャル成長層とを準備することと、…を有する、
+    # 半導体基板構造体の製造方法」等）で誤爆し、方法名（製造方法等）から
+    # 全く無関係な語への誤った関係を作ってしまうことを532件回帰の分析で
+    # 確認済み（例：「製造方法 有する エピタキシャル成長層」「製造方法
+    # 有する 真空中」）。一方、「〜工程」という名詞そのものの繰り返し列挙
+    # （「製造方法 備える 供給工程」等）は同じヒューリスティックが正しく
+    # 機能している。両者を区別する安全で簡単な基準として、対象
+    # （target）のテキストが「工程」を含むものだけに絞って採用する
+    # （タグ付け＝構成要素境界の認識ルール自体を形式ごとに作り直すのでは
+    # なく、既存のGiNZA補完をどこまで信用するかを形式で絞る、という
+    # 形での「表現形式ごとのルール適用」）。
+    claim_format = pp.classify_claim_format(text)
+    if claim_format == "順次列挙形式":
+        def _ginza_fallback_target_ok(target_text):
+            return "工程" in target_text
+    else:
+        def _ginza_fallback_target_ok(target_text):
+            return True
+
+    # 【LLM無言／LLM一致／LLM矛盾の分類】GiNZAの候補ごとに、同じ(source, target)
+    # についてLLM（mapped）が何を言っているかで3つに分ける。
+    #   ・LLM無言　　：その(source,target)についてLLMは何も出していない
+    #                  → GiNZAの候補をそのまま採用候補として追加する
+    #                    （type=claim_title_ginza / ginza_has_fallback、従来通り）。
+    #   ・LLMと一致　：LLMが同じ意味（同義語グループで一致、_relation_synonym_match）
+    #                  の関係を既に出している → 追加しない（表記だけ違う重複関係を
+    #                  増やさない）。
+    #                  【バグ修正】以前はclaim_title_ginza側にこのチェックが
+    #                  一切無く、LLMが既に「有する」を出していてもGiNZAが
+    #                  「備える」のような表記違いの候補を追加してしまうことが
+    #                  あった（同じ関係の言い換え重複＝純粋なFPになる）。
+    #   ・LLM矛盾　　：LLMが同じ(source,target)について同義語ではない別の関係を
+    #                  出している → type=claim_title_ginza_conflict /
+    #                  ginza_has_fallback_conflict として追加する（採用するか
+    #                  どうかはまだ決めない。まずTP/FP/Precisionを実測してから
+    #                  判断するための、無言タイプとは別カテゴリの候補として
+    #                  記録する）。
+    mapped_relations_by_pair = {}
+    for r in mapped:
+        mapped_relations_by_pair.setdefault((r["source"], r["target"]), []).append(r["relation"])
+
+    def _relation_matches_any(candidate_relation, existing_relations):
+        for rel in existing_relations:
+            if rel == candidate_relation or pp._relation_synonym_match(candidate_relation, rel):
+                return True
+        return False
+
+    # 【実験7】クレームタイトル相当の構成要素名。enable_has_fallback=Falseでも
+    # _filter_redundant_root_ownershipで使えるよう、ブロックの外で初期化しておく。
+    _claim_title_text_for_dedup = None
+
+    extra_from_ginza = []
+    if enable_has_fallback:
+        added_pairs = set()  # GiNZAフォールバック候補として既に判定済みの(source,target)
+
+        def _classify_and_maybe_add(r, type_no_conflict, type_conflict):
+            pair = (r["source"], r["target"])
+            if pair in added_pairs:
+                return
+            existing_rels = mapped_relations_by_pair.get(pair, [])
+            if not existing_rels:
+                extra_from_ginza.append({
+                    "source": r["source"], "relation": r["relation"],
+                    "target": r["target"], "type": type_no_conflict,
+                })
+            elif not _relation_matches_any(r["relation"], existing_rels):
+                extra_from_ginza.append({
+                    "source": r["source"], "relation": r["relation"],
+                    "target": r["target"], "type": type_conflict,
+                })
+            # else: LLMと同義語一致＝重複なので追加しない
+            added_pairs.add(pair)
+
+        last_i = len(tag_doc) - 1
+        while last_i > 0 and tag_doc[last_i].pos_ == "PUNCT":
+            last_i -= 1
+        claim_title_comp = pp.find_component_by_token(tag_comps, last_i)
+        _claim_title_text_for_dedup = (
+            claim_title_comp["text"] if claim_title_comp is not None else None
+        )
+        if claim_title_comp is not None:
+            title_text = claim_title_comp["text"]
+            for r in ginza_relations:
+                if r.get("type") == "has" and r["source"] == title_text and _ginza_fallback_target_ok(r["target"]):
+                    _classify_and_maybe_add(r, "claim_title_ginza", "claim_title_ginza_conflict")
+
+        _HAS_SYNONYMS = next(
+            (g for g in pp.RELATION_SYNONYM_GROUPS if "含む" in g),
+            {"有する", "備える", "具備する", "含む", "含める"},
+        )
+        # 「工程」を含むかどうかの絞り込みは、実際に誤爆を確認した
+        # root_component（＝クレーム題名）が所有者になっているケースだけに
+        # 限定する。それ以外の所有者（工程自身が持つ内部の実体等、例えば
+        # 「原子 有する 結合手」）は、今回診断した誤爆パターンとは無関係な
+        # ので、絞り込まずに従来通り採用する（未診断のまま広く絞ると、
+        # 正しい関係まで失うリスクがある）。
+        _title_text_for_filter = claim_title_comp["text"] if claim_title_comp is not None else None
+
+        for r in ginza_relations:
+            if r["relation"] not in _HAS_SYNONYMS:
+                continue
+            if r["source"] == _title_text_for_filter and not _ginza_fallback_target_ok(r["target"]):
+                continue
+            _classify_and_maybe_add(r, "ginza_has_fallback", "ginza_has_fallback_conflict")
+
+    # 【実験2＋3】GiNZA補完候補側の検証：ginza_has_fallback|有する（実験2、
+    # verify_risky_ginza/risk_threshold）と、それ以外の追加ルール
+    # （claim_title_ginza|有する等、extra_risk_rules）をまとめて1回の
+    # LLM呼び出しで検証する。どちらも指定しなければ一切変更しない
+    # （既定では実験1のbaselineと完全に同じ挙動になる）。
+    ginza_rules = []
+    if verify_risky_ginza:
+        ginza_rules.append({"type": _RISK_VERIFY_TYPE, "relation": _RISK_VERIFY_RELATION,
+                             "threshold": risk_threshold})
+    # 【実験8】fan-out型：同じ(type,relation)でも、請求項全体での総数ではなく
+    # 「同じsourceが何個の別々のtargetと繋がっているか」で判定する別ルール。
+    # verify_risky_ginzaのgh_n型ルールと共存でき、risky_idxの和集合として
+    # 扱われる（_verify_risky_candidates_in_list参照）。
+    if verify_fanout:
+        ginza_rules.append({"type": _RISK_VERIFY_TYPE, "relation": _RISK_VERIFY_RELATION,
+                             "threshold": fanout_risk_threshold, "group_by": "source"})
+    ginza_rules += [
+        r for r in (extra_risk_rules or [])
+        if r["type"] in ("claim_title_ginza", "ginza_has_fallback",
+                          "claim_title_ginza_conflict", "ginza_has_fallback_conflict")
+        and not (r["type"] == _RISK_VERIFY_TYPE and r["relation"] == _RISK_VERIFY_RELATION)
+    ]
+    if ginza_rules:
+        extra_from_ginza = _verify_risky_candidates_in_list(
+            extra_from_ginza, ginza_rules, text, model, host, verify_cache, claim_id, debug,
+            verify_cache_key_suffix="::ginza", stage_label="GiNZA補完",
+        )
+
+    existing_keys = {(r["source"], r["relation"], r["target"]) for r in mapped}
+    mapped = mapped + [
+        r for r in extra_from_ginza
+        if (r["source"], r["relation"], r["target"]) not in existing_keys
+    ]
+
+    # GiNZA単体版（analyze_claim_ginza_only）と同じく、「Ｘの主面」「Ｘの裏面」
+    # のような面・部位を表す複合語は、常にＸそのものとして統合する
+    # （本人の指示：「構成要素の一部を表す言葉は、その構成要素として扱う」）。
+    # 出自関係（_add_genitive_provenance_relations）より先に実行する必要がある
+    # 順序もGiNZA単体版と揃えている（先に統合しておかないと「Ｘの主面」が
+    # 単独ノードのまま出自関係を持ってしまうため）。
+    mapped = pp._merge_surface_location_nodes(mapped)
+
+    # 「Ｘの深さ」のような複合語ノードに対する出自関係の補完も、
+    # GiNZA単体版と同じロジックを流用する。
+    mapped = pp._add_genitive_provenance_relations(mapped)
+
+    # 【実験3】attribute|の候補の検証。attribute型は_add_genitive_provenance_
+    # relationsでしか作られないので、このタイミングでしか対象を拾えない。
+    attribute_rules = [r for r in (extra_risk_rules or []) if r["type"] == "attribute"]
+    if attribute_rules:
+        mapped = _verify_risky_candidates_in_list(
+            mapped, attribute_rules, text, model, host, verify_cache, claim_id, debug,
+            verify_cache_key_suffix="::attribute", stage_label="出自関係(attribute)",
+        )
+
+    # GiNZA単体版（analyze_claim_ginza_only）と同じく、「一部」「部分」のような
+    # 裸の部分名詞は、係り元（の格）の実体名にマージする
+    # （例: "第１端子の一部" が単独ノード「一部」のままにならないようにする）。
+    mapped = pp._merge_partitive_nodes(mapped, tag_doc, tag_comps)
+
+    # 【実験4】target無条件フィルタ。type/relationを問わず、_INVALID_TARGET_WORDS
+    # に完全一致するtargetを持つ関係を最後に一律除去する（詳細は定数定義部の
+    # コメント参照）。LLM呼び出し不要・デフォルトFalseでは実験1〜3のbaseline
+    # 再現性に影響しない。
+    if filter_invalid_targets:
+        before_n = len(mapped)
+        mapped = _filter_invalid_targets(mapped)
+        removed_n = before_n - len(mapped)
+        if removed_n:
+            print(f"  [{claim_id or '?'}] target無条件フィルタ発火 → {removed_n}件除去")
+
+    # 【実験7】クレームタイトルによる二重所有の除去。target無条件フィルタ
+    # （実験4）と同じくLLM呼び出し不要の決定的な後処理だが、根拠が
+    # 「targetの語そのもの」ではなく「同じtargetを既に別の構成要素が
+    # 所有しているか」という関係同士の突き合わせである点が異なる（詳細は
+    # 関数定義部のコメント参照）。
+    if filter_redundant_root_ownership:
+        before_n = len(mapped)
+        mapped = _filter_redundant_root_ownership(mapped, _claim_title_text_for_dedup)
+        removed_n = before_n - len(mapped)
+        if removed_n:
+            print(f"  [{claim_id or '?'}] クレームタイトル二重所有フィルタ発火 → {removed_n}件除去")
+
+    components = [{"text": v, "start": -1, "end": -1} for v in tag_to_text.values()]
+    return components, mapped
+
+
+def _hash_text(s):
+    """キャッシュ整合性チェック用のハッシュ（タグ付き原文が変わっていないか確認する）。"""
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def analyze_claim_llm_direct(text, pipeline_dir=None, model=DEFAULT_MODEL, host=None, pp=None,
+                              debug=False, debug_out=None, llm_cache=None, claim_id=None,
+                              verify_risky_ginza=False, risk_threshold=_DEFAULT_RISK_THRESHOLD,
+                              verify_fanout=False,
+                              fanout_risk_threshold=_DEFAULT_FANOUT_RISK_THRESHOLD,
+                              extra_risk_rules=None, verify_cache=None,
+                              filter_invalid_targets=False,
+                              filter_redundant_root_ownership=False):
+    """
+    日本語クレームテキストを渡すと (構成要素リスト, 関係リスト) を返す。
+    英訳を挟まず、タグ付き日本語テキストをそのままLLMに渡してSAOを
+    直接出力させる方式（analyze_claim_translateとの違いは、
+    「タグ付き日本語→タグ付き関係リスト」の生成方法だけで、それ以降の
+    GiNZA補完・ノード正規化は_apply_ginza_fallback_and_normalizeを共有する）。
+
+    まずはチャンク分割せず、クレーム全体を1回のLLM呼び出しで処理する
+    （英訳のときのように主語取り違えが起きやすいかどうかは未検証のため、
+    問題が出た場合はチャンク分割を検討する）。
+
+    【LLM生出力キャッシュ（実験2以降のため）】
+    llm_cache（dict）とclaim_id（str）を渡すと、次のように動作する:
+      - llm_cache[claim_id]が存在し、そのtagged_text_hashが今回のタグ付き
+        原文のハッシュと一致する場合 → Ollamaを呼ばず、キャッシュ済みの
+        llm_outputを使う（GiNZAフォールバック側のロジック変更だけを
+        再評価したい実験3以降で、Ollama呼び出しを完全に省くためのもの）。
+      - それ以外（未キャッシュ or ハッシュ不一致）→ 通常通りOllamaを呼び、
+        結果をllm_cache[claim_id]に書き込む（呼び出し元がファイルへ保存する）。
+      - llm_cache=None（デフォルト）の場合は今まで通り毎回Ollamaを呼ぶ。
+        既存の呼び出し元（引数を渡さない場合）の挙動は完全に変わらない。
+
+    【実験2：条件付きGiNZA（検証型）】
+    verify_risky_ginza=Trueにすると、_apply_ginza_fallback_and_normalizeの
+    条件付き検証（risk_threshold件以上のginza_has_fallback|有する候補が
+    生成された請求項だけ、LLMに個別確認させる）が有効になる。
+    verify_cache（dict）を渡すと、この検証呼び出し分もllm_cacheと同じ考え方で
+    キャッシュされる。デフォルト（verify_risky_ginza=False）では
+    _apply_ginza_fallback_and_normalizeに一切変更を加えないため、実験1の
+    baselineの再現性には影響しない。
+
+    【実験3：検証型の対象拡張】
+    extra_risk_rules（例：_ALL_EXTRA_RISK_RULES）を渡すと、同じ検証の仕組みを
+    claim_title_ginza|有する・attribute|の・llm_direct側の「超える」「方向」
+    等にも適用する。verify_risky_ginzaと独立に指定でき、両方Noneのままなら
+    実験1のbaselineと完全に同じ挙動。
+
+    【実験4：target無条件フィルタ】
+    filter_invalid_targets=Trueにすると、type・relationを問わず、targetが
+    _INVALID_TARGET_WORDS（「複数」「互い」等、gold中に一件も存在しないと
+    確認済みの語）に完全一致する関係を最後に一律除去する。LLM呼び出し不要
+    （Ollama非依存）で、検証系のverify_risky_ginza/extra_risk_rulesとは独立に
+    指定できる。デフォルトFalseでは実験1〜3のbaseline再現性に影響しない。
+
+    【実験8：ginza_has_fallback|有するのfan-out型検証】
+    verify_fanout=Trueにすると、ginza_has_fallback|有するの候補を、請求項
+    全体の総数（gh_n、実験2）ではなく、同じsourceが何個の別々のtargetと
+    繋がっているか（fan-out数）で見て、fanout_risk_threshold件以上の
+    グループだけをLLMに個別確認させる。verify_risky_ginzaと独立に指定でき、
+    両方Trueなら1回のLLM呼び出しでまとめて検証する。デフォルトFalseでは
+    実験1〜7のbaseline再現性に影響しない。
+    """
+    pp = pp or _load_pipeline(pipeline_dir)
+    tagged_text, tag_to_text, tag_doc, tag_comps = tag_components(text, pp)
+
+    tagged_hash = _hash_text(tagged_text)
+    cache_entry = llm_cache.get(claim_id) if (llm_cache is not None and claim_id is not None) else None
+
+    if cache_entry is not None and cache_entry.get("tagged_text_hash") == tagged_hash:
+        llm_output = cache_entry["llm_output"]
+        from_cache = True
+    else:
+        llm_output = _ollama_chat(_SAO_EXTRACTION_PROMPT, tagged_text, model=model, host=host)
+        from_cache = False
+        if llm_cache is not None and claim_id is not None:
+            llm_cache[claim_id] = {"tagged_text_hash": tagged_hash, "llm_output": llm_output}
+
+    if debug:
+        print("---タグ付き原文---", tagged_text, sep="\n")
+        print(f"---LLM出力（SAO）{'［キャッシュ利用］' if from_cache else ''}---", llm_output, sep="\n")
+    if debug_out is not None:
+        debug_out["tagged_text"] = tagged_text
+        debug_out["llm_output"] = llm_output
+        debug_out["tag_to_text"] = dict(tag_to_text)
+        debug_out["llm_cache_hit"] = from_cache
+
+    mapped = extract_relations_from_llm_output(llm_output, tag_to_text)
+    # 【検討中・いったん保留】enable_has_fallback=Falseで「有する」系GiNZA
+    # フォールバックを無効化する変更を試したが、Precision改善のためだけに
+    # Recallを犠牲にする判断を実測データなしで行うべきではない、という
+    # 指摘を受けて元のTrue（フォールバック有効）に戻した。理由・今後の
+    # 判断手順は_apply_ginza_fallback_and_normalizeのdocstring
+    # 【検討中・いったん保留】を参照。
+    return _apply_ginza_fallback_and_normalize(
+        text, mapped, pp, tag_doc, tag_comps, tag_to_text,
+        verify_risky_ginza=verify_risky_ginza, risk_threshold=risk_threshold,
+        verify_fanout=verify_fanout, fanout_risk_threshold=fanout_risk_threshold,
+        extra_risk_rules=extra_risk_rules,
+        model=model, host=host, verify_cache=verify_cache, claim_id=claim_id, debug=debug,
+        filter_invalid_targets=filter_invalid_targets,
+        filter_redundant_root_ownership=filter_redundant_root_ownership,
+    )
+
+
+# ===========================================================================
+# 【統合】node_match_eval.py
+# ===========================================================================
+"""
+node_match_eval.py
+===================
+主語どうし・目的語どうしを比べる評価（--eval-mode node）。
+
+従来の緩い評価（evaluate_triples_lenient）は「ＡがＢをＲする」という文全体の
+埋め込み類似度で一致を判定していたが、同じ請求項の構成要素をでたらめに
+組み合わせた偽の関係でも97.8%がどれかの正解と類似度0.75以上になり、本文を
+読まないでたらめな出力でもF1が67.1%になってしまうことが分かった。
+そこで、意味的類似度は使いつつ、主語と目的語を別々に比べる。
+
+一致の条件（1対1の対応付け）:
+  ① 表記正規化で主語・目的語が一致し、関係も一致 → 一致（従来と同じ）
+  ② 残りは、主語どうし・目的語どうしがそれぞれ次のどれかで対応し、かつ関係が一致:
+       ・表記正規化で一致
+       ・一方がもう一方を含む（例：「第１端」と「第１トランジスタの第１端」）。
+         ただし短い方の番号（第１・Ａ等）が長い方にも含まれる場合のみ
+       ・番号が同じで、埋め込みの類似度がθ（既定0.9）以上
+     主語・目的語の対応の強さの小さい方が高い組から順に対応付ける。
+  θ=0.9 の根拠：同じ請求項の別々の正解ノード同士（番号が同じ・包含関係なし）で
+  類似度が0.9以上になるのは4.2%（0.75では27.2%）。
+  関係の一致は従来の規則（表記正規化・漢字部分一致・同義語グループ）を使うが、
+  同義語グループの「の」は関係全体が「の」の場合だけ認める（従来は「の」を含む
+  あらゆる関係語が「有する」系と同義扱いになっていた）。
+"""
+import re
+
+_KANJI_NUM = str.maketrans("一二三四五六七八九", "123456789")
+_NUM_RE = re.compile(r"\d+|[a-zA-Z]")
+
+
+def numbers(t):
+    t = re.sub(r"第([一二三四五六七八九])", lambda m: "第" + m.group(1).translate(_KANJI_NUM), t)
+    return tuple(_NUM_RE.findall(t))
+
+
+def node_score(a, b, E, theta):
+    if a == b:
+        return 1.0
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 2 and short in long_ and set(numbers(short)) <= set(numbers(long_)):
+        return 0.9
+    if numbers(a) != numbers(b):
+        return 0.0
+    s = float(E[a] @ E[b])
+    return s if s >= theta else 0.0
+
+
+def rel_match(pp, p_rel, g_rel):
+    if p_rel == g_rel:
+        return True
+    pn = pp._normalize_relation_for_match(p_rel)
+    gn = pp._normalize_relation_for_match(g_rel)
+    if pn == gn or pn in gn or gn in pn:
+        return True
+    for group in pp.RELATION_SYNONYM_GROUPS:
+        a_in = any((g in p_rel) if len(g) > 1 else (g == p_rel) for g in group)
+        b_in = any((g in g_rel) if len(g) > 1 else (g == g_rel) for g in group)
+        if a_in and b_in:
+            return True
+    return False
+
+
+def evaluate_triples_node(pp, predicted, gold, theta=0.9):
+    n = pp._normalize_node_text_lenient
+    mp, mg = {}, set()
+    for i, p in enumerate(predicted):
+        for j, g in enumerate(gold):
+            if j in mg:
+                continue
+            if (n(p["source"]) == n(g["source"]) and n(p["target"]) == n(g["target"])
+                    and rel_match(pp, p["relation"], g["relation"])):
+                mp[i] = "normalized"
+                mg.add(j)
+                break
+    rp = [i for i in range(len(predicted)) if i not in mp]
+    rg = [j for j in range(len(gold)) if j not in mg]
+    if rp and rg:
+        nodes = list({n(predicted[i][k]) for i in rp for k in ("source", "target")}
+                     | {n(gold[j][k]) for j in rg for k in ("source", "target")})
+        model = pp._get_embed_model()
+        E = dict(zip(nodes, model.encode(nodes, normalize_embeddings=True)))
+        cands = []
+        for i in rp:
+            p = predicted[i]
+            for j in rg:
+                g = gold[j]
+                if not rel_match(pp, p["relation"], g["relation"]):
+                    continue
+                sc = min(node_score(n(p["source"]), n(g["source"]), E, theta),
+                         node_score(n(p["target"]), n(g["target"]), E, theta))
+                if sc > 0:
+                    cands.append((sc, i, j))
+        cands.sort(key=lambda x: -x[0])
+        for sc, i, j in cands:
+            if i in mp or j in mg:
+                continue
+            mp[i] = "semantic"
+            mg.add(j)
+    tp = len(mp)
+    P = tp / len(predicted) if predicted else 0.0
+    R = tp / len(gold) if gold else 0.0
+    return {
+        "precision": P, "recall": R, "f1": 2 * P * R / (P + R) if P + R else 0.0,
+        "正解数": tp, "システム抽出数": len(predicted), "正解データ数": len(gold),
+        "matched_pred": [predicted[i] for i in sorted(mp)],
+        "unmatched_pred": [p for i, p in enumerate(predicted) if i not in mp],
+        "unmatched_gold": [g for j, g in enumerate(gold) if j not in mg],
+        "正解内訳": {"表記正規化一致": sum(1 for v in mp.values() if v == "normalized"),
+                  "意味的類似度一致": sum(1 for v in mp.values() if v == "semantic")},
+    }
+
+
+def evaluate_triples_exact(pp, predicted, gold):
+    """【主指標】トリプル完全一致（--eval-mode exact）。
+    主語・目的語は表記正規化（_normalize_node_text_lenient：全角半角・「前記」・
+    数量詞などの揺れを吸収）した上で完全一致、関係は rel_match（表記正規化・
+    漢字部分一致・同義語グループ）で一致したものだけを正解とする。
+    意味的類似度は使わない。"""
+    n = pp._normalize_node_text_lenient
+    mp, mg = set(), set()
+    for i, p in enumerate(predicted):
+        for j, g in enumerate(gold):
+            if j in mg:
+                continue
+            if (n(p["source"]) == n(g["source"]) and n(p["target"]) == n(g["target"])
+                    and rel_match(pp, p["relation"], g["relation"])):
+                mp.add(i)
+                mg.add(j)
+                break
+    tp = len(mp)
+    P = tp / len(predicted) if predicted else 0.0
+    R = tp / len(gold) if gold else 0.0
+    return {
+        "precision": P, "recall": R, "f1": 2 * P * R / (P + R) if P + R else 0.0,
+        "正解数": tp, "システム抽出数": len(predicted), "正解データ数": len(gold),
+        "matched_pred": [predicted[i] for i in sorted(mp)],
+        "unmatched_pred": [p for i, p in enumerate(predicted) if i not in mp],
+        "unmatched_gold": [g for j, g in enumerate(gold) if j not in mg],
+    }
+
+
+# ===========================================================================
+# 【統合】nested_graph.py
+# ===========================================================================
+"""SAO関係を「構成（入れ子の箱）＋関係（矢印）」の1枚の図にするDOT生成。
+
+・備える／有する等の所有関係 → 親の箱の中に子を入れる（入れ子）
+・それ以外の関係（接続される・固定される等）→ 箱と箱をつなぐ矢印
+・どの部品にも属さない語（方向・設置対象など）→ 装置の箱の外に点線の楕円
+・同じ部品を複数の兄弟が持つ場合（第１ヘッダと第２ヘッダがそれぞれ壁部を持つ等）
+  → それぞれの箱の中に複製して描く
+・上位と下位の両方が同じ部品を持つ場合（題名と具体的な部品の二重所有）
+  → より具体的な方（下位）の中だけに描く
+"""
+
+import html
+
+HAS_RELATIONS = {"有する", "備える", "具備する", "含む", "含める", "の"}
+FONT = "Noto Sans CJK JP,Yu Gothic,Meiryo,sans-serif"
+
+
+def _esc(s):
+    return html.escape(s).replace('"', '\\"')
+
+
+def relations_to_nested_dot(relations, rel_color="#2563eb"):
+    rels = [r for r in relations if r["source"] != r["target"]]
+
+    names = []
+    for r in rels:
+        for n in (r["source"], r["target"]):
+            if n not in names:
+                names.append(n)
+
+    owners = {}
+    for r in rels:
+        if r["relation"] in HAS_RELATIONS:
+            owners.setdefault(r["target"], [])
+            if r["source"] not in owners[r["target"]]:
+                owners[r["target"]].append(r["source"])
+
+    def ancestors(n, seen=None):
+        seen = set() if seen is None else seen
+        out = set()
+        for o in owners.get(n, []):
+            if o in seen:
+                continue
+            seen.add(o)
+            out.add(o)
+            out |= ancestors(o, seen)
+        return out
+
+    # 他の所有者の祖先になっている所有者（題名などの上位）は外す
+    direct_owners = {}
+    for child, os_ in owners.items():
+        keep = [o for o in os_
+                if o != child and child not in ancestors(o)
+                and not any(o in ancestors(p) for p in os_ if p != o)]
+        if keep:
+            direct_owners[child] = keep
+
+    # インスタンス（描画上の箱）を作る。path = 根から自分までの名前の並び
+    instances = {}  # name -> [path tuple]
+
+    def build(name, stack=()):
+        if name in stack:
+            return []
+        if name in instances:
+            return instances[name]
+        if name not in direct_owners:
+            paths = [(name,)]
+        else:
+            paths = []
+            for o in direct_owners[name]:
+                for op in build(o, stack + (name,)):
+                    paths.append(op + (name,))
+            if not paths:
+                paths = [(name,)]
+        instances[name] = paths
+        return paths
+
+    for n in names:
+        build(n)
+
+    all_paths = [p for ps in instances.values() for p in ps]
+    children = {}
+    for p in all_paths:
+        if len(p) > 1:
+            children.setdefault(p[:-1], []).append(p)
+    containers = set(children)
+    ids = {p: f"n{i}" for i, p in enumerate(all_paths)}
+
+    def anchor(p):
+        return f"{ids[p]}_a" if p in containers else ids[p]
+
+    lines = [
+        "digraph SAO {",
+        'graph [compound=true, rankdir=LR, newrank=true, nodesep=0.3, ranksep=1.1, '
+        f'fontname="{FONT}", fontsize=13, bgcolor="white"];',
+        f'node [fontname="{FONT}", fontsize=12, shape=box, style="rounded,filled", '
+        'fillcolor="#ffffff", color="#94a3b8"];',
+        f'edge [fontname="{FONT}", fontsize=11];',
+    ]
+
+    def emit(p, indent):
+        pad = "  " * indent
+        if p in containers:
+            fill = ["#eef2ff", "#f5f7fb", "#ffffff"][min(len(p) - 1, 2)]
+            lines.append(f"{pad}subgraph cluster_{ids[p]} {{")
+            lines.append(f'{pad}  label="{_esc(p[-1])}"; labeljust=l; style="rounded,filled"; '
+                         f'fillcolor="{fill}"; color="#64748b"; penwidth=1.3;')
+            lines.append(f'{pad}  {anchor(p)} [shape=point, width=0.01, style=invis, label=""];')
+            for c in children[p]:
+                emit(c, indent + 1)
+            lines.append(f"{pad}}}")
+        elif len(p) == 1:
+            lines.append(f'{pad}{ids[p]} [label="{_esc(p[-1])}", shape=ellipse, style="dashed", '
+                         'color="#94a3b8", fontcolor="#475569"];')
+        else:
+            lines.append(f'{pad}{ids[p]} [label="{_esc(p[-1])}"];')
+
+    for p in all_paths:
+        if len(p) == 1:
+            emit(p, 1)
+
+    def closest(src_path, tgt_name):
+        # 複製された相手のうち、根からの道筋を一番長く共有するものを選ぶ
+        def shared(a, b):
+            k = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                k += 1
+            return k
+        return max(instances[tgt_name], key=lambda q: shared(src_path, q))
+
+    drawn = set()
+    for r in rels:
+        if r["relation"] in HAS_RELATIONS:
+            continue
+        for sp in instances[r["source"]]:
+            tp = closest(sp, r["target"])
+            key = (sp, r["relation"], tp)
+            if key in drawn or sp == tp:
+                continue
+            drawn.add(key)
+            a = [f'label="{_esc(r["relation"])}"', f'color="{rel_color}"',
+                 f'fontcolor="{rel_color}"', "penwidth=1.3"]
+            if sp in containers:
+                a.append(f"ltail=cluster_{ids[sp]}")
+            if tp in containers:
+                a.append(f"lhead=cluster_{ids[tp]}")
+            lines.append(f"  {anchor(sp)} -> {anchor(tp)} [{', '.join(a)}];")
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# 【統合】claim_segmenter.py
+# ===========================================================================
+"""
+claim_segmenter.py
+===================
+【実験10】手がかり句による請求項の分割と、区間ごとのGiNZA解析。
+
+新森ら（2004）「手がかり句を用いた特許請求項の構造解析」の考え方に基づき、
+長い請求項を記述断片に分割してから、区間ごとに GiNZA 単体版
+（patent_pipeline.analyze_claim_ginza_only）で解析する。
+
+分割の手がかり（新森ら 表2・表3 を元にした）:
+  ・出願人が入れた改行（新森らの調査では、改行位置の87%が記述断片の境界）
+  ・「において、」「に於いて、」「であって、」（ジェプソン的形式の区切り）
+  ・「名詞＋と、」（構成要素列挙形式の区切り）
+  ・「動詞・助動詞の連用形＋、」（順次列挙形式・「前記Xは、…を含み、」の区切り）
+
+各区間は、末尾の「と、」「、」を「。」に置き換えて独立した文として解析する。
+「を備え、」のような構成要素の列挙を締めくくるだけの区間は解析しない
+（題名と構成要素の関係は、請求項全体のGiNZA解析で既に取れているため）。
+
+オプション（実験10b）:
+  distribute=True : 「前記A及び前記Bのそれぞれは、…」を「前記Aは、…」「前記Bは、…」
+                    の2つの区間に展開してから解析する。
+  merge_enzai=True: GiNZA（SudachiPy）が「延在する」を「延」＋「在す」に誤って分割する
+                    問題を、解析の前に1語へ結合して防ぐ。
+"""
+import re
+from contextlib import contextmanager
+
+_JEPSON_RE = re.compile(r"(において|に於いて|に於て|であって|にあたり|に当たり)[、，]")
+_COMPOSE_ONLY_RE = re.compile(r"^(と)?[、，]?(を|とを)?[、，]?(備え|具備し|有し|含み|設け)(る|た|ている|てなる)?[、，]?$")
+_DISTRIB_RE = re.compile(
+    r"^(?P<coord>.+?)の(?P<each>それぞれ|各々|各)(?P<part>は|が|に|を|には|にも|も)(?P<rest>.*)$")
+_NEW_TOPIC_RE = re.compile(r"^\s*(前記|該|当該|上記)?[^、。，]{1,40}?(は|が)[、，]")
+_COORD_SPLIT_RE = re.compile(r"、|，|及び|および|並びに|ならびに|と")
+
+
+def _split_line(pp, line):
+    """1行を、GiNZAの品詞情報を使って手がかり句で区間に分ける。"""
+    line = line.strip()
+    if not line:
+        return []
+    doc = pp.nlp(line)
+    cuts = []
+    toks = list(doc)
+    for i, t in enumerate(toks):
+        if t.text not in ("、", "，") or i == 0 or i == len(toks) - 1:
+            continue
+        prev = toks[i - 1]
+        infl = "".join(prev.morph.get("Inflection"))
+        if prev.pos_ in ("VERB", "AUX") and "連用形" in infl:
+            # 「〜設けられ、〜流路を有する多穴管と」のような修飾部の途中では切らない。
+            # 新しい主題・主語（「前記Yは、」等）が続く場合だけ区切りとみなす。
+            if _NEW_TOPIC_RE.match(line[t.idx + len(t.text):]):
+                cuts.append(t.idx + len(t.text))
+        elif prev.text == "と" and prev.pos_ in ("ADP", "CCONJ") and i >= 2 and toks[i - 2].pos_ in ("NOUN", "PROPN", "NUM", "SYM"):
+            # 「AとBとの間に位置する」のような並列は構成要素の区切りではないので切らない
+            if "との" not in line[t.idx + len(t.text):]:
+                cuts.append(t.idx + len(t.text))
+    for m in _JEPSON_RE.finditer(line):
+        cuts.append(m.end())
+    cuts = sorted(set(c for c in cuts if 0 < c < len(line)))
+    parts, start = [], 0
+    for c in cuts:
+        parts.append(line[start:c])
+        start = c
+    parts.append(line[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_claim(pp, text):
+    segs = []
+    for line in re.split(r"[\r\n]+", text):
+        segs.extend(_split_line(pp, line))
+    return segs
+
+
+def to_sentence(seg):
+    """区間を独立した文にする。構成要素の列挙を締めくくるだけの区間はNone。"""
+    s = seg.strip()
+    if _COMPOSE_ONLY_RE.match(s):
+        return None
+    s = re.sub(r"[。．]$", "", s)
+    s = _JEPSON_RE.sub(lambda m: "", s) if _JEPSON_RE.search(s[-6:] if len(s) > 6 else s) else s
+    s = re.sub(r"とを?[、，]?$", "", s)
+    s = re.sub(r"[、，]$", "", s)
+    s = s.strip()
+    if len(s) < 2:
+        return None
+    return s + "。"
+
+
+def distribute(sent):
+    """「前記A及び前記Bのそれぞれは、…」→「前記Aは、…」「前記Bは、…」"""
+    m = _DISTRIB_RE.match(sent)
+    if not m:
+        return [sent]
+    items = [x.strip() for x in _COORD_SPLIT_RE.split(m.group("coord")) if x.strip()]
+    if len(items) < 2 or any(len(x) > 40 for x in items):
+        return [sent]
+    return [f"{x}{m.group('part')}{m.group('rest')}" for x in items]
+
+
+_ENZAI_NAME = "exp10_merge_enzai"
+
+
+def _ensure_enzai_component(pp):
+    from spacy.language import Language
+
+    if _ENZAI_NAME not in Language.factories:
+        @Language.component(_ENZAI_NAME)
+        def _merge(doc):
+            with doc.retokenize() as rt:
+                for i in range(len(doc) - 1):
+                    if doc[i].text == "延" and doc[i + 1].text.startswith("在す"):
+                        rt.merge(doc[i:i + 2], attrs={"POS": "VERB", "LEMMA": "延在する"})
+            return doc
+    if _ENZAI_NAME not in pp.nlp.pipe_names and _ENZAI_NAME not in pp.nlp.disabled:
+        pp.nlp.add_pipe(_ENZAI_NAME, first=True)
+        pp.nlp.disable_pipe(_ENZAI_NAME)
+
+
+@contextmanager
+def _enzai(pp, on):
+    if not on:
+        yield
+        return
+    _ensure_enzai_component(pp)
+    pp.nlp.enable_pipe(_ENZAI_NAME)
+    try:
+        yield
+    finally:
+        pp.nlp.disable_pipe(_ENZAI_NAME)
+
+
+def segment_relations(pp, text, distribute_each=False, merge_enzai=False):
+    """区間ごとにGiNZA単体版で解析した関係を返す（type に区間解析の種類を付ける）。"""
+    out = []
+    with _enzai(pp, merge_enzai):
+        for seg in split_claim(pp, text):
+            sent = to_sentence(seg)
+            if sent is None:
+                continue
+            sents = distribute(sent) if distribute_each else [sent]
+            for s in sents:
+                try:
+                    _, rels = pp.analyze_claim_ginza_only(s)
+                except Exception:  # noqa: BLE001
+                    continue
+                for r in rels:
+                    r = dict(r)
+                    r["seg_type"] = r.get("type", "?")
+                    r["distributed"] = len(sents) > 1
+                    out.append(r)
+    return out
+
+
+# ===========================================================================
+# 【統合】dep_pairs.py
+# ===========================================================================
+"""
+dep_pairs.py
+=============
+【実験12】係り受けに基づく汎用の候補生成（Open IE 型）。
+
+特定の書き方ごとの規則を足すのではなく、「述語（動詞・サ変名詞＋する・
+形容詞）にかかる構成要素どうしは関係を持ちうる」という一般原則だけで候補を作る。
+どの組を・どの向きで採るかは、格助詞（が・は・を・に・で・と・から・より…）、
+受身かどうか、連体修飾かどうか、といった言語的な手がかりを特徴量として
+選別モデルに学習させる（ClausIE 等の節ベース Open IE と同じ考え方）。
+
+対象: 請求項全体と、手がかり句で分割した各区間（claim_segmenter）。
+述語の項:
+  ・述語に直接かかる名詞（nsubj / obj / obl / iobj / nmod）
+  ・連体修飾（acl）の場合は、修飾される名詞
+  ・連用形・て形で続く述語（conj / advcl）は、主題（「前記Xは、」）を引き継ぐ
+"""
+import re
+
+pass  # （統合済み）import claim_segmenter as CS
+
+ARG_DEPS = {"nsubj", "obj", "obl", "iobj", "nmod", "nsubj:pass", "csubj"}
+CASES = ["が", "は", "を", "に", "で", "と", "から", "より", "へ", "の", "まで", "によって", "により", "に対して", "として", "間"]
+
+
+def _case_of(tok):
+    ps = [c.text for c in tok.children if c.dep_ in ("case", "mark") and c.i > tok.i]
+    s = "".join(ps)
+    for c in CASES:
+        if s.startswith(c) or s == c:
+            return c
+    if any(c.text == "間" for c in tok.children) or any(c.text in ("間", "との間") for c in tok.head.children if c.i > tok.i and c.i < tok.head.i):
+        return "間"
+    return s or "-"
+
+
+def _is_pred(t):
+    if t.pos_ in ("VERB", "ADJ"):
+        return True
+    if t.pos_ == "NOUN" and any(c.lemma_ == "する" or c.text in ("さ", "し", "する", "され", "される") for c in t.children if c.dep_ in ("aux", "cop")):
+        return True
+    return False
+
+
+def _label(pp, t):
+    lab = pp._relation_label(t)
+    passive = bool(re.search(r"(れ|られ|され)(る|た|て|ており|ている)?$", lab)) or any(
+        c.lemma_ in ("れる", "られる") for c in t.children if c.dep_ == "aux")
+    lab = re.sub(r"(ており|ている|ていた|て|た|、)$", "", lab)
+    if t.pos_ == "NOUN" and not lab.endswith(("する", "される", "され", "し")):
+        lab += "される" if passive else "する"
+    return lab, passive
+
+
+def _comp_map(pp, doc):
+    comps = pp.extract_patent_components_general(doc)
+    m = {}
+    for c in comps:
+        for i in range(c["start"], c["end"] + 1):
+            m[i] = c
+    return m
+
+
+def _component_of(tok, cmap):
+    c = cmap.get(tok.i)
+    return c["text"] if c else None
+
+
+def _coordinated(tok, depth=0):
+    """「A及びB」「AとBと」のような並列を展開する（GiNZAでは nmod/conj＋cc で表される）。"""
+    out = [tok]
+    if depth > 2:
+        return out
+    has_cc = any(c.dep_ == "cc" for c in tok.children)
+    for x in tok.children:
+        if x.dep_ in ("nmod", "conj") and (has_cc or any(c.dep_ == "cc" for c in x.children)
+                                            or _case_of(x) == "と" or x.dep_ == "conj"):
+            out += _coordinated(x, depth + 1)
+    return out
+
+
+def pairs_from_doc(pp, doc, scope):
+    cmap = _comp_map(pp, doc)
+    out = []
+    topic = None
+    for t in doc:
+        if not _is_pred(t):
+            continue
+        args = []
+        for c in t.children:
+            if c.dep_ in ARG_DEPS:
+                case = _case_of(c)
+                for k, x in enumerate(_coordinated(c)):
+                    name = _component_of(x, cmap)
+                    if name:
+                        args.append((name, case, c.dep_ + ("" if k == 0 else "+並列"), x.i))
+        if t.dep_ == "acl":
+            for k, x in enumerate(_coordinated(t.head)):
+                name = _component_of(x, cmap)
+                if name:
+                    args.append((name, "連体", "acl_head" + ("" if k == 0 else "+並列"), x.i))
+        tops = [a for a in args if a[1] == "は"]
+        if tops:
+            topic = tops[0]
+        elif topic is not None and t.dep_ in ("conj", "advcl", "ROOT") and not any(a[1] in ("が",) for a in args):
+            if topic[0] not in [a[0] for a in args]:
+                args.append((topic[0], "は(継承)", "topic", topic[3]))
+        seen, uniq = set(), []
+        for a in args:
+            if a[0] not in seen:
+                seen.add(a[0])
+                uniq.append(a)
+        if len(uniq) < 2 or len(uniq) > 6:
+            continue
+        lab, passive = _label(pp, t)
+        for a in uniq:
+            for b in uniq:
+                if a[0] == b[0]:
+                    continue
+                out.append({
+                    "source": a[0], "relation": lab, "target": b[0], "scope": scope,
+                    "src_case": a[1], "tgt_case": b[1], "src_dep": a[2], "tgt_dep": b[2],
+                    "passive": passive, "dist": abs(a[3] - b[3]), "src_before": a[3] < b[3],
+                    "n_args": len(uniq), "pred_pos": t.pos_,
+                })
+    return out
+
+
+def dependency_pairs(pp, text):
+    with _enzai(pp, True):
+        return _dependency_pairs(pp, text)
+
+
+def _dependency_pairs(pp, text):
+    res = []
+    try:
+        res += pairs_from_doc(pp, pp.nlp(pp._clean_claim_text(text)), "全体")
+    except Exception:  # noqa: BLE001
+        pass
+    for seg in split_claim(pp, text):
+        sent = to_sentence(seg)
+        if sent is None:
+            continue
+        for s in distribute(sent):
+            try:
+                res += pairs_from_doc(pp, pp.nlp(pp._clean_claim_text(s)), "区間")
+            except Exception:  # noqa: BLE001
+                continue
+    return res
+
+
+# ===========================================================================
+# 【統合】sao_selector.py
+# 名前の付け替え: Selector → Selector9, TRAIN_FILE → TRAIN_FILE9, analyze_claim_selected → analyze_claim_selected9, build_candidates → build_candidates9, claim_features → claim_features9, select → select9
+# ===========================================================================
+"""
+sao_selector.py
+================
+候補選別モデル（実験9）。
+
+LLM直接抽出・GiNZA補完・GiNZA単体版の出力をすべて「候補」として集め、
+候補の関係ごとに「正解である確率」を学習済みモデルで予測して、
+確率がしきい値以上のものだけを採用する。同じ2つの構成要素の組（向きを
+問わない）からは、確率が最も高い1件だけを採る。
+
+実験2〜8では「このtypeのこの関係語はLLMに再確認させる」「この語が目的語
+なら消す」といったルールを1つずつ足してきたが、ここではそれらの判断材料
+（抽出元、関係語の種類、fan-out、題名かどうか、本文中の位置など）を
+特徴量としてまとめて与え、どう組み合わせるかは学習に任せる。
+LLMの呼び出しは抽出の1回だけ（実験2〜4の検証LLMは使わない）。
+
+学習データ（sao_selector_train.npz）は、532件の正解データから作った
+候補ごとの特徴量とラベル。評価時は交差検証の分割ごとに、その分割を除いた
+請求項だけで学習したモデルを使う（学習に使った請求項で評価しない）。
+"""
+import re
+from collections import Counter
+import pathlib as _pathlib
+
+import numpy as np
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE9 = HERE / "sao_selector_train.npz"
+
+INVALID = {"複数", "互い", "こと", "もの", "場合", "状態", "様子", "全体", "一部", "両方", "それぞれ",
+           "いずれか", "各々", "これ", "それ", "あれ", "ここ", "そこ", "一方", "他方",
+           "それぞれの一方", "それぞれの他方", "少なくとも", "前記", "所定"}
+SIMPLIFIED = set("收离构设为们这个从与际图电气压热导线发开关实现应该总数据还样进过对时")
+SRC_KEYS = ["E1:llm_direct", "E1:claim_title_ginza", "E1:claim_title_ginza_conflict",
+            "E1:ginza_has_fallback", "E1:ginza_has_fallback_conflict", "E1:attribute",
+            "G:direct", "G:positional", "G:has", "LLMraw", "REV", "VERB"]
+FORMATS = ["順次列挙形式", "構成要素列挙形式", "ジェプソン的形式"]
+# LLMが関係語に中国語の簡体字を混ぜることがある（例：收容する）ので日本の字体に直す
+SIMP = str.maketrans({"收": "収", "离": "離", "构": "構", "并": "並", "设": "設", "为": "為", "电": "電",
+                      "气": "気", "压": "圧", "热": "熱", "导": "導", "线": "線", "发": "発", "开": "開",
+                      "关": "関", "实": "実", "现": "現", "应": "応", "总": "総", "进": "進", "过": "過",
+                      "对": "対", "时": "時", "连": "連", "结": "結", "层": "層", "极": "極", "块": "塊",
+                      "从": "従", "个": "個", "际": "際", "图": "図", "样": "様", "动": "動", "驱": "駆",
+                      "边": "辺", "侧": "側", "间": "間", "备": "備", "装": "装", "据": "拠", "变": "変",
+                      "绝": "絶", "缘": "縁", "传": "伝", "递": "逓", "输": "輸", "给": "給", "调": "調",
+                      "节": "節", "测": "測", "检": "検", "术": "術", "处": "処", "理": "理", "盖": "蓋",
+                      "载": "載", "阳": "陽", "阴": "陰", "储": "貯", "续": "続", "转": "転", "换": "換"})
+KEPT_INDEX = len(SRC_KEYS)  # 実験4の検証LLMを通ったかどうか（本モデルでは常に0として使う）
+
+
+def rel_group(pp, rel):
+    for i, group in enumerate(pp.RELATION_SYNONYM_GROUPS):
+        if any((g in rel) if len(g) > 1 else (g == rel) for g in group):
+            return i
+    return -1
+
+
+def claim_features9(pp, info):
+    """info = {"cands": [...], "tags": [...], "title": str|None, "cleaned": str, "format": str}"""
+    n = pp._normalize_node_text_lenient
+    surface = set(getattr(pp, "_SURFACE_LOCATION_WORDS", set()))
+    n_groups = len(pp.RELATION_SYNONYM_GROUPS)
+    cands = info["cands"]
+    title = info["title"]
+    tags = set(info["tags"])
+    text = info["cleaned"]
+    out_deg = Counter(c["source"] for c in cands)
+    in_deg = Counter(c["target"] for c in cands)
+    owners = Counter(c["target"] for c in cands if rel_group(pp, c["relation"]) == 0)
+    pairs = Counter((c["source"], c["target"]) for c in cands)
+    llm_pairs = {(c["source"], c["target"]) for c in cands
+                 if "E1:llm_direct" in c["srcs"] or "LLMraw" in c["srcs"]}
+    g_pairs = {(c["source"], c["target"]) for c in cands if any(s.startswith("G:") for s in c["srcs"])}
+    rows = []
+    for c in cands:
+        s, r, t = c["source"], c["relation"], c["target"]
+        f = [float(k in c["srcs"]) for k in SRC_KEYS]
+        f += [float(c.get("kept", False)), float(len(c["srcs"]))]
+        f += [float((s, t) in llm_pairs), float((s, t) in g_pairs), float((t, s) in llm_pairs),
+              float((t, s) in g_pairs), float(pairs[(s, t)] - 1), float((t, s) in pairs)]
+        g = rel_group(pp, r)
+        f += [float(g == i) for i in range(-1, n_groups)]
+        f += [float(len(r)), float("《" in r), float(r == "の"),
+              float(bool(re.search(r"(される|られる|され|られ)$", r))),
+              float(any(ch in SIMPLIFIED for ch in r))]
+        for x in (s, t):
+            f += [float(x == title), float(x in tags), float(len(x)), float("の" in x),
+                  float(bool(re.search(r"\d|[０-９]", x))), float(x in INVALID or n(x) in INVALID),
+                  float(x in surface), float(x in text)]
+        f += [float(out_deg[s]), float(in_deg[t]), float(owners[t]), float(out_deg[t]), float(in_deg[s])]
+        ps, pt = text.find(s), text.find(t)
+        f += [float(ps), float(pt), float(abs(ps - pt) if ps >= 0 and pt >= 0 else -1),
+              float(ps < pt if ps >= 0 and pt >= 0 else -1), float(len(text))]
+        f += [float(len(tags)), float(len(cands))] + [float(info["format"] == x) for x in FORMATS]
+        rows.append(f)
+    X = np.array(rows, dtype=float) if rows else np.zeros((0, 1))
+    if len(X):
+        X[:, KEPT_INDEX] = 0.0
+    return X
+
+
+def build_candidates9(ts, pp, text, llm_output=None, llm_cache=None, claim_id=None,
+                     model=None, host=None):
+    """候補を集める。LLMの呼び出しは抽出の1回だけ（llm_cacheがあればそれを使う）。"""
+    tagged_text, t2t, tag_doc, tag_comps = tag_components(text, pp)
+    debug_out = {}
+    kw = {} if model is None else {"model": model}
+    if llm_output is not None:
+        llm_cache = {"_": {"tagged_text_hash": _hash_text(tagged_text), "llm_output": llm_output}}
+        claim_id = "_"
+    _, e1 = analyze_claim_llm_direct(text, pp=pp, host=host, llm_cache=llm_cache,
+                                        claim_id=claim_id, debug_out=debug_out, **kw)
+    raw = extract_relations_from_llm_output(debug_out.get("llm_output", ""), t2t)
+    try:
+        _, g = pp.analyze_claim_ginza_only(text)
+    except Exception:  # noqa: BLE001
+        g = []
+    cands = {}
+
+    def add(r, src):
+        rel = r["relation"].translate(SIMP)
+        key = (r["source"], rel, r["target"])
+        c = cands.setdefault(key, {"source": key[0], "relation": rel, "target": key[2],
+                                   "srcs": [], "type": r.get("type", src)})
+        if src not in c["srcs"]:
+            c["srcs"].append(src)
+
+    for r in e1:
+        add(r, "E1:" + r["type"])
+    for r in g:
+        add(r, "G:" + r.get("type", "?"))
+    for r in raw:
+        add(r, "LLMraw")
+    last_i = len(tag_doc) - 1
+    while last_i > 0 and tag_doc[last_i].pos_ == "PUNCT":
+        last_i -= 1
+    tc = pp.find_component_by_token(tag_comps, last_i)
+    return {"cands": list(cands.values()), "tags": sorted(set(t2t.values())),
+            "title": tc["text"] if tc is not None else None,
+            "cleaned": pp._clean_claim_text(text), "format": pp.classify_claim_format(text)}
+
+
+def select9(pp, info, prob, threshold):
+    """確率の高い順に採用。同じ2つの構成要素の組（向きを問わない）からは1件だけ。"""
+    n = pp._normalize_node_text_lenient
+    out, seen = [], set()
+    for i in np.argsort(-prob):
+        if prob[i] < threshold:
+            break
+        c = info["cands"][i]
+        key = frozenset((n(c["source"]), n(c["target"])))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
+                    "type": c["srcs"][0].split(":")[-1] if c["srcs"] else "selected",
+                    "prob": float(prob[i])})
+    return out
+
+
+class Selector9:
+    """学習データから選別モデルを作る。exclude_ids を渡すと、その請求項を除いて学習する
+    （交差検証の評価用）。"""
+
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE9):
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        d = np.load(train_file, allow_pickle=False)
+        X, Y, ids = d["X"], d["Y"], d["ids"]
+        self.threshold = float(d["threshold"])
+        if exclude_ids:
+            keep = ~np.isin(ids, np.array(sorted(exclude_ids)))
+            X, Y = X[keep], Y[keep]
+        X = X.copy()
+        X[:, KEPT_INDEX] = 0.0
+        self.model = HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=40,
+            l2_regularization=1.0, early_stopping=False, random_state=0).fit(X, Y)
+
+    def predict(self, pp, info):
+        X = claim_features9(pp, info)
+        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
+
+
+def analyze_claim_selected9(ts, pp, selector, text, threshold=None, **kw):
+    info = build_candidates9(ts, pp, text, **kw)
+    prob = selector.predict(pp, info)
+    rels = select9(pp, info, prob, selector.threshold if threshold is None else threshold)
+    return info, rels
+
+
+def cv_folds(texts_by_id, n_folds=5, seed=42):
+    """本文が同じ請求項を同じ分割に入れた、交差検証の分割（学習時と同じ分け方）。"""
+    import random
+    groups = {}
+    for cid, text in texts_by_id.items():
+        groups.setdefault("".join(text.split()), []).append(cid)
+    glist = list(groups.values())
+    random.Random(seed).shuffle(glist)
+    return [[c for g in glist[i::n_folds] for c in g] for i in range(n_folds)]
+
+
+# ===========================================================================
+# 【統合】sao_selector10.py
+# 名前の付け替え: Selector → Selector10, TRAIN_FILE → TRAIN_FILE10, analyze_claim_selected → analyze_claim_selected10, build_candidates → build_candidates10, claim_features → claim_features10
+# ===========================================================================
+"""
+sao_selector10.py
+==================
+【実験10】実験9（sao_selector.py）の候補に、手がかり句で分割した区間ごとの
+GiNZA解析（claim_segmenter.py）の結果を追加した候補選別モデル。
+実験9のコード・学習データには一切手を加えず、候補と特徴量を足すだけにしている。
+"""
+import pathlib as _pathlib
+
+import numpy as np
+
+pass  # （統合済み）import claim_segmenter as CS
+pass  # （統合済み）import sao_selector as S
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE10 = HERE / "sao_selector10a_train.npz"
+SEG_KEYS = ["GS:direct", "GS:positional", "GS:has", "GS:distrib"]
+
+
+def build_candidates10(ts, pp, text, variant="a", **kw):
+    """variant="a"（採用）: 分割のみ。"b": 分割＋「それぞれ」の展開＋「延在」の結合（効果なし）。"""
+    info = build_candidates9(ts, pp, text, **kw)
+    rels = segment_relations(pp, text, distribute_each=(variant == "b"), merge_enzai=(variant == "b"))
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    for r in rels:
+        rel = r["relation"].translate(SIMP)
+        key = (r["source"], rel, r["target"])
+        c = index.get(key)
+        if c is None:
+            c = {"source": key[0], "relation": rel, "target": key[2], "srcs": [], "type": "GS:" + r["seg_type"]}
+            info["cands"].append(c)
+            index[key] = c
+        for src in ["GS:" + r["seg_type"]] + (["GS:distrib"] if r.get("distributed") else []):
+            if src not in c["srcs"]:
+                c["srcs"].append(src)
+    return info
+
+
+def claim_features10(pp, info):
+    X = claim_features9(pp, info)
+    if not len(info["cands"]):
+        return X
+    cands = info["cands"]
+    gs_pairs = {(c["source"], c["target"]) for c in cands if any(s.startswith("GS:") for s in c["srcs"])}
+    extra = []
+    for c in cands:
+        f = [float(k in c["srcs"]) for k in SEG_KEYS]
+        f += [float((c["source"], c["target"]) in gs_pairs), float((c["target"], c["source"]) in gs_pairs),
+              float(sum(s.startswith("GS:") for s in c["srcs"]))]
+        extra.append(f)
+    return np.hstack([X, np.array(extra, dtype=float)])
+
+
+class Selector10(Selector9):
+    """実験10の選別モデル。学習データと特徴量だけが実験9と異なる。"""
+
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE10):
+        super().__init__(exclude_ids=exclude_ids, train_file=train_file)
+
+    def predict(self, pp, info):
+        X = claim_features10(pp, info)
+        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
+
+
+def analyze_claim_selected10(ts, pp, selector, text, threshold=None, **kw):
+    info = build_candidates10(ts, pp, text, **kw)
+    prob = selector.predict(pp, info)
+    rels = select9(pp, info, prob, selector.threshold if threshold is None else threshold)
+    return info, rels
+
+
+# ===========================================================================
+# 【統合】sao_selector11.py
+# 名前の付け替え: Selector → Selector11, TRAIN_FILE → TRAIN_FILE11, analyze_claim_selected → analyze_claim_selected11, build_candidates → build_candidates11, claim_features → claim_features11, select → select11
+# ===========================================================================
+"""
+sao_selector11.py
+==================
+【実験11】ノードの粒度（「XのY」の結合）を、候補として選べるようにしたもの。
+
+532件の正解データの分析（「XのY」でX・Yともにタグになっている1,341箇所）:
+  ・正解で「XのY」が1つのノードになっている：526箇所
+  ・正解ではYが単独のノードになっている　　：約310箇所
+  → 無条件に結合すると約4割で誤るため、結合は規則で決めず「結合した候補」を
+    追加して、実験9と同じ選別モデルにどちらを採るか判断させる。
+  ・Yが本文で常に「〜のY」の形でしか出てこない場合は結合が約9割、単独でも
+    出てくる場合は約8割（この情報を特徴量として与える）。
+  ・正解に結合ノードがある場合、「X の XのY」という関係も約4分の1で付いている
+    ので、その候補も追加する。
+
+同じ箇所の「Y」と「XのY」は、どちらか一方しか採らない（選別時に同じ組とみなす）。
+
+学習ラベルは主指標と同じ「トリプル完全一致」（node_match_eval.evaluate_triples_exact
+と同じ基準）で付けている。主語・目的語ごとの意味的類似度（包含を一致とみなす）で
+ラベルを付けると「Y」と「XのY」が同じ扱いになり、結合を学習できない（その条件では
+F1が1.4pt下がった）。
+実験9・10のコードと学習データには手を加えない。
+"""
+import re
+import pathlib as _pathlib
+
+import numpy as np
+
+pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import sao_selector10 as S10
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE11 = HERE / "sao_selector11_train.npz"
+
+
+def merge_occurrences(info):
+    """本文中の「XのY」（X・Yともにタグ）を探し、Y→[X, ...] を返す。"""
+    text = info["cleaned"]
+    tags = sorted(set(info["tags"]), key=len, reverse=True)
+    owners = {}
+    for X in tags:
+        for Y in tags:
+            if X != Y and (X + "の" + Y) in text:
+                owners.setdefault(Y, [])
+                if X not in owners[Y]:
+                    owners[Y].append(X)
+    return owners
+
+
+def build_candidates11(ts, pp, text, **kw):
+    info = build_candidates10(ts, pp, text, variant="a", **kw)
+    owners = merge_occurrences(info)
+    text_c = info["cleaned"]
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    base = {}
+
+    def add(src, rel, tgt, srcs, bsrc, btgt):
+        key = (src, rel, tgt)
+        if key in index:
+            c = index[key]
+            for s in srcs:
+                if s not in c["srcs"]:
+                    c["srcs"].append(s)
+            return
+        c = {"source": src, "relation": rel, "target": tgt, "srcs": list(srcs), "type": "MRG"}
+        info["cands"].append(c)
+        index[key] = c
+        base[key] = (bsrc, btgt)
+
+    for c in list(info["cands"]):
+        for side in ("source", "target"):
+            Y = c[side]
+            for X in owners.get(Y, []):
+                M = X + "の" + Y
+                other = c["target"] if side == "source" else c["source"]
+                if other in (X, M):
+                    continue
+                new = dict(source=c["source"], target=c["target"])
+                new[side] = M
+                add(new["source"], c["relation"], new["target"],
+                    [s for s in c["srcs"]] + ["MRG"], c["source"], c["target"])
+    for Y, xs in owners.items():
+        for X in xs:
+            add(X, "の", X + "の" + Y, ["MRG:link"], X, Y)
+    info["merge_owners"] = owners
+    info["merge_base"] = {"|".join(k): list(v) for k, v in base.items()}
+    info["y_always_no"] = {Y: (text_c.count(Y) == text_c.count("の" + Y)) for Y in owners}
+    return info
+
+
+def claim_features11(pp, info):
+    X = claim_features10(pp, info)
+    if not len(info["cands"]):
+        return X
+    owners = info.get("merge_owners", {})
+    merged_nodes = {X_ + "の" + Y: Y for Y, xs in owners.items() for X_ in xs}
+    extra = []
+    for c in info["cands"]:
+        ms = [merged_nodes[x] for x in (c["source"], c["target"]) if x in merged_nodes]
+        ys = [x for x in (c["source"], c["target"]) if x in owners]
+        y = ms[0] if ms else (ys[0] if ys else None)
+        extra.append([
+            float("MRG" in c["srcs"]), float("MRG:link" in c["srcs"]), float(bool(ms)), float(bool(ys)),
+            float(info.get("y_always_no", {}).get(y, False)) if y else -1.0,
+            float(len(owners.get(y, []))) if y else 0.0,
+            float(bool(re.search(r"\d|[０-９一二三四五六七八九]", y))) if y else -1.0,
+            float(len(y)) if y else 0.0,
+        ])
+    return np.hstack([X, np.array(extra, dtype=float)])
+
+
+def select11(pp, info, prob, threshold):
+    """実験9と同じ選び方。ただし「XのY」と「Y」は同じノードとみなして組の重複を判定する。"""
+    n = pp._normalize_node_text_lenient
+    owners = info.get("merge_owners", {})
+    canon = {X + "の" + Y: Y for Y, xs in owners.items() for X in xs}
+    out, seen = [], set()
+    for i in np.argsort(-prob):
+        if prob[i] < threshold:
+            break
+        c = info["cands"][i]
+        key = frozenset((n(canon.get(c["source"], c["source"])), n(canon.get(c["target"], c["target"]))))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
+                    "type": c["srcs"][0].split(":")[-1] if c["srcs"] else "selected",
+                    "prob": float(prob[i])})
+    return out
+
+
+class Selector11(Selector9):
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE11):
+        super().__init__(exclude_ids=exclude_ids, train_file=train_file)
+
+    def predict(self, pp, info):
+        X = claim_features11(pp, info)
+        return self.model.predict_proba(X)[:, 1] if len(info["cands"]) else np.zeros(0)
+
+
+def analyze_claim_selected11(ts, pp, selector, text, threshold=None, **kw):
+    info = build_candidates11(ts, pp, text, **kw)
+    prob = selector.predict(pp, info)
+    return info, select11(pp, info, prob, selector.threshold if threshold is None else threshold)
+
+
+# ===========================================================================
+# 【統合】sao_selector12.py
+# 名前の付け替え: Selector → Selector12, TRAIN_FILE → TRAIN_FILE12, analyze_claim_selected → analyze_claim_selected12, build_candidates → build_candidates12, claim_features → claim_features12, select → select12, structural_features → structural_features12
+# ===========================================================================
+"""
+sao_selector12.py
+==================
+【実験12】抽出の欠点（余計な抽出・取り逃し・苦手な関係）を、個別の規則ではなく汎用的な
+仕組みで改善する。試した仕組みと、交差検証（主指標：トリプル完全一致）での採否：
+
+(1) 係り受けに基づく汎用の候補生成（dep_pairs.py）…… 採用（+1.28pt）
+    述語（動詞・サ変名詞・形容詞）にかかる構成要素どうしをすべて候補の組にし、
+    格助詞・受身・連体修飾・並列などを特徴量として選別モデルに与える（節ベースの
+    Open IE と同じ考え方）。「接続される」「封止する」など有する系以外の関係に効く。
+(2) 2段階の選別 …… 採用（+0.35pt、信頼区間は0をわずかにまたぐ）
+    1段目の確率から、同じ組・逆向きの組の中での順位、同じ部品を持つ別の持ち主の確率、
+    A→B→C の経路（近道）、各ノードにとって最も確からしい関係か、を作り、2段目で選び直す。
+(3) 1組から2件目の関係も採る …… 不採用
+    同じ組から採る関係の最大数（1 か 2）を内側の交差検証で選ばせたところ、全分割で1が選ばれた。
+(4) 持ち主つきノード「XのY」の候補（OWN）…… 不採用
+    75,464 件の候補のうち正解は 340 件（0.4%）、選ばれた 6 件はすべて誤りだった。
+    （own=True で作れるが、配布した学習データは使っていない）
+(5) 持ち主の情報で「XのY」と「Y」を同じ組とみなす（owner_canon）…… 不採用（−0.13pt）
+
+しきい値・1組の最大件数を選ぶ内側の評価は、主指標と同じく「1つの正解には1つの抽出だけを
+対応させる」数え方にした（同義の関係が2件とも正解に数えられる水増しを防ぐ）。
+学習ラベル・モデル選択・評価はすべてトリプル完全一致（実験11と同じ基準）。
+"""
+import re
+from collections import defaultdict
+import pathlib as _pathlib
+
+import numpy as np
+
+pass  # （統合済み）import dep_pairs as D
+pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import sao_selector11 as S11
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE12 = HERE / "sao_selector12_train.npz"
+CASE_KEYS = CASES + ["連体", "は(継承)", "-"]
+HAS = {"有する", "備える", "具備する", "含む", "含める", "の"}
+
+
+def _is_has(rel):
+    return rel in HAS or any(h in rel for h in ("有する", "備える", "具備する", "含む"))
+
+
+def build_candidates12(ts, pp, text, own=False, owner_canon=False, **kw):
+    """実験11の候補に、係り受けに基づく候補（DEP）を加える。
+    owner_canon=True: 候補の「X 有する Y」から持ち主Xを求め、「XのY」と「Y」を同じ組とみなして
+      重複を除く（選別時）。採用した実験12（dep）はこれを使わない設定で学習したので、既定は False。
+    own=True: 持ち主つきノード「XのY」の候補（OWN）も作る。532件の検証で、OWN候補は75,464件中
+      正解が340件（0.4%）しかなく、選別モデルが選んだものはすべて誤りだったため、既定では作らない。"""
+    info = build_candidates11(ts, pp, text, **kw)
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    for c in info["cands"]:
+        c.setdefault("dep", None)
+
+    def add(src, rel, tgt, tag, dep=None, base=None):
+        key = (src, rel, tgt)
+        c = index.get(key)
+        if c is None:
+            c = {"source": src, "relation": rel, "target": tgt, "srcs": [], "type": tag, "dep": None}
+            info["cands"].append(c)
+            index[key] = c
+        if tag not in c["srcs"]:
+            c["srcs"].append(tag)
+        if dep is not None:
+            agg = c["dep"] or {"n": 0, "scope": set(), "sc": set(), "tc": set(), "passive": False,
+                               "before": False, "dist": 99, "n_args": 0, "noun_pred": False, "coord": False}
+            agg["n"] += 1
+            agg["scope"].add(dep["scope"])
+            agg["sc"].add(dep["src_case"])
+            agg["tc"].add(dep["tgt_case"])
+            agg["passive"] |= dep["passive"]
+            agg["before"] |= dep["src_before"]
+            agg["dist"] = min(agg["dist"], dep["dist"])
+            agg["n_args"] = max(agg["n_args"], dep["n_args"])
+            agg["noun_pred"] |= dep["pred_pos"] == "NOUN"
+            agg["coord"] |= "並列" in dep["src_dep"] or "並列" in dep["tgt_dep"]
+            c["dep"] = agg
+        if base is not None:
+            c["own_base"] = base
+        return c
+
+    for d in dependency_pairs(pp, text):
+        add(d["source"], d["relation"].translate(SIMP), d["target"], "DEP", dep=d)
+
+    title = info["title"]
+    owners = defaultdict(list)
+    for c in info["cands"]:
+        if _is_has(c["relation"]) and c["source"] != title and "の" not in c["target"] \
+                and c["source"] not in owners[c["target"]] and len(owners[c["target"]]) < 3:
+            owners[c["target"]].append(c["source"])
+    if own:
+        for c in list(info["cands"]):
+            for side in ("source", "target"):
+                Y = c[side]
+                for X in owners.get(Y, []):
+                    other = c["target"] if side == "source" else c["source"]
+                    if other == Y or (other == X and side == "source"):
+                        continue
+                    new = {"source": c["source"], "target": c["target"]}
+                    new[side] = X + "の" + Y
+                    if new["source"] == new["target"]:
+                        continue
+                    add(new["source"], c["relation"], new["target"], "OWN", base=Y)
+    info["own_owners"] = {k: v for k, v in owners.items()} if (owner_canon or own) else {}
+    for c in info["cands"]:
+        if c.get("dep") is not None:
+            c["dep"] = {k: (sorted(v) if isinstance(v, set) else v) for k, v in c["dep"].items()}
+    return info
+
+
+def canon(info):
+    m = {}
+    for Y, xs in info.get("merge_owners", {}).items():
+        for X in xs:
+            m[X + "の" + Y] = Y
+    for Y, xs in info.get("own_owners", {}).items():
+        for X in xs:
+            m.setdefault(X + "の" + Y, Y)
+    return m
+
+
+def claim_features12(pp, info):
+    X = claim_features11(pp, info)
+    if not len(info["cands"]):
+        return X
+    rows = []
+    for c in info["cands"]:
+        d = c.get("dep")
+        f = [float("DEP" in c["srcs"]), float("OWN" in c["srcs"])]
+        if d:
+            f += [float(d["n"]), float("全体" in d["scope"]), float("区間" in d["scope"]),
+                  float(d["passive"]), float(d["before"]), float(d["dist"]), float(d["n_args"]),
+                  float(d["noun_pred"]), float(d["coord"])]
+            f += [float(k in d["sc"]) for k in CASE_KEYS] + [float(k in d["tc"]) for k in CASE_KEYS]
+        else:
+            f += [0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0] + [0.0] * (2 * len(CASE_KEYS))
+        f += [float(len(info.get("own_owners", {}).get(c.get("own_base", ""), [])))]
+        rows.append(f)
+    return np.hstack([X, np.array(rows, dtype=float)])
+
+
+def structural_features12(pp, info, p):
+    """1段目の確率 p から、組・持ち主・経路の構造的な特徴を作る（2段目用）。"""
+    n = pp._normalize_node_text_lenient
+    cm = canon(info)
+    cands = info["cands"]
+    key = [(n(cm.get(c["source"], c["source"])), n(cm.get(c["target"], c["target"]))) for c in cands]
+    pair_ps = defaultdict(list)
+    for i, (s, t) in enumerate(key):
+        pair_ps[frozenset((s, t))].append(p[i])
+    best_dir = defaultdict(float)
+    for i, k in enumerate(key):
+        best_dir[k] = max(best_dir[k], p[i])
+    has_edge = defaultdict(float)
+    owner_ps = defaultdict(list)
+    out_best, in_best, node_best = defaultdict(float), defaultdict(float), defaultdict(float)
+    for i, (c, (s, t)) in enumerate(zip(cands, key)):
+        if _is_has(c["relation"]):
+            has_edge[(s, t)] = max(has_edge[(s, t)], p[i])
+            owner_ps[t].append((p[i], s))
+        out_best[s] = max(out_best[s], p[i])
+        in_best[t] = max(in_best[t], p[i])
+        node_best[s] = max(node_best[s], p[i])
+        node_best[t] = max(node_best[t], p[i])
+    children = defaultdict(list)
+    for (s, t), v in has_edge.items():
+        children[s].append((t, v))
+    rows = []
+    for i, (c, (s, t)) in enumerate(zip(cands, key)):
+        ps = sorted(pair_ps[frozenset((s, t))], reverse=True)
+        rank = ps.index(p[i])
+        others = [q for q in ps if q != p[i]] or [0.0]
+        rev = best_dir.get((t, s), 0.0)
+        own_other = max([q for q, o in owner_ps[t] if o != s] or [0.0])
+        n_own = len({o for q, o in owner_ps[t] if q >= 0.3})
+        shortcut = max([min(v, has_edge.get((m, t), 0.0)) for m, v in children[s] if m != t] or [0.0])
+        via = max([min(has_edge.get((s2, s), 0.0), p[i]) for s2 in [] ] or [0.0])
+        rows.append([
+            p[i], float(rank), max(others), rev, p[i] - rev, own_other, p[i] - own_other, float(n_own),
+            shortcut, p[i] - shortcut, node_best[s], node_best[t], float(p[i] >= node_best[s] - 1e-9),
+            float(p[i] >= node_best[t] - 1e-9), out_best[s], in_best[t], float(len(ps)), via,
+            float(_is_has(c["relation"])),
+        ])
+    return np.array(rows, dtype=float) if rows else np.zeros((0, 19))
+
+
+def select12(pp, info, prob, threshold, max_per_pair=2):
+    """確率の高い順に採用。同じ組（「XのY」と「Y」は同じノードとみなす）では最大 max_per_pair 件まで。
+    2件目は、既に採った関係と同義でないものだけ。max_per_pair は交差検証の内側で選ぶ。"""
+    pass  # （統合済み）import node_match_eval as NM
+
+    n = pp._normalize_node_text_lenient
+    cm = canon(info)
+    out, chosen = [], defaultdict(list)
+    for i in np.argsort(-prob):
+        if prob[i] < threshold:
+            break
+        c = info["cands"][i]
+        k = frozenset((n(cm.get(c["source"], c["source"])), n(cm.get(c["target"], c["target"]))))
+        if any(rel_match(pp, c["relation"], r) or rel_match(pp, r, c["relation"]) for r in chosen[k]):
+            continue
+        if len(chosen[k]) >= max_per_pair:
+            continue
+        chosen[k].append(c["relation"])
+        out.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
+                    "type": c["srcs"][0].split(":")[-1] if c["srcs"] else "selected",
+                    "prob": float(prob[i])})
+    return out
+
+
+def _model():
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                                          min_samples_leaf=40, l2_regularization=1.0,
+                                          early_stopping=False, random_state=0)
+
+
+class Selector12:
+    """2段階の選別モデル。学習データ（npz）には1段目の特徴量X1・ラベルY・請求項ID・
+    学習時の1段目確率（交差検証の外側で求めたもの）P1・2段目の構造特徴X2を保存してある。"""
+
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE12, fold=None):
+        """exclude_ids を除いて学習する（交差検証の評価用）。fold を渡すと、2段目の構造特徴に
+        「その分割の学習用請求項だけで作った1段目の確率」から求めたもの（X2_fold{k}）を使い、
+        交差検証（make_train12.py）と同じモデルを再現する。"""
+        d = np.load(train_file, allow_pickle=False)
+        keep = np.ones(len(d["Y"]), bool)
+        if exclude_ids:
+            keep = ~np.isin(d["ids"], np.array(sorted(exclude_ids)))
+        x2_key = "X2_fold%d" % fold if fold is not None and ("X2_fold%d" % fold) in d.files else "X2"
+        X1, Y, X2 = d["X1"][keep], d["Y"][keep], d[x2_key][keep]
+        self.fold_thresholds = [float(t) for t in d["fold_thresholds"]] if "fold_thresholds" in d.files else None
+        X1 = X1.copy()
+        X1[:, KEPT_INDEX] = 0.0
+        self.m1 = _model().fit(X1, Y)
+        self.m2 = _model().fit(np.hstack([X1, X2]), Y)
+        self.threshold = float(d["threshold"])
+        self.max_per_pair = int(d["max_per_pair"]) if "max_per_pair" in d.files else 2
+        self.fold_max_per_pair = [int(x) for x in d["fold_max_per_pair"]] if "fold_max_per_pair" in d.files else None
+
+    def predict(self, pp, info):
+        if not len(info["cands"]):
+            return np.zeros(0)
+        X1 = claim_features12(pp, info)
+        p1 = self.m1.predict_proba(X1)[:, 1]
+        X2 = structural_features12(pp, info, p1)
+        return self.m2.predict_proba(np.hstack([X1, X2]))[:, 1]
+
+
+def analyze_claim_selected12(ts, pp, selector, text, threshold=None, max_per_pair=None, **kw):
+    info = build_candidates12(ts, pp, text, **kw)
+    prob = selector.predict(pp, info)
+    return info, select12(pp, info, prob, selector.threshold if threshold is None else threshold,
+                        selector.max_per_pair if max_per_pair is None else max_per_pair)
+
+
+# ===========================================================================
+# 【統合】platform_core.py
+# 名前の付け替え: structural_features → claim_structure_features
+# ===========================================================================
+"""
+platform_core.py
+=================
+特許分析プラットフォーム（app.py）のデータ処理部分。
+画面（Streamlit）に依存しない処理だけをまとめる。
+
+  ・コーパス（532件）の読み込み：corpus_sao_532.json
+  ・採用／要確認／除外の判定（選別モデルの確率を、交差検証で較正した帯で区切る）
+  ・人手の確認・修正結果の反映
+  ・構造的特徴量（レーダーチャート用。特許の「強さ」ではなく請求項の書き方の構造）
+  ・SAOネットワーク（全特許の構成要素を基本語にまとめたグラフ）
+  ・類似性（SAOトリプルのTF-IDFとコサイン類似度）
+  ・Excel／CSVへの書き出し
+"""
+import io
+import json
+import math
+import re
+from collections import Counter, defaultdict
+import pathlib as _pathlib
+
+import numpy as np
+import pandas as pd
+
+HERE = _pathlib.Path(__file__).resolve().parent
+CORPUS_NAME = "corpus_sao_532.json"
+
+
+def find_corpus_file():
+    """corpus_sao_532.json を、このファイルと同じフォルダ・実行フォルダ・その下の
+    SAO_platform_実験12 フォルダの順に探す（見つからなければ None）。"""
+    for d in (HERE, _pathlib.Path.cwd(), HERE / "SAO_platform_実験12", _pathlib.Path.cwd() / "SAO_platform_実験12"):
+        f = d / CORPUS_NAME
+        if f.exists():
+            return f
+    return None
+
+
+CORPUS_FILE = find_corpus_file() or (HERE / CORPUS_NAME)
+
+STATUS_ACCEPT = "採用"
+STATUS_REVIEW = "要確認"
+STATUS_REJECT = "除外"
+STATUS_ORDER = [STATUS_ACCEPT, STATUS_REVIEW, STATUS_REJECT]
+
+HAS_WORDS = ("有する", "備える", "具備する", "含む", "含める")
+
+# ---------------------------------------------------------------------------
+# 読み込み
+# ---------------------------------------------------------------------------
+
+
+def load_corpus(path=None):
+    """corpus_sao_532.json を読み込む。
+    戻り値: dict(meta=..., bands=..., patents=[{id, title, applicant, company, group,
+    fi, fi_sub, year, url, text, x, y, z, map_x, map_y, relations=[...]}, ...])
+    relations の各要素: source, relation, target, prob, status, origin"""
+    path = path or find_corpus_file() or CORPUS_FILE
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def classify(prob, selected, bands):
+    """選別モデルの確率を、採用／要確認／除外に振り分ける。
+    bands = {"accept": 採用の下限, "threshold": 選別のしきい値, "review_low": 要確認の下限}
+      ・選ばれた関係で確率が accept 以上 → 採用
+      ・選ばれた関係で accept 未満、または選ばれなかったが review_low 以上 → 要確認
+      ・それ以外 → 除外"""
+    if selected and prob >= bands["accept"]:
+        return STATUS_ACCEPT
+    if selected or prob >= bands["review_low"]:
+        return STATUS_REVIEW
+    return STATUS_REJECT
+
+
+# ---------------------------------------------------------------------------
+# 人手の確認結果の反映
+# ---------------------------------------------------------------------------
+
+
+def effective_relations(patent, reviews=None):
+    """人手の確認結果があればそれを、無ければ「採用」＋「要確認のうち選別モデルが
+    選んだもの」を、その特許の現在のSAOとして返す（分析ページ共通の入力）。"""
+    if reviews and patent["id"] in reviews:
+        return [r for r in reviews[patent["id"]] if r.get("keep", True)]
+    return [r for r in patent["relations"] if r.get("selected")]
+
+
+def review_table(patent, reviews=None):
+    """人手確認用の表（DataFrame）。確認済みならその内容を、未確認なら
+    採用・要確認の候補を、採用=True/要確認は選別モデルの判断を初期値にして返す。"""
+    if reviews and patent["id"] in reviews:
+        rows = reviews[patent["id"]]
+        return pd.DataFrame([{
+            "採用する": bool(r.get("keep", True)), "主語(S)": r["source"], "関係(A)": r["relation"],
+            "目的語(O)": r["target"], "確率": r.get("prob"), "判定": r.get("status", "人手追加"),
+            "抽出元": r.get("origin", "人手"),
+        } for r in rows])
+    rows = [r for r in patent["relations"] if r["status"] != STATUS_REJECT]
+    return pd.DataFrame([{
+        "採用する": bool(r.get("selected")), "主語(S)": r["source"], "関係(A)": r["relation"],
+        "目的語(O)": r["target"], "確率": round(float(r["prob"]), 3), "判定": r["status"],
+        "抽出元": origin_label(r.get("origin", "")),
+    } for r in sorted(rows, key=lambda r: -r["prob"])],
+        columns=["採用する", "主語(S)", "関係(A)", "目的語(O)", "確率", "判定", "抽出元"])
+
+
+def table_to_review(df):
+    """人手確認の表（data_editor の結果）を、保存用のリストに戻す。"""
+    out = []
+    for _, row in df.iterrows():
+        s, a, o = (str(row.get(k) or "").strip() for k in ("主語(S)", "関係(A)", "目的語(O)"))
+        if not (s and a and o):
+            continue
+        prob = row.get("確率")
+        out.append({
+            "source": s, "relation": a, "target": o, "keep": bool(row.get("採用する", True)),
+            "prob": None if prob is None or (isinstance(prob, float) and math.isnan(prob)) else float(prob),
+            "status": row.get("判定") if isinstance(row.get("判定"), str) and row.get("判定") else "人手追加",
+            "origin": row.get("抽出元") if isinstance(row.get("抽出元"), str) and row.get("抽出元") else "人手",
+        })
+    return out
+
+
+def reviews_to_csv(reviews):
+    rows = [{"特許番号": pid, **r} for pid, rs in reviews.items() for r in rs]
+    return pd.DataFrame(rows, columns=["特許番号", "source", "relation", "target", "keep", "prob",
+                                       "status", "origin"]).to_csv(index=False).encode("utf-8-sig")
+
+
+def reviews_from_csv(data):
+    df = pd.read_csv(io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data)
+    out = defaultdict(list)
+    for _, r in df.iterrows():
+        out[str(r["特許番号"])].append({
+            "source": str(r["source"]), "relation": str(r["relation"]), "target": str(r["target"]),
+            "keep": str(r.get("keep", True)).lower() in ("true", "1", "yes"),
+            "prob": None if pd.isna(r.get("prob")) else float(r["prob"]),
+            "status": r.get("status") if isinstance(r.get("status"), str) else "人手追加",
+            "origin": r.get("origin") if isinstance(r.get("origin"), str) else "人手",
+        })
+    return dict(out)
+
+
+# ---------------------------------------------------------------------------
+# 基本語（ネットワーク・類似度用のノード名の正規化）
+# ---------------------------------------------------------------------------
+
+_NUM = r"[0-9０-９一二三四五六七八九十]+"
+_PREFIX_RE = re.compile(r"^(前記|当該|該|上記|各|複数の|少なくとも(一|１|1)つの|一対の|１対の|1対の)+")
+_ORD_RE = re.compile(r"第" + _NUM + r"の?")
+_TAIL_RE = re.compile(r"(" + _NUM + r"|[A-Za-zＡ-Ｚａ-ｚ]+)$")
+_SUFFIX_RE = re.compile(r"(の各々|のそれぞれ|の各|それぞれ|各々)$")
+
+
+def base_term(node):
+    """「前記第１トランジスタの第２端」→「トランジスタの端」のように、
+    番号・指示語を除いて、特許をまたいで比べられる基本語にする。"""
+    t = str(node).strip()
+    t = _PREFIX_RE.sub("", t)
+    t = _SUFFIX_RE.sub("", t)
+    t = _ORD_RE.sub("", t)
+    t = _TAIL_RE.sub("", t)
+    t = re.sub(r"\s+", "", t)
+    return t or str(node)
+
+
+_ORIGIN = [("LLM", ("LLMraw", "E1:llm_direct")),
+           ("GiNZA補完", ("E1:claim_title_ginza", "E1:ginza_has_fallback", "E1:attribute",
+                        "E1:ginza_has_fallback_conflict", "E1:claim_title_ginza_conflict")),
+           ("GiNZA", ("G",)), ("分割GiNZA", ("GS",)), ("ノード結合", ("MRG",)), ("係り受け", ("DEP",)),
+           ("持ち主つき", ("OWN",))]
+
+
+def origin_label(srcs):
+    """候補の出どころ（内部の記号）を、画面用の短い名前にする。
+    srcs: 記号のリスト（"E1:llm_direct" など）か、"+" でつないだ文字列。"""
+    items = srcs.split("+") if isinstance(srcs, str) else list(srcs)
+    out = []
+    for name, keys in _ORIGIN:
+        for x in items:
+            if x in keys or (x.split(":")[0] in keys and ":" not in keys[0]):
+                out.append(name)
+    return "・".join(dict.fromkeys(out)) or (srcs if isinstance(srcs, str) else "")
+
+
+def is_has(rel):
+    return rel in ("の",) + HAS_WORDS or any(h in rel for h in HAS_WORDS)
+
+
+# ---------------------------------------------------------------------------
+# 構造的特徴量（レーダーチャート用）
+# ---------------------------------------------------------------------------
+
+_NUMERIC_RE = re.compile(
+    r"[0-9０-９]+(\.[0-9０-９]+)?\s*(%|％|μm|um|ｍｍ|mm|nm|ｎｍ|℃|°C|V|Ｖ|A|Ａ|Ω|Hz|倍|度|原子%|atoms|cm)"
+    r"|以上|以下|未満|より大きい|より小さい|超え")
+
+RADAR_AXES = ["構成要素数", "SAO関係数", "階層の深さ", "分岐の多さ", "関係の多様性", "機能・配置の記述", "数値限定"]
+
+
+def _longest_path(edges):
+    children = defaultdict(set)
+    nodes = set()
+    for s, t in edges:
+        if s != t:
+            children[s].add(t)
+            nodes |= {s, t}
+    memo = {}
+
+    def depth(n, stack):
+        if n in memo:
+            return memo[n]
+        best = 0
+        for c in children[n]:
+            if c in stack:
+                continue
+            best = max(best, 1 + depth(c, stack | {c}))
+        memo[n] = best
+        return best
+
+    return max((depth(n, {n}) for n in nodes), default=0)
+
+
+def claim_structure_features(relations, text=""):
+    """1件の請求項のSAOから構造的特徴量を求める（値の大小は特許の優劣ではない）。"""
+    nodes = {x for r in relations for x in (r["source"], r["target"])}
+    has_edges = [(r["source"], r["target"]) for r in relations if is_has(r["relation"])]
+    out_deg = Counter(r["source"] for r in relations)
+    rel_kinds = {re.sub(r"(され|させ|して|する|した|される)+$", "", r["relation"]) for r in relations}
+    non_has = sum(1 for r in relations if not is_has(r["relation"]))
+    return {
+        "構成要素数": len(nodes),
+        "SAO関係数": len(relations),
+        "階層の深さ": _longest_path(has_edges),
+        "分岐の多さ": round(float(np.mean(list(out_deg.values()))), 2) if out_deg else 0.0,
+        "関係の多様性": len(rel_kinds),
+        "機能・配置の記述": round(non_has / len(relations), 3) if relations else 0.0,
+        "数値限定": len(_NUMERIC_RE.findall(text or "")),
+        "請求項の文字数": len(text or ""),
+    }
+
+
+def feature_table(corpus, reviews=None):
+    rows = []
+    for p in corpus["patents"]:
+        f = claim_structure_features(effective_relations(p, reviews), p["text"])
+        rows.append({"特許番号": p["id"], "発明の名称": p["title"], "企業": p["company"], "出願年": p["year"], **f})
+    return pd.DataFrame(rows)
+
+
+def percentile_scores(df, axes=RADAR_AXES):
+    """各軸をコーパス内の順位（0〜100のパーセンタイル）に変換する。"""
+    out = df.copy()
+    for a in axes:
+        out[a] = (df[a].rank(pct=True, method="average") * 100).round(1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SAOネットワーク
+# ---------------------------------------------------------------------------
+
+
+def build_network(corpus, patent_ids=None, reviews=None, min_patents=2, top_n=60):
+    """全特許（または指定特許）のSAOを基本語でまとめたネットワーク。
+    ノード: 基本語。重み = その語が現れる特許の件数。
+    エッジ: 基本語どうしのSAO関係。重み = その組が現れる特許の件数、代表の関係名。"""
+    node_patents = defaultdict(set)
+    edge_patents = defaultdict(set)
+    edge_rel = defaultdict(Counter)
+    surface = defaultdict(Counter)
+    ids = set(patent_ids) if patent_ids else None
+    for p in corpus["patents"]:
+        if ids is not None and p["id"] not in ids:
+            continue
+        for r in effective_relations(p, reviews):
+            s, t = base_term(r["source"]), base_term(r["target"])
+            if s == t:
+                continue
+            node_patents[s].add(p["id"])
+            node_patents[t].add(p["id"])
+            surface[s][r["source"]] += 1
+            surface[t][r["target"]] += 1
+            edge_patents[(s, t)].add(p["id"])
+            edge_rel[(s, t)][r["relation"]] += 1
+    keep = [n for n, ps in node_patents.items() if len(ps) >= min_patents]
+    keep = set(sorted(keep, key=lambda n: -len(node_patents[n]))[:top_n])
+    nodes = [{"id": n, "patents": sorted(node_patents[n]), "count": len(node_patents[n]),
+              "surfaces": [s for s, _ in surface[n].most_common(8)]} for n in keep]
+    edges = [{"source": s, "target": t, "count": len(ps), "relation": edge_rel[(s, t)].most_common(1)[0][0],
+              "patents": sorted(ps)}
+             for (s, t), ps in edge_patents.items() if s in keep and t in keep]
+    return nodes, edges
+
+
+def layout_network(nodes, edges, seed=0):
+    import networkx as nx
+
+    g = nx.Graph()
+    for n in nodes:
+        g.add_node(n["id"])
+    for e in edges:
+        w = e["count"]
+        if g.has_edge(e["source"], e["target"]):
+            g[e["source"]][e["target"]]["weight"] += w
+        else:
+            g.add_edge(e["source"], e["target"], weight=w)
+    if not len(g):
+        return {}
+    k = 2.4 / math.sqrt(max(len(g), 1))
+    return nx.spring_layout(g, k=k, iterations=120, seed=seed, weight="weight")
+
+
+def patents_with_node(corpus, term, reviews=None):
+    """基本語 term がSAOに現れる特許と、そのSAO・本文中の出現表記を返す。"""
+    out = []
+    for p in corpus["patents"]:
+        rels = [r for r in effective_relations(p, reviews)
+                if base_term(r["source"]) == term or base_term(r["target"]) == term]
+        if rels:
+            surf = sorted({x for r in rels for x in (r["source"], r["target"]) if base_term(x) == term},
+                          key=len, reverse=True)
+            out.append({"patent": p, "relations": rels, "surfaces": surf})
+    return out
+
+
+def highlight(text, words):
+    """本文中の words をマーカーで強調した HTML を返す。"""
+    import html as _html
+
+    esc = _html.escape(text)
+    for w in sorted({w for w in words if w}, key=len, reverse=True):
+        esc = esc.replace(_html.escape(w), "\u0000" + _html.escape(w) + "\u0001")
+    esc = esc.replace("\u0000", '<mark style="background:#fde68a;padding:0 2px;border-radius:3px">')
+    esc = esc.replace("\u0001", "</mark>")
+    return esc.replace("\n", "<br>")
+
+
+# ---------------------------------------------------------------------------
+# 類似性（SAOトリプルのTF-IDF）
+# ---------------------------------------------------------------------------
+
+
+def sao_tokens(relations):
+    toks = []
+    for r in relations:
+        s, t = base_term(r["source"]), base_term(r["target"])
+        rel = "有する" if is_has(r["relation"]) else re.sub(r"(される|させる|する|され|して)$", "", r["relation"])
+        toks += ["T:%s→%s→%s" % (s, rel, t), "P:%s→%s" % (s, t), "N:" + s, "N:" + t]
+    return toks
+
+
+def similarity_matrix(corpus, reviews=None):
+    """全特許のSAOをTF-IDFベクトルにし、コサイン類似度の行列を返す。"""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    docs = [sao_tokens(effective_relations(p, reviews)) for p in corpus["patents"]]
+    vec = TfidfVectorizer(analyzer=lambda x: x, sublinear_tf=True, min_df=1)
+    X = vec.fit_transform(docs)
+    S = (X @ X.T).toarray()
+    np.fill_diagonal(S, 0.0)
+    return S
+
+
+def similarity_explain(rel_a, rel_b):
+    """2件のSAOの共通部分（基本語のトリプル・組・ノード）。"""
+    ta, tb = set(sao_tokens(rel_a)), set(sao_tokens(rel_b))
+    common = ta & tb
+    return {
+        "共通のSAO": sorted(x[2:] for x in common if x.startswith("T:")),
+        "共通の組": sorted(x[2:] for x in common if x.startswith("P:")),
+        "共通の構成要素": sorted(x[2:] for x in common if x.startswith("N:")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 集計（ダッシュボード・バブル・ヒートマップ）
+# ---------------------------------------------------------------------------
+
+
+def status_counts(corpus, reviews=None):
+    c = Counter()
+    for p in corpus["patents"]:
+        for r in p["relations"]:
+            c[r["status"]] += 1
+        c[STATUS_REJECT] += p.get("n_rejected", 0)
+    confirmed = sum(sum(1 for r in rs if r.get("keep", True)) for rs in (reviews or {}).values())
+    return {
+        "特許件数": len(corpus["patents"]),
+        STATUS_ACCEPT: c[STATUS_ACCEPT], STATUS_REVIEW: c[STATUS_REVIEW], STATUS_REJECT: c[STATUS_REJECT],
+        "抽出SAO": sum(1 for p in corpus["patents"] for r in p["relations"] if r.get("selected")),
+        "人手確認済みの特許": len(reviews or {}), "確定SAO（人手確認済み）": confirmed,
+    }
+
+
+def company_year_bubble(corpus, reviews=None):
+    rows = []
+    for p in corpus["patents"]:
+        if p.get("year") is None:
+            continue
+        rows.append({"企業": p["company"], "出願年": p["year"],
+                     "SAO数": len(effective_relations(p, reviews))})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return (df.groupby(["企業", "出願年"]).agg(請求項数=("SAO数", "size"), 平均SAO数=("SAO数", "mean"),
+                                              SAO数合計=("SAO数", "sum")).reset_index())
+
+
+def company_tech_matrix(corpus, axis="FIサブクラス", reviews=None, top_tech=15):
+    rows = []
+    for p in corpus["patents"]:
+        if axis == "FIサブクラス":
+            techs = p.get("fi_sub") or []
+        elif axis == "FIメイングループ":
+            techs = p.get("fi_main") or []
+        else:
+            techs = sorted({base_term(x) for r in effective_relations(p, reviews)
+                            for x in (r["source"], r["target"])})
+        for t in techs:
+            rows.append({"企業": p["company"], "技術": t, "特許番号": p["id"]})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    top = df.groupby("技術")["特許番号"].nunique().sort_values(ascending=False).head(top_tech).index
+    m = df[df["技術"].isin(top)].groupby(["企業", "技術"])["特許番号"].nunique().unstack(fill_value=0)
+    return m[list(top)]
+
+
+# ---------------------------------------------------------------------------
+# 書き出し
+# ---------------------------------------------------------------------------
+
+
+def export_excel(corpus, reviews=None, sim=None, top_k=5):
+    """分析結果一式を1つのExcelファイル（bytes）にする。"""
+    buf = io.BytesIO()
+    feats = feature_table(corpus, reviews)
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame([
+            {"項目": k, "値": v} for k, v in status_counts(corpus, reviews).items()
+        ] + [{"項目": "採用の下限確率", "値": corpus["bands"]["accept"]},
+             {"項目": "選別のしきい値", "値": corpus["bands"]["threshold"]},
+             {"項目": "要確認の下限確率", "値": corpus["bands"]["review_low"]},
+             {"項目": "抽出手法", "値": corpus["meta"].get("method", "")}]).to_excel(xw, sheet_name="概要", index=False)
+        pd.DataFrame([{
+            "特許番号": p["id"], "発明の名称": p["title"], "出願人": p["applicant"], "企業": p["company"],
+            "出願年": p["year"], "FI": p["fi"], "人手確認": p["id"] in (reviews or {}), "URL": p.get("url", ""),
+        } for p in corpus["patents"]]).to_excel(xw, sheet_name="特許一覧", index=False)
+        pd.DataFrame([{
+            "特許番号": p["id"], "主語(S)": r["source"], "関係(A)": r["relation"], "目的語(O)": r["target"],
+            "確率": round(float(r["prob"]), 4), "判定": r["status"], "選別モデルの選択": bool(r.get("selected")),
+            "抽出元": origin_label(r.get("origin", "")),
+        } for p in corpus["patents"] for r in p["relations"]]).to_excel(xw, sheet_name="SAO（AI判定）", index=False)
+        if reviews:
+            pd.DataFrame([{
+                "特許番号": pid, "主語(S)": r["source"], "関係(A)": r["relation"], "目的語(O)": r["target"],
+                "採用": r.get("keep", True), "元の判定": r.get("status", ""),
+            } for pid, rs in reviews.items() for r in rs]).to_excel(xw, sheet_name="SAO（人手確認済み）", index=False)
+        feats.to_excel(xw, sheet_name="構造的特徴", index=False)
+        if sim is not None:
+            ids = [p["id"] for p in corpus["patents"]]
+            rows = []
+            for i, pid in enumerate(ids):
+                for j in np.argsort(-sim[i])[:top_k]:
+                    rows.append({"特許番号": pid, "類似特許": ids[j], "類似度": round(float(sim[i, j]), 4)})
+            pd.DataFrame(rows).to_excel(xw, sheet_name="類似特許", index=False)
+    return buf.getvalue()
+
+
+def relations_csv(corpus, reviews=None):
+    rows = []
+    for p in corpus["patents"]:
+        for r in effective_relations(p, reviews):
+            rows.append({"特許番号": p["id"], "発明の名称": p["title"], "企業": p["company"],
+                         "主語(S)": r["source"], "関係(A)": r["relation"], "目的語(O)": r["target"],
+                         "判定": "人手確認済み" if reviews and p["id"] in reviews else r.get("status", "")})
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
+# ===========================================================================
+# 【統合】eval_translate_sao.py
+# 名前の付け替え: main → main_eval
+# ===========================================================================
+"""
+eval_translate_sao.py
+======================
+translate_sao.py の厳格F1を、既存のGiNZA版（patent_pipeline.py）と
+全く同じ評価基準（evaluate_triples / RELATION_SYNONYM_GROUPS）で測定する。
+
+2つのモードがある（--mode）:
+  llm_direct（デフォルト）: 「タグ化 → タグ付き日本語のままLLMにSAOを
+      直接出力させる → 日本語に逆変換」方式。英訳を挟まないので、
+      翻訳段とSAO抽出段の誤差が混ざらない。
+  translate: 従来の「タグ化 → Ollama/DeepL翻訳 → 英語で依存構造解析 →
+      日本語に逆変換」方式（比較用に残している）。
+
+【方針転換】以前は「評価方法を甘くして数値を良く見せることは絶対にしない」
+という方針の下、evaluate_triples（source/targetの完全一致必須）だけを
+使っていた。その後、ユーザーの明示的な判断により「意味が伝わっていれば
+正解でよい」という基準に変更し、既定の評価をevaluate_triples_lenient
+（①表記・字体の正規化、②数量詞・修飾語の除去、③それでも不一致なら
+埋め込みモデルによる意味的類似度）に切り替えた（--eval-mode strictで
+従来の厳格評価にも戻せる。GiNZA初期0.277→改良0.421という過去の数字は
+すべて厳格評価によるものなので、そちらと比較する際は必ず--eval-mode strict
+を使うこと）。
+
+使い方（自分のPC上、Ollamaが起動している状態で）:
+    pip install spacy ollama
+    python -m spacy download en_core_web_sm
+    python3 eval_translate_sao.py --pipeline-dir /path/to/real_app --data-dir /path/to/gold_data --limit 20
+
+532件全部を回すとLLM呼び出しが大量に発生し、1クレームあたり数十秒〜
+1分程度かかることがあるため、全体では数時間規模になりうる。そのため
+本スクリプトは毎クレーム処理後に --out へ結果を保存しており、
+--resume を付けて再実行すると、既に --out に保存済みのクレームは
+スキップして続きから再開できる（PCのスリープ・ネットワーク切断・
+途中終了などで作業が失われないようにするため）。
+--debug を付けるとクレームごとにタグ付き原文・LLM出力（または英訳）・
+抽出結果を表示する。
+"""
+import argparse
+import json
+import sys
+import time
+from collections import Counter
+import pathlib as _pathlib
+
+ts = sys.modules[__name__]  # 統合後はこのファイル自身
+
+
+def _aggregate(per_claim):
+    """per_claimのリストからMICRO/MACRO集計を計算する（再開時も毎回この
+    リストから計算し直すので、二重カウントの心配がない）。"""
+    n = len(per_claim) or 1
+    total_tp = sum(c["正解数"] for c in per_claim)
+    total_pred = sum(c["システム抽出数"] for c in per_claim)
+    total_gold = sum(c["正解データ数"] for c in per_claim)
+    micro_p = total_tp / total_pred if total_pred else 0.0
+    micro_r = total_tp / total_gold if total_gold else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if micro_p + micro_r else 0.0
+    macro_p = sum(c["precision"] for c in per_claim) / n
+    macro_r = sum(c["recall"] for c in per_claim) / n
+    macro_f1 = sum(c["f1"] for c in per_claim) / n
+    return {
+        "micro": {"precision": micro_p, "recall": micro_r, "f1": micro_f1},
+        "macro": {"precision": macro_p, "recall": macro_r, "f1": macro_f1},
+    }
+
+
+_FALLBACK_TYPES_FOR_TABLE = {
+    "claim_title_ginza", "ginza_has_fallback", "attribute",
+    # 【LLM無言／LLM矛盾の分離】claim_title_ginza_conflict / ginza_has_fallback_conflict は、
+    # 同じ(source, target)についてLLMが既に別の（同義語ではない）関係を出している
+    # ケース。無言タイプ（LLMが何も出していないケース）とTP/FP/Precisionを
+    # 分けて見られるようにするため、表には別の行として並べる。
+    "claim_title_ginza_conflict", "ginza_has_fallback_conflict",
+}
+
+
+def _aggregate_type_relation(per_claim):
+    """全claimのtp_fp_by_type_relationを合算し、(type, 関係語)ごとの
+    TP/FP/Precisionの表を作る。claim_title_ginza / ginza_has_fallback /
+    attribute（GiNZA由来で語彙が限られたフォールバック）だけに絞る
+    （llm_direct/translateはLLMの自由な言い換えで関係語のバリエーションが
+    膨大になり、個別の採用/不採用ルールを作る対象として実用的ではないため）。
+    Precisionが低い順（不採用候補が先）に並べて返す。"""
+    combined = {}
+    for c in per_claim:
+        for tr_key, counts in c.get("tp_fp_by_type_relation", {}).items():
+            combined.setdefault(tr_key, {"tp": 0, "fp": 0})
+            combined[tr_key]["tp"] += counts["tp"]
+            combined[tr_key]["fp"] += counts["fp"]
+
+    rows = []
+    for tr_key, counts in combined.items():
+        type_name, _, relation = tr_key.partition("|")
+        if type_name not in _FALLBACK_TYPES_FOR_TABLE:
+            continue
+        tp, fp = counts["tp"], counts["fp"]
+        n = tp + fp
+        rows.append({
+            "type": type_name, "relation": relation, "tp": tp, "fp": fp,
+            "precision": tp / n if n else 0.0,
+        })
+    rows.sort(key=lambda r: r["precision"])
+    return rows
+
+
+def _load_llm_cache(cache_path):
+    """LLM生出力キャッシュを読み込む。ファイルが無い/壊れている場合は
+    空のキャッシュから始める（キャッシュは常にベストエフォートで、
+    失敗しても評価自体は最初からOllamaを呼んで進められる）。"""
+    if cache_path is None:
+        return None
+    p = _pathlib.Path(cache_path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("cache", {})
+    except Exception as e:  # noqa: BLE001
+        print(f"--llm-cache: {p} の読み込みに失敗したため、空のキャッシュから始めます（{e}）")
+        return {}
+
+
+def _save_llm_cache(cache_path, llm_cache):
+    """LLM生出力キャッシュを保存する（1件処理するたびに呼び、途中終了しても
+    それまでにOllamaを呼んだ分は失わずに再利用できるようにする）。"""
+    if cache_path is None:
+        return
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump({"cache": llm_cache}, f, ensure_ascii=False, indent=1)
+
+
+def _lenient_match_details(pp, predicted, gold, semantic_threshold, use_semantic):
+    """evaluate_triples_lenientと同じ手順・同じ順序で対応付けを行い、
+    どの抽出がどの正解に、どの方法（表記正規化／意味的類似度）と類似度で
+    対応付いたかを記録する（評価結果そのものは変えない。呼び出し側で
+    正解数が公式の評価と一致することを確認している）。"""
+    n = pp._normalize_node_text_lenient
+
+    def rel_match(p_rel, g_rel):
+        if p_rel == g_rel:
+            return True
+        pn = pp._normalize_relation_for_match(p_rel)
+        gn = pp._normalize_relation_for_match(g_rel)
+        if pn == gn or pn in gn or gn in pn:
+            return True
+        return pp._relation_synonym_match(p_rel, g_rel)
+
+    matched = {}
+    matched_gold = set()
+    for pi, p in enumerate(predicted):
+        for gi, g in enumerate(gold):
+            if gi in matched_gold:
+                continue
+            if (n(p["source"]) == n(g["source"]) and n(p["target"]) == n(g["target"])
+                    and rel_match(p["relation"], g["relation"])):
+                matched[pi] = (gi, "normalized", None)
+                matched_gold.add(gi)
+                break
+
+    remaining_pred = [pi for pi in range(len(predicted)) if pi not in matched]
+    remaining_gold = [gi for gi in range(len(gold)) if gi not in matched_gold]
+    if use_semantic and remaining_pred and remaining_gold:
+        try:
+            model = pp._get_embed_model()
+
+            def text(r):
+                return pp._triple_to_text((n(r["source"]), r["relation"], n(r["target"])))
+
+            emb_p = model.encode([text(predicted[i]) for i in remaining_pred], normalize_embeddings=True)
+            emb_g = model.encode([text(gold[i]) for i in remaining_gold], normalize_embeddings=True)
+            sim = emb_p @ emb_g.T
+            cands = [(sim[a, b], a, b) for a in range(sim.shape[0]) for b in range(sim.shape[1])]
+            cands.sort(key=lambda x: -x[0])
+            used_b = set()
+            for s, a, b in cands:
+                if s < semantic_threshold:
+                    break
+                pi, gi = remaining_pred[a], remaining_gold[b]
+                if pi in matched or b in used_b or gi in matched_gold:
+                    continue
+                matched[pi] = (gi, "semantic", float(s))
+                matched_gold.add(gi)
+                used_b.add(b)
+        except Exception:  # noqa: BLE001 -- 公式評価側と同じく、使えなければ意味的一致なしで扱う
+            pass
+
+    return [
+        {"pred": predicted[pi], "gold": gold[gi], "method": method, "similarity": s}
+        for pi, (gi, method, s) in sorted(matched.items())
+    ]
+
+
+def _save(out_path, per_claim, args, elapsed, done):
+    agg = _aggregate(per_claim)
+    type_relation_table = _aggregate_type_relation(per_claim)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "eval_mode": args.eval_mode,
+                "semantic_threshold": (args.semantic_threshold if args.eval_mode == "lenient"
+                                       else args.node_threshold if args.eval_mode == "node" else None),
+                "micro": agg["micro"],
+                "macro": agg["macro"],
+                "type_relation_table": type_relation_table,
+                "per_claim": per_claim,
+                "elapsed_sec": elapsed,
+                "model": args.model,
+                "done": done,  # False=まだ途中（--resumeで再開可能）, True=全件完了
+            },
+            f, ensure_ascii=False, indent=1,
+        )
+
+
+def main_eval():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pipeline-dir", default=".",
+        help="patent_pipeline.py（evaluate_triples等）が置いてあるディレクトリ",
+    )
+    parser.add_argument(
+        "--data-dir", default=".",
+        help="claims_532_for_gold.json / gold_sao_532_merged.json が置いてあるディレクトリ",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--host", default=None)
+    parser.add_argument(
+        "--mode", default="llm_direct", choices=["llm_direct", "translate", "selected", "selected10", "selected11", "selected12"],
+        help="selected12: 【実験12・推奨】selected11の候補に、係り受けに基づく汎用の候補"
+             "（述語にかかる構成要素どうしの組、dep_pairs.py）を追加し、2段階の選別モデルで選ぶ"
+             "（sao_selector12.py）。1組から採る関係の数も交差検証の内側で選んだ値を使う。"
+             "selected11: 【実験11】selected10の候補に「XのY」を結合したノードの候補を"
+             "追加し、トリプル完全一致の基準で学習した選別モデル（sao_selector11.py）。"
+             "selected10: 【実験10】selectedの候補に、手がかり句で分割した区間ごとの"
+             "GiNZA解析（claim_segmenter.py、新森ら2004に基づく）を追加したもの（sao_selector10.py）。"
+             "selected: 【実験9】候補選別モデル（sao_selector.py）。LLM直接抽出・GiNZA補完・"
+             "GiNZA単体版の出力を候補として集め、学習済みモデルで正解の確率を予測して選ぶ。"
+             "評価では交差検証の分割ごとに、その分割を除いた請求項だけで学習したモデルを使う。"
+             "llm_direct（デフォルト）: 英訳を挟まず、タグ付き日本語をそのままLLMに渡して"
+             "SAOを直接抽出する。translate: 従来の「タグ付き日本語→英訳→英語で"
+             "依存構造解析」方式（--backend/--deepl-keyはこちらでのみ使う）。",
+    )
+    parser.add_argument("--backend", default="ollama", choices=["ollama", "deepl"],
+                         help="--mode translate専用。翻訳エンジン。"
+                              "deeplはDEEPL_API_KEY環境変数（または--deepl-key）が必要")
+    parser.add_argument("--deepl-key", default=None, help="DeepL APIキー（省略時はDEEPL_API_KEY環境変数）")
+    parser.add_argument("--limit", type=int, default=10, help="評価するクレーム数（先頭からN件）")
+    parser.add_argument(
+        "--format", default=None,
+        choices=["順次列挙形式", "構成要素列挙形式", "ジェプソン的形式"],
+        help="classify_claim_format()でこの表現形式に分類されたクレームだけに絞り込む"
+             "（--limitは絞り込んだ後の件数に適用される）。省略時は絞り込まない。",
+    )
+    parser.add_argument("--out", default="eval_translate_result.json")
+    parser.add_argument("--debug", action="store_true", help="タグ付き原文・英訳・抽出結果を表示する")
+    parser.add_argument(
+        "--eval-mode", default="lenient", choices=["lenient", "strict", "node", "exact"],
+        help="exact: 【主指標】トリプル完全一致（主語・目的語は表記正規化後に完全一致、関係は"
+             "表記正規化・漢字部分一致・同義語。意味的類似度は使わない。node_match_eval.py）。"
+             "node: 主語どうし・目的語どうしを比べる評価（node_match_eval.py、閾値は"
+             "--node-threshold）。"
+             "lenient（デフォルト）: 表記正規化＋意味的類似度による緩い評価"
+             "（evaluate_triples_lenient）。strict: 従来のsource/target完全一致"
+             "（evaluate_triples）。GiNZA初期0.277→改良0.421と比較する場合はstrictを使う。",
+    )
+    parser.add_argument(
+        "--semantic-threshold", type=float, default=0.75,
+        help="--eval-mode lenientでの、埋め込みモデルによる意味的一致とみなす"
+             "コサイン類似度の閾値（0〜1）。",
+    )
+    parser.add_argument(
+        "--node-threshold", type=float, default=0.9,
+        help="--eval-mode nodeでの、主語どうし・目的語どうしの埋め込み類似度の閾値。",
+    )
+    parser.add_argument(
+        "--no-semantic", action="store_true",
+        help="--eval-mode lenientで、埋め込みモデルを使わず表記正規化のみで評価する"
+             "（sentence-transformersのインストール・モデルダウンロードが不要になる）。",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="--outに既存の結果ファイルがあれば読み込み、そこに含まれるクレームIDは"
+             "スキップして続きから実行する。532件のような長時間の実行を、"
+             "途中で中断されても失わずに再開するためのオプション。",
+    )
+    parser.add_argument(
+        "--save-details", action="store_true",
+        help="評価方法の検証用。各クレームについて、全抽出結果（predicted）、"
+             "どの抽出がどの正解にどの方法（表記正規化／意味的類似度）と類似度で"
+             "一致したか（match_details）、厳格評価の結果（strict）も--outに保存する。"
+             "評価の数値そのものは変わらない。",
+    )
+    parser.add_argument(
+        "--verify-risky-ginza", action="store_true",
+        help="【実験2：条件付きGiNZA（検証型）】--mode llm_direct専用。1請求項内で"
+             "ginza_has_fallback|有する候補が--risk-threshold件以上生成された"
+             "場合だけ、その候補群をLLMに個別確認させ、確認できなかった候補を"
+             "除外する。それ未満の通常のケースは変更しない。省略時（デフォルト）"
+             "は実験1のbaselineと完全に同じ挙動。",
+    )
+    parser.add_argument(
+        "--risk-threshold", type=int, default=_DEFAULT_RISK_THRESHOLD,
+        help=f"--verify-risky-ginza時の閾値（1請求項あたりのginza_has_fallback|"
+             f"有する候補数）。デフォルト{ts._DEFAULT_RISK_THRESHOLD}は、532件"
+             f"baselineの分析（gh_n>=16の13件がPrecision25.3%%で候補総数の約4割を"
+             f"占めていた）に基づく。",
+    )
+    parser.add_argument(
+        "--verify-fanout", action="store_true",
+        help="【実験8：ginza_has_fallback|有するのfan-out型検証】--mode llm_direct"
+             "専用。--verify-risky-ginza（gh_n＝1請求項あたりの候補総数）とは別の、"
+             "より細かい粒度の指標。ginza_has_fallback|有するの候補を同じsourceで"
+             "グループ化し、1つのsourceが--fanout-risk-threshold件以上の別々の"
+             "targetと繋がっている場合だけ、そのグループをLLMに個別確認させる"
+             "（例：「係合爪の各々」が「第１部材」「係合爪」「半導体装置」等、"
+             "6つの無関係なtargetに繋がってしまうようなケースを狙う）。"
+             "--verify-risky-ginzaと独立に指定でき、併用もできる（両方の基準の"
+             "いずれかに該当する候補が1回のLLM呼び出しでまとめて検証される）。"
+             "省略時（デフォルト）は実験1〜7のbaselineと完全に同じ挙動。",
+    )
+    parser.add_argument(
+        "--fanout-risk-threshold", type=int, default=_DEFAULT_FANOUT_RISK_THRESHOLD,
+        help=f"--verify-fanout時の閾値（同一source内での、別々のtarget数）。"
+             f"デフォルト{ts._DEFAULT_FANOUT_RISK_THRESHOLD}は、raw候補×gold_sao_"
+             f"532_merged.jsonのシミュレーション分析（fan-out=1で55.9%%、2で"
+             f"66.5%%、3で53.1%%、4で49.2%%、5で27.3%%、6以上で20.9%%）に基づく。",
+    )
+    parser.add_argument(
+        "--verify-extra-risky", action="store_true",
+        help="【実験3：検証型の対象拡張】--mode llm_direct専用。"
+             "ginza_has_fallback|有する（--verify-risky-ginza）以外にも、"
+             "532件baselineの精査で見つかった危険な(type,関係語)——"
+             "claim_title_ginza|有する（候補--claim-title-risk-threshold件以上）、"
+             "attribute|の（常に）、llm_direct側の「超える」「方向」"
+             "「より小さい」「位置する」（常に）——を同じLLM再確認の仕組みで"
+             "検証する。--verify-risky-ginzaと独立に指定でき、併用もできる。",
+    )
+    parser.add_argument(
+        "--claim-title-risk-threshold", type=int, default=_DEFAULT_CLAIM_TITLE_RISK_THRESHOLD,
+        help=f"【実験5：既存GiNZAルールの閾値調整】--verify-extra-risky時の、"
+             f"claim_title_ginza|有するの検証閾値（1請求項あたりの候補数）。"
+             f"デフォルト{ts._DEFAULT_CLAIM_TITLE_RISK_THRESHOLD}は実験3の値。"
+             f"実験4後の残存FP分析で、閾値のすぐ下（候補数10〜13件）にも"
+             f"Precision72.0%%程度の危険な塊が残っていることが判明したため、"
+             f"10まで下げて適用範囲を広げられるようにした。",
+    )
+    parser.add_argument(
+        "--verify-cache", default=None,
+        help="--verify-risky-ginza / --verify-extra-risky時のLLM検証呼び出し用"
+             "キャッシュファイル（--llm-cacheとは別ファイルで管理する）。"
+             "仕組みは--llm-cacheと同じ。",
+    )
+    parser.add_argument(
+        "--filter-invalid-targets", action="store_true",
+        help="【実験4：target無条件フィルタ】--mode llm_direct専用。type・relationを"
+             "問わず、targetがts._INVALID_TARGET_WORDS（「複数」「互い」等、"
+             "gold_sao_532_merged.json全10,497件中に一件も出現しないと確認済みの"
+             "18語）に完全一致する関係を一律除去する。LLM呼び出し不要"
+             "（Ollama非依存の後処理のみ）。--verify-risky-ginza / "
+             "--verify-extra-risky とは独立に併用できる。デフォルト（省略時）は"
+             "実験1〜3のbaselineと完全に同じ挙動。",
+    )
+    parser.add_argument(
+        "--filter-redundant-root-ownership", action="store_true",
+        help="【実験7：クレームタイトルによる二重所有の除去】--mode llm_direct専用。"
+             "sourceがクレームタイトル相当の構成要素（claim_title_ginza判定に使う"
+             "ものと同じ）である「有する」系関係のうち、同じtargetを既に別の"
+             "（より具体的な）構成要素が所有しているものを、過大包摂として一律"
+             "除去する。LLM呼び出し不要（Ollama非依存の後処理のみ）。実験4の"
+             "targetフィルタとは異なる根拠（target自体ではなく既存の所有関係との"
+             "突き合わせ）に基づく決定的フィルタで、--filter-invalid-targets等"
+             "とは独立に併用できる。デフォルト（省略時）は実験1〜6のbaselineと"
+             "完全に同じ挙動。",
+    )
+    parser.add_argument(
+        "--llm-cache", default=None,
+        help="【実験2以降のためのLLM生出力キャッシュ】--mode llm_direct専用。"
+             "指定したパスのJSONファイルにクレームIDごとのOllama生出力（GiNZA"
+             "補完前）を保存し、次回以降は同じクレームでOllamaを呼ばずに再利用する。"
+             "GiNZA側のロジック（_apply_ginza_fallback_and_normalize等）だけを"
+             "変更した実験を、Ollamaの再呼び出しなしで再評価できるようにするため。"
+             "ファイルが存在しない場合は空のキャッシュから始めて新規作成し、既存の"
+             "場合は追記（既存エントリは上書きされない限り保持）する。--out（評価"
+             "結果）とは別ファイルで管理する。省略時（デフォルト）は今まで通り"
+             "毎クレーム必ずOllamaを呼ぶ（挙動は変わらない）。",
+    )
+    args = parser.parse_args()
+
+    sys.path.insert(0, args.pipeline_dir)
+    pp = sys.modules[__name__]  # 統合後はこのファイル自身
+
+    data_dir = _pathlib.Path(args.data_dir)
+    with open(data_dir / "claims_532_for_gold.json", encoding="utf-8") as f:
+        claims = json.load(f)
+    with open(data_dir / "gold_sao_532_merged.json", encoding="utf-8") as f:
+        gold_all = json.load(f)
+
+    if args.format:
+        claims = [c for c in claims if pp.classify_claim_format(c["text"]) == args.format]
+        print(f"表現形式「{args.format}」に絞り込み: {len(claims)}件")
+
+    claims = claims[: args.limit] if args.limit else claims
+
+    out_path = _pathlib.Path(args.out)
+    per_claim = []
+    done_ids = set()
+    if args.resume and out_path.exists():
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                prev = json.load(f)
+            per_claim = prev.get("per_claim", [])
+            done_ids = {c["id"] for c in per_claim}
+            print(f"--resume: {out_path} から完了済み{len(done_ids)}件を読み込みました。続きから実行します。")
+        except Exception as e:  # noqa: BLE001 -- 読み込み失敗時は最初からでも進められるようにする
+            print(f"--resume: {out_path} の読み込みに失敗したため、最初から実行します（{e}）")
+            per_claim = []
+            done_ids = set()
+
+    targets = [c for c in claims if c["id"] not in done_ids]
+    n_target = len(targets)
+    t0 = time.time()
+    n_done_this_run = 0
+
+    llm_cache = _load_llm_cache(args.llm_cache)
+    if llm_cache is not None:
+        print(f"--llm-cache: {args.llm_cache}（既存{len(llm_cache)}件を読み込み）")
+    verify_cache = _load_llm_cache(args.verify_cache)
+    if verify_cache is not None:
+        print(f"--verify-cache: {args.verify_cache}（既存{len(verify_cache)}件を読み込み）")
+    if args.verify_risky_ginza:
+        print(f"--verify-risky-ginza有効（閾値: gh_n>={args.risk_threshold}）")
+    if args.verify_fanout:
+        print(f"--verify-fanout有効（閾値: 同一source内のtarget数>={args.fanout_risk_threshold}）")
+    extra_risk_rules = _build_extra_risk_rules(args.claim_title_risk_threshold) if args.verify_extra_risky else None
+    if args.verify_extra_risky:
+        rules_desc = ", ".join(f"{r['type']}|{r['relation']}(閾値{r['threshold']})" for r in extra_risk_rules)
+        print(f"--verify-extra-risky有効: {rules_desc}")
+    if args.filter_invalid_targets:
+        words_desc = "、".join(sorted(_INVALID_TARGET_WORDS))
+        print(f"--filter-invalid-targets有効: target完全一致で無条件除去する語 = {words_desc}")
+    if args.filter_redundant_root_ownership:
+        print("--filter-redundant-root-ownership有効: クレームタイトルによる二重所有を除去")
+
+    if args.mode in ("selected", "selected10", "selected11", "selected12"):
+        pass  # （統合済み）import sao_selector
+        pass  # （統合済み）import sao_selector10
+        pass  # （統合済み）import sao_selector11
+        if args.mode == "selected12":
+            pass  # （統合済み）import sao_selector12
+        folds = cv_folds({c["id"]: c["text"] for c in json.load(
+            open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
+        fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
+        import numpy as _np
+        _sel_mod = {"selected": sao_selector, "selected10": sao_selector10,
+                    "selected11": sao_selector11,
+                    "selected12": sao_selector12 if args.mode == "selected12" else None}[args.mode]
+        _train = _np.load(_sel_mod.TRAIN_FILE, allow_pickle=False)
+        fold_threshold = [float(t) for t in _train["fold_thresholds"]]
+        print(f"--mode {args.mode}: 交差検証の5分割ごとに選別モデルを学習しています…")
+        if args.mode == "selected12":
+            # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
+            fold_selector = [_sel_mod.Selector(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
+        else:
+            fold_selector = [_sel_mod.Selector(exclude_ids=set(f)) for f in folds]
+        print(f"  分割ごとのしきい値: {fold_threshold}")
+    if args.eval_mode in ("node", "exact"):
+        pass  # （統合済み）import node_match_eval
+
+    for c in targets:
+        cid = c["id"]
+        try:
+            if args.mode in ("selected", "selected10", "selected11", "selected12"):
+                selector = fold_selector[fold_of[cid]]
+                extra = {}
+                if args.mode == "selected12" and selector.fold_max_per_pair:
+                    extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
+                _, predicted = _sel_mod.analyze_claim_selected(
+                    ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
+                    llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
+            elif args.mode == "translate":
+                _, predicted = analyze_claim_translate_llm(
+                    c["text"], model=args.model, host=args.host, pp=pp, debug=args.debug,
+                    backend=args.backend, deepl_api_key=args.deepl_key,
+                )
+            else:
+                _, predicted = analyze_claim_llm_direct(
+                    c["text"], model=args.model, host=args.host, pp=pp, debug=args.debug,
+                    llm_cache=llm_cache, claim_id=cid,
+                    verify_risky_ginza=args.verify_risky_ginza, risk_threshold=args.risk_threshold,
+                    verify_fanout=args.verify_fanout, fanout_risk_threshold=args.fanout_risk_threshold,
+                    extra_risk_rules=extra_risk_rules,
+                    verify_cache=verify_cache,
+                    filter_invalid_targets=args.filter_invalid_targets,
+                    filter_redundant_root_ownership=args.filter_redundant_root_ownership,
+                )
+        except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
+            print(f"[{cid}] エラーのためスキップ: {e}")
+            continue
+        gold = gold_all[cid]
+        if args.eval_mode == "exact":
+            metrics = evaluate_triples_exact(pp, predicted, gold)
+        elif args.eval_mode == "node":
+            metrics = evaluate_triples_node(pp, predicted, gold, theta=args.node_threshold)
+        elif args.eval_mode == "lenient":
+            metrics = pp.evaluate_triples_lenient(
+                predicted, gold, lenient_relation_match=True,
+                semantic_threshold=args.semantic_threshold,
+                use_semantic=not args.no_semantic,
+            )
+        else:
+            metrics = pp.evaluate_triples(predicted, gold, lenient_relation_match=True)
+        # unmatched_gold/unmatched_pred は従来 --debug 時のみ画面表示していたが、
+        # 532件規模では画面出力を後から見返すのは非現実的なので、常に --out の
+        # JSONへ保存する（誤抽出の傾向を、実行後にファイルから集計できるようにするため）。
+        keep_keys = [
+            "precision", "recall", "f1", "正解数", "システム抽出数", "正解データ数",
+            "unmatched_gold", "unmatched_pred",
+        ]
+        if "正解内訳" in metrics:
+            keep_keys.append("正解内訳")
+
+        # 【type×関係語ごとのTP/FP内訳】translate_sao.pyの各関係には、どの処理が
+        # 作ったかを示す"type"（llm_direct / claim_title_ginza /
+        # ginza_has_fallback / attribute / translate 等）が付いている。
+        # 「GiNZAフォールバックを丸ごとON/OFFする」のではなく、「(type, 関係語)の
+        # 組み合わせごとに、これまでの実測でPrecision（TP/(TP+FP)）が高ければ
+        # 採用し、低ければ不採用にする」という、より粒度の細かい判断をしたい、
+        # というユーザーの提案に基づく。
+        # predicted（今回のシステム予測全体、type付き）からunmatched_pred
+        # （FP）をマルチセット差分すれば、残りが必ずTPになるので、追加の
+        # Ollama呼び出しなしで(type, 関係語)単位のTP/FPを集計できる。
+        def _rel_key(r):
+            return (r.get("source"), r.get("relation"), r.get("target"), r.get("type"))
+
+        pred_counter = Counter(_rel_key(r) for r in predicted)
+        unmatched_pred_counter = Counter(_rel_key(r) for r in metrics.get("unmatched_pred", []))
+        matched_counter = pred_counter - unmatched_pred_counter  # 残り＝TP
+
+        tp_fp_by_type_relation = {}
+        for key, cnt in matched_counter.items():
+            tr_key = f"{key[3] or 'unknown'}|{key[1]}"
+            tp_fp_by_type_relation.setdefault(tr_key, {"tp": 0, "fp": 0})
+            tp_fp_by_type_relation[tr_key]["tp"] += cnt
+        for key, cnt in unmatched_pred_counter.items():
+            tr_key = f"{key[3] or 'unknown'}|{key[1]}"
+            tp_fp_by_type_relation.setdefault(tr_key, {"tp": 0, "fp": 0})
+            tp_fp_by_type_relation[tr_key]["fp"] += cnt
+        if tp_fp_by_type_relation:
+            keep_keys.append("tp_fp_by_type_relation")
+            metrics = {**metrics, "tp_fp_by_type_relation": tp_fp_by_type_relation}
+
+        entry = {"id": cid, **{k: v for k, v in metrics.items() if k in keep_keys}}
+        if args.save_details:
+            # 評価方法の検証用：全抽出結果、対応付けの詳細（方法・類似度）、
+            # 厳格評価（evaluate_triples）の結果を同時に保存する。
+            entry["predicted"] = predicted
+            if args.eval_mode == "lenient":
+                details = _lenient_match_details(
+                    pp, predicted, gold, args.semantic_threshold, not args.no_semantic)
+                if len(details) != metrics["正解数"]:
+                    print(f"  [{cid}] 警告: 対応付けの記録（{len(details)}件）が公式の正解数"
+                          f"（{metrics['正解数']}件）と一致しません")
+                entry["match_details"] = details
+            strict = pp.evaluate_triples(predicted, gold, lenient_relation_match=True)
+            entry["strict"] = {k: strict[k] for k in ("precision", "recall", "f1", "正解数",
+                                                       "システム抽出数", "正解データ数")}
+        per_claim.append(entry)
+        n_done_this_run += 1
+        elapsed_run = time.time() - t0
+        avg = elapsed_run / n_done_this_run
+        remaining = n_target - n_done_this_run
+        eta_min = avg * remaining / 60
+        print(f"[{cid}] precision={metrics['precision']:.3f} recall={metrics['recall']:.3f} f1={metrics['f1']:.3f} "
+              f"(正解{metrics['正解数']}/抽出{metrics['システム抽出数']}/正解データ{metrics['正解データ数']}) "
+              f"[{n_done_this_run}/{n_target}件 経過{elapsed_run / 60:.1f}分 残り目安{eta_min:.1f}分]")
+        if args.debug:
+            for g in metrics["unmatched_gold"]:
+                print("    見逃し:", g["source"], g["relation"], g["target"])
+            for p in metrics["unmatched_pred"]:
+                print("    誤抽出:", p["source"], p["relation"], p["target"])
+        # 1件ごとに保存する（PCのスリープ・強制終了・ネットワーク切断等で
+        # 途中終了しても、ここまでの結果は --resume で失わずに再開できる）。
+        _save(out_path, per_claim, args, elapsed_run, done=False)
+        _save_llm_cache(args.llm_cache, llm_cache)
+        _save_llm_cache(args.verify_cache, verify_cache)
+
+    elapsed = time.time() - t0
+    _save(out_path, per_claim, args, elapsed, done=True)
+    _save_llm_cache(args.llm_cache, llm_cache)
+    _save_llm_cache(args.verify_cache, verify_cache)
+    agg = _aggregate(per_claim)
+
+    print("\n=== 集計 ===")
+    print(f"件数: {len(per_claim)}（今回の実行で処理: {n_done_this_run}件）  "
+          f"所要時間（今回の実行分）: {elapsed:.1f}秒  評価方法: {args.eval_mode}"
+          + ("" if args.eval_mode in ("strict", "exact")
+             else f"（主語・目的語ごとの類似度の閾値={args.node_threshold}）" if args.eval_mode == "node"
+             else f"（閾値={args.semantic_threshold}, 意味的類似度={'無効' if args.no_semantic else '有効'}）"))
+    print(f"MICRO precision={agg['micro']['precision']:.4f} recall={agg['micro']['recall']:.4f} f1={agg['micro']['f1']:.4f}")
+    print(f"MACRO precision={agg['macro']['precision']:.4f} recall={agg['macro']['recall']:.4f} f1={agg['macro']['f1']:.4f}")
+
+    # 【(type, 関係語)ごとのPrecision表】claim_title_ginza / ginza_has_fallback /
+    # attribute（＝GiNZA由来のフォールバックで、LLMの自由な言い換えと違って
+    # 語彙が限られており、「この(type, 関係語)は採用する/しない」という
+    # ルールを現実的に作れる）についてだけ表示する。llm_direct/translateは
+    # LLMの自由な言い換えで関係語のバリエーションが膨大になり、個別の
+    # ON/OFFルールを作る対象として実用的ではないため表示対象から外す
+    # （JSON側にはtype_relation_tableとして全type分を保存済み）。
+    rows = _aggregate_type_relation(per_claim)
+    if rows:
+        print("\n=== GiNZAフォールバック系の (type, 関係語) 別 TP/FP/Precision ===")
+        print("（Precisionが低いものは、その(type, 関係語)だけ不採用にする候補）")
+        print(f"{'type':<20} {'relation':<20} {'TP':>5} {'FP':>5} {'Precision':>10}")
+        for r in rows:
+            print(f"{r['type']:<20} {r['relation']:<20} {r['tp']:>5} {r['fp']:>5} {r['precision']:>10.3f}")
+
+    print(f"保存しました: {out_path}")
+
+
+# ===========================================================================
+# 元のモジュール名で呼べるようにする名前空間
+# （app.py からは pp.sao_selector12.Selector() のように使う）
+# ===========================================================================
+_THIS = sys.modules[__name__]
+
+en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
+translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
+node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, node_score=node_score, numbers=numbers, rel_match=rel_match)
+nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, _esc=_esc, relations_to_nested_dot=relations_to_nested_dot)
+claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
+dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
+sao_selector = _types.SimpleNamespace(FORMATS=FORMATS, HERE=HERE, INVALID=INVALID, KEPT_INDEX=KEPT_INDEX, SIMP=SIMP, SIMPLIFIED=SIMPLIFIED, SRC_KEYS=SRC_KEYS, Selector=Selector9, TRAIN_FILE=TRAIN_FILE9, analyze_claim_selected=analyze_claim_selected9, build_candidates=build_candidates9, claim_features=claim_features9, cv_folds=cv_folds, rel_group=rel_group, select=select9)
+sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, Selector=Selector10, TRAIN_FILE=TRAIN_FILE10, analyze_claim_selected=analyze_claim_selected10, build_candidates=build_candidates10, claim_features=claim_features10, cv_folds=cv_folds, select=select9)
+sao_selector11 = _types.SimpleNamespace(HERE=HERE, Selector=Selector11, TRAIN_FILE=TRAIN_FILE11, analyze_claim_selected=analyze_claim_selected11, build_candidates=build_candidates11, claim_features=claim_features11, cv_folds=cv_folds, merge_occurrences=merge_occurrences, select=select11)
+sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, analyze_claim_selected=analyze_claim_selected12, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
+platform_core = _types.SimpleNamespace(CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, HAS_WORDS=HAS_WORDS, HERE=HERE, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _longest_path=_longest_path, base_term=base_term, build_network=build_network, classify=classify, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, find_corpus_file=find_corpus_file, highlight=highlight, is_has=is_has, layout_network=layout_network, load_corpus=load_corpus, origin_label=origin_label, patents_with_node=patents_with_node, percentile_scores=percentile_scores, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review)
+eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
+SELECTOR_MODULES = {"sao_selector12": sao_selector12, "sao_selector11": sao_selector11,
+                    "sao_selector10": sao_selector10, "sao_selector": sao_selector}
+
+
+if __name__ == "__main__":
+    # 評価（旧 eval_translate_sao.py）：python patent_pipeline.py --mode selected12 --eval-mode exact ...
+    main_eval()
