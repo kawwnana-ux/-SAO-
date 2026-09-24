@@ -11964,6 +11964,124 @@ def _dependency_pairs(pp, text):
 
 
 # ===========================================================================
+# 【統合】seg_pairs.py
+# 名前の付け替え: HAS_VERBS → HAS_VERBS_sp
+# ===========================================================================
+"""
+seg_pairs.py
+=============
+【実験13】区間の中の「主役」と他の構成要素を組にする候補生成。
+
+実験12の誤り分析では、正解のSAOの37%がどの候補にも入っていなかった。そのうち最も多いのは
+「両方のノードは候補にあるのに、その組がどの方法からも出ていない」もの（正解の13.5%）で、
+その約7割は、同じ構成要素の説明区間（「…を有する第１ヘッダと、」のような、手がかり句で
+区切った1つの区間）の中に両方のノードが出てくる。係り受けの経路が長くなる（6以上）ため、
+述語の直接の項だけを組にする実験12の方法では拾えない。
+
+そこで、係り受けの経路には頼らず、次の一般的な規則で候補を作る。
+  ・区間ごとに「主役」を決める：区間の最後に出てくる構成要素（「…Ｘと、」のＸ）と、
+    区間の先頭の主題（「前記Ｘは、…」のＸ）。
+  ・主役と、同じ区間に出てくる他の構成要素とを、区間の中の各述語で結んだ候補を、両方の
+    向きで作る。
+  ・どの組・どの述語・どの向きを採るかは、選別モデルが特徴量（述語との距離、係り受けの
+    経路の長さ、述語が2つの間にあるか後ろにあるか等）から判断する。
+"""
+import re
+
+pass  # （統合済み）import claim_segmenter as CS
+pass  # （統合済み）import dep_pairs as D
+
+
+def _tree_dist(a, b):
+    def anc(t):
+        out = [t]
+        while t.head.i != t.i:
+            t = t.head
+            out.append(t)
+        return out
+    A, B = anc(a), anc(b)
+    pos = {t.i: k for k, t in enumerate(B)}
+    for k, t in enumerate(A):
+        if t.i in pos:
+            return k + pos[t.i]
+    return 99
+
+
+def pairs_from_segment(pp, doc, scope="区間"):
+    cmap = _comp_map(pp, doc)
+    comps = {}
+    for c in cmap.values():
+        comps[(c["start"], c["end"])] = c
+    comps = [comps[k] for k in sorted(comps)]
+    if len(comps) < 2:
+        return []
+    preds = [t for t in doc if _is_pred(t)]
+    if not preds:
+        return []
+    # 主役：区間の最後の構成要素、と、先頭の主題（「Ｘは、」「Ｘが、」）
+    heads = {comps[-1]["text"]: comps[-1]}
+    first = comps[0]
+    after = [t.text for t in doc[first["end"] + 1:first["end"] + 3]]
+    if after and after[0] in ("は", "が"):
+        heads[first["text"]] = first
+    out = []
+    for hname, h in heads.items():
+        ht = doc[h["end"]]
+        for c in comps:
+            if c["text"] == hname:
+                continue
+            ct = doc[c["end"]]
+            for p in preds:
+                lab, passive = _label(pp, p)
+                if not lab or len(lab) > 12:
+                    continue
+                lo, hi = min(h["end"], c["end"]), max(h["end"], c["end"])
+                info = {"scope": scope, "passive": passive, "pred_pos": p.pos_,
+                        "tree_h": _tree_dist(ht, p), "tree_c": _tree_dist(ct, p),
+                        "between": lo < p.i < hi, "after": p.i > hi, "gap": abs(p.i - ct.i),
+                        "n_comps": len(comps), "n_preds": len(preds), "head_last": h is comps[-1]}
+                out.append(dict(info, source=hname, relation=lab, target=c["text"], head_is="source"))
+                out.append(dict(info, source=c["text"], relation=lab, target=hname, head_is="target"))
+    return out
+
+
+HAS_VERBS_sp = [("備え", "備える"), ("有し", "有する"), ("有する", "有する"), ("含み", "含む"), ("含む", "含む"),
+             ("具備", "具備する"), ("から構成", "構成される"), ("からなる", "からなる")]
+
+
+def segment_pairs(pp, text, title=None):
+    """各区間の主役どうしの候補に加え、題名（請求項の最後の構成要素）が、列挙された各区間の
+    主役を「備える／有する／含む…」で持つ候補も作る（構成要素列挙形式の骨格）。"""
+    res, heads = [], []
+    with _enzai(pp, True):
+        for seg in split_claim(pp, text):
+            sent = to_sentence(seg)
+            if sent is None:
+                continue
+            for s in distribute(sent):
+                try:
+                    doc = pp.nlp(pp._clean_claim_text(s))
+                    res += pairs_from_segment(pp, doc)
+                    cmap = _comp_map(pp, doc)
+                    if cmap:
+                        last = max(cmap.values(), key=lambda c: c["end"])
+                        heads.append(last["text"])
+                except Exception:  # noqa: BLE001
+                    continue
+    if title:
+        clean = pp._clean_claim_text(text)
+        verbs = [v for stem, v in HAS_VERBS_sp if stem in clean]
+        for k, h in enumerate(dict.fromkeys(heads)):
+            if h == title:
+                continue
+            for v in dict.fromkeys(verbs):
+                res.append({"scope": "題名", "passive": False, "pred_pos": "VERB", "tree_h": -1, "tree_c": -1,
+                            "between": False, "after": True, "gap": k, "n_comps": len(heads), "n_preds": len(verbs),
+                            "head_last": True, "source": title, "relation": v, "target": h, "head_is": "source"})
+    return res
+
+
+# ===========================================================================
 # 【統合】sao_selector.py
 # 名前の付け替え: build_candidates → build_candidates9, claim_features → claim_features9
 # ===========================================================================
@@ -12297,7 +12415,7 @@ def claim_features11(pp, info):
 
 # ===========================================================================
 # 【統合】sao_selector12.py
-# 名前の付け替え: Selector → Selector12, TRAIN_FILE → TRAIN_FILE12, analyze_claim_selected → analyze_claim_selected12, build_candidates → build_candidates12, claim_features → claim_features12, select → select12, structural_features → structural_features12
+# 名前の付け替え: Selector → Selector12, TRAIN_FILE → TRAIN_FILE12, build_candidates → build_candidates12, claim_features → claim_features12, select → select12, structural_features → structural_features12
 # ===========================================================================
 """
 sao_selector12.py
@@ -12529,8 +12647,16 @@ class Selector12:
         keep = np.ones(len(d["Y"]), bool)
         if exclude_ids:
             keep = ~np.isin(d["ids"], np.array(sorted(exclude_ids)))
-        x2_key = "X2_fold%d" % fold if fold is not None and ("X2_fold%d" % fold) in d.files else "X2"
-        X1, Y, X2 = d["X1"][keep], d["Y"][keep], d[x2_key][keep]
+        X2_all = d["X2"]
+        if fold is not None:
+            key = "X2_fold%d" % fold
+            # 分割ごとの構造特徴は大きいので、別ファイル（…_cv_folds.npz）に分けて置いてもよい
+            extra = _pathlib.Path(train_file).with_name(_pathlib.Path(train_file).name.replace("_train.npz", "_cv_folds.npz"))
+            if key in d.files:
+                X2_all = d[key]
+            elif extra.exists():
+                X2_all = np.load(extra, allow_pickle=False)[key]
+        X1, Y, X2 = d["X1"][keep], d["Y"][keep], X2_all[keep]
         self.fold_thresholds = [float(t) for t in d["fold_thresholds"]] if "fold_thresholds" in d.files else None
         X1 = X1.copy()
         X1[:, KEPT_INDEX] = 0.0
@@ -12549,10 +12675,109 @@ class Selector12:
         return self.m2.predict_proba(np.hstack([X1, X2]))[:, 1]
 
 
-def analyze_claim_selected12(ts, pp, selector, text, threshold=None, max_per_pair=None, **kw):
-    info = build_candidates12(ts, pp, text, **kw)
+# ===========================================================================
+# 【統合】sao_selector13.py
+# 名前の付け替え: Selector → Selector13, TRAIN_FILE → TRAIN_FILE13, analyze_claim_selected → analyze_claim_selected13, build_candidates → build_candidates13, canon → canon13, claim_features → claim_features13, select → select13, structural_features → structural_features13
+# ===========================================================================
+"""
+sao_selector13.py
+==================
+【実験13】候補の網羅性の改善。実験12（係り受け候補＋2段階選別）の候補に、区間の主役と他の
+構成要素を組にする候補（seg_pairs.py）と、題名が列挙された各構成要素を持つ候補を加える。
+選別の仕組み（2段階・1組1件・内側の交差検証でしきい値を選ぶ）は実験12と同じ。
+"""
+import pathlib as _pathlib
+
+import numpy as np
+
+pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import sao_selector12 as S12
+pass  # （統合済み）import seg_pairs as SP
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE13 = HERE / "sao_selector13_train.npz"
+canon13 = canon
+select13 = select12
+structural_features13 = structural_features12
+
+
+def add_segment_candidates(info, seg):
+    """seg_pairs の出力を候補に加える（同じ候補は1つにまとめ、区間の手がかりを集計する）。"""
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    for d in seg:
+        rel = d["relation"].translate(SIMP)
+        key = (d["source"], rel, d["target"])
+        c = index.get(key)
+        if c is None:
+            c = {"source": key[0], "relation": rel, "target": key[2], "srcs": [], "type": "SEG", "dep": None}
+            info["cands"].append(c)
+            index[key] = c
+        tag = "TITLE" if d["scope"] == "題名" else "SEG"
+        if tag not in c["srcs"]:
+            c["srcs"].append(tag)
+        a = c.get("seg") or {"n": 0, "tree_h": 99, "tree_c": 99, "between": False, "after": False, "gap": 99,
+                             "n_comps": 0, "n_preds": 0, "head_src": False, "head_tgt": False, "passive": False,
+                             "title": False}
+        a["n"] += 1
+        if d["tree_h"] >= 0:
+            a["tree_h"] = min(a["tree_h"], d["tree_h"])
+            a["tree_c"] = min(a["tree_c"], d["tree_c"])
+        a["between"] |= bool(d["between"])
+        a["after"] |= bool(d["after"])
+        a["gap"] = min(a["gap"], d["gap"])
+        a["n_comps"] = max(a["n_comps"], d["n_comps"])
+        a["n_preds"] = max(a["n_preds"], d["n_preds"])
+        a["head_src"] |= d["head_is"] == "source"
+        a["head_tgt"] |= d["head_is"] == "target"
+        a["passive"] |= bool(d["passive"])
+        a["title"] |= d["scope"] == "題名"
+        c["seg"] = a
+    return info
+
+
+def build_candidates13(ts, pp, text, **kw):
+    info = build_candidates12(ts, pp, text, own=False, owner_canon=False, **kw)
+    return add_segment_candidates(info, segment_pairs(pp, text, title=info["title"]))
+
+
+def claim_features13(pp, info):
+    X = claim_features12(pp, info)
+    if not len(info["cands"]):
+        return X
+    rows = []
+    for c in info["cands"]:
+        a = c.get("seg")
+        f = [float("SEG" in c["srcs"]), float("TITLE" in c["srcs"]),
+             float(len([s for s in c["srcs"] if s not in ("SEG", "TITLE")]))]
+        if a:
+            f += [float(a["n"]), float(a["tree_h"]), float(a["tree_c"]), float(a["between"]), float(a["after"]),
+                  float(a["gap"]), float(a["n_comps"]), float(a["n_preds"]), float(a["head_src"]),
+                  float(a["head_tgt"]), float(a["passive"]), float(a["title"])]
+        else:
+            f += [0.0, -1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        rows.append(f)
+    return np.hstack([X, np.array(rows, dtype=float)])
+
+
+class Selector13(Selector12):
+    """実験12と同じ2段階の選別モデル（特徴量に区間の手がかりを加えたもの）。"""
+
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE13, fold=None):
+        super().__init__(exclude_ids=exclude_ids, train_file=train_file, fold=fold)
+
+    def predict(self, pp, info):
+        if not len(info["cands"]):
+            return np.zeros(0)
+        X1 = claim_features13(pp, info)
+        p1 = self.m1.predict_proba(X1)[:, 1]
+        X2 = structural_features13(pp, info, p1)
+        return self.m2.predict_proba(np.hstack([X1, X2]))[:, 1]
+
+
+def analyze_claim_selected13(ts, pp, selector, text, threshold=None, max_per_pair=None, **kw):
+    info = build_candidates13(ts, pp, text, **kw)
     prob = selector.predict(pp, info)
-    return info, select12(pp, info, prob, selector.threshold if threshold is None else threshold,
+    return info, select13(pp, info, prob, selector.threshold if threshold is None else threshold,
                         selector.max_per_pair if max_per_pair is None else max_per_pair)
 
 
@@ -12731,7 +12956,7 @@ _ORIGIN = [("LLM", ("LLMraw", "E1:llm_direct")),
            ("GiNZA補完", ("E1:claim_title_ginza", "E1:ginza_has_fallback", "E1:attribute",
                         "E1:ginza_has_fallback_conflict", "E1:claim_title_ginza_conflict")),
            ("GiNZA", ("G",)), ("分割GiNZA", ("GS",)), ("ノード結合", ("MRG",)), ("係り受け", ("DEP",)),
-           ("持ち主つき", ("OWN",))]
+           ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",))]
 
 
 def origin_label(srcs):
@@ -13048,14 +13273,14 @@ def relations_csv(corpus, reviews=None):
 # 汎用のデータセット（任意の特許リストを読み込んで解析する）
 # ---------------------------------------------------------------------------
 
-# 実験12の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
+# 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 DEFAULT_BANDS = {
-    "accept": 0.63, "threshold": 0.25, "review_low": 0.15, "target_precision": 0.8,
-    "stats": {"採用": {"精度": 0.802}, "要確認": {"精度": 0.3097}, "除外": {"精度": 0.0968},
-              "正解の所在": {"採用": 0.3169, "要確認": 0.2277, "除外": 0.0827, "候補なし": 0.3727}},
+    "accept": 0.58, "threshold": 0.275, "review_low": 0.175, "target_precision": 0.8,
+    "stats": {"採用": {"精度": 0.8034}, "要確認": {"精度": 0.288}, "除外": {"精度": 0.0576},
+              "正解の所在": {"採用": 0.3731, "要確認": 0.1988, "除外": 0.1358, "候補なし": 0.2924}},
 }
-METHOD_NAME = "実験12（係り受け候補＋2段階選別）"
-METHOD_SCORE = "532件の正解データで、トリプル完全一致 F1 53.6%（適合率 60.5%・再現率 48.1%）"
+METHOD_NAME = "実験13（係り受け候補＋区間の主役の候補＋2段階選別）"
+METHOD_SCORE = "532件の正解データで、トリプル完全一致 F1 56.0%（適合率 64.2%・再現率 49.7%）"
 
 GROUP_PALETTE = ["#3987e5", "#d95926", "#199e70", "#9b59d0", "#e0a100", "#2bb3c0", "#e0457b", "#7a8b2c"]
 OTHER_COLOR = "#8a8880"
@@ -13187,7 +13412,7 @@ def apply_analysis(patent, cands):
 
 
 def new_dataset(name, patents, bands=None):
-    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector12", "n": len(patents)},
+    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector13", "n": len(patents)},
             "bands": dict(bands or DEFAULT_BANDS), "patents": patents}
 
 
@@ -13355,6 +13580,55 @@ def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, to
     return axes, out, sizes
 
 
+# ---------------------------------------------------------------------------
+# 表示用の整形（関係語の頭に残った助詞、「複数の」などの付いたノード名）
+# ---------------------------------------------------------------------------
+
+_LEAD_PARTICLE_RE = re.compile(r"^(には|では|とは|へは|からは|にも|とも|は|が|を|に|で|と|へ|も|の)+(?=[一-龥ァ-ヶー])")
+_NODE_PREFIX_RE = re.compile(r"^(前記|当該|上記|複数の|少なくとも(一|１|1)つの|少なくとも(一|１|1)個の|一対の|１対の|"
+                             r"各|それぞれの)+")
+
+
+_CONJ_RULES = [(r"されている$", "される"), (r"られている$", "られる"), (r"([一-龥])している$", r"\1する"),
+               (r"づき$", "づく"), (r"された$", "される"), (r"されて$", "される"), (r"され$", "される"), (r"られた$", "られる"),
+               (r"られ$", "られる"), (r"れた$", "れる"), (r"([^さら])れ$", r"\1れる"), (r"した$", "する"),
+               (r"([一-龥])し$", r"\1する"), (r"([一-龥])み$", r"\1む"), (r"([一-龥])え$", r"\1える"),
+               (r"([一-龥])き$", r"\1く"), (r"([一-龥])ち$", r"\1つ"), (r"([一-龥])り$", r"\1る")]
+
+
+def clean_relation(rel):
+    """関係語を表示用に整える。「には有する」→「有する」（頭に残った助詞を取る）、
+    「接続され」「接続された」→「接続される」、「含み」→「含む」（言い切りの形にそろえる）。"""
+    r = str(rel or "").strip()
+    out = _LEAD_PARTICLE_RE.sub("", r) or r
+    if len(out) >= 2:
+        for pat, rep in _CONJ_RULES:
+            new = re.sub(pat, rep, out)
+            if new != out:
+                out = new
+                break
+    return out
+
+
+def display_node(name):
+    """図の上で同じものを1つの箱にまとめるための名前（「複数の多穴管」→「多穴管」）。"""
+    s = str(name or "").strip()
+    out = _NODE_PREFIX_RE.sub("", s)
+    return out or s
+
+
+def tidy_relations(rels):
+    """図や一覧に出す前に、関係語とノード名を整え、同じ関係の重複を除く。"""
+    out, seen = [], set()
+    for r in rels:
+        s, a, t = display_node(r["source"]), clean_relation(r["relation"]), display_node(r["target"])
+        if s == t or (s, a, t) in seen:
+            continue
+        seen.add((s, a, t))
+        out.append(dict(r, source=s, relation=a, target=t))
+    return out
+
+
 # ===========================================================================
 # 【統合】eval_translate_sao.py
 # 名前の付け替え: main → main_eval
@@ -13362,7 +13636,7 @@ def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, to
 """
 評価（旧 eval_translate_sao.py）
 ================================
-532件の正解データに対して、実験12の抽出を5分割交差検証で評価する。
+532件の正解データに対して、実験13の抽出を5分割交差検証で評価する。
 
     python patent_pipeline.py --eval-mode exact --limit 532 --llm-cache llm_cache.json --out exp12_exact.json
 
@@ -13561,7 +13835,7 @@ def main_eval():
     parser.add_argument("--host", default=None)
     parser.add_argument(
         "--mode", default="selected12", choices=["selected12"],
-        help="抽出方法。実験12（係り受け候補＋2段階選別、主指標 F1 53.6%%）のみ。",
+        help="抽出方法。実験13（主指標 F1 56.0%%）のみ（名前は互換のため selected12 のまま）。",
     )
     parser.add_argument("--backend", default="ollama", choices=["ollama", "deepl"],
                          help="--mode translate専用。翻訳エンジン。"
@@ -13764,19 +14038,19 @@ def main_eval():
     if args.filter_redundant_root_ownership:
         print("--filter-redundant-root-ownership有効: クレームタイトルによる二重所有を除去")
 
-    # 抽出は実験12（係り受け候補＋2段階選別）のみ。交差検証の分割ごとに、その分割を
+    # 抽出は実験13（係り受け候補＋区間の主役の候補＋2段階選別）のみ。交差検証の分割ごとに、その分割を
     # 除いた請求項だけで学習した選別モデルを使う（評価する請求項を学習に使わない）
     pass  # （統合済み）import sao_selector
-    pass  # （統合済み）import sao_selector12
+    pass  # （統合済み）import sao_selector13
     folds = cv_folds({c["id"]: c["text"] for c in json.load(
         open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
     fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
     import numpy as _np
-    _train = _np.load(TRAIN_FILE12, allow_pickle=False)
+    _train = _np.load(TRAIN_FILE13, allow_pickle=False)
     fold_threshold = [float(t) for t in _train["fold_thresholds"]]
     print("交差検証の5分割ごとに選別モデルを学習しています…")
     # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
-    fold_selector = [Selector12(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
+    fold_selector = [Selector13(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
     print(f"  分割ごとのしきい値: {fold_threshold}")
     if args.eval_mode in ("node", "exact"):
         pass  # （統合済み）import node_match_eval
@@ -13788,7 +14062,7 @@ def main_eval():
             extra = {}
             if selector.fold_max_per_pair:
                 extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
-            _, predicted = analyze_claim_selected12(
+            _, predicted = analyze_claim_selected13(
                 ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
                 llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
         except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
@@ -13927,11 +14201,13 @@ node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE,
 nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, _esc=_esc, relations_to_nested_dot=relations_to_nested_dot)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
+seg_pairs = _types.SimpleNamespace(HAS_VERBS=HAS_VERBS_sp, _tree_dist=_tree_dist, pairs_from_segment=pairs_from_segment, segment_pairs=segment_pairs)
 sao_selector = _types.SimpleNamespace(FORMATS=FORMATS, HERE=HERE, INVALID=INVALID, KEPT_INDEX=KEPT_INDEX, SIMP=SIMP, SIMPLIFIED=SIMPLIFIED, SRC_KEYS=SRC_KEYS, build_candidates=build_candidates9, claim_features=claim_features9, cv_folds=cv_folds, rel_group=rel_group)
 sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, build_candidates=build_candidates10, claim_features=claim_features10)
 sao_selector11 = _types.SimpleNamespace(HERE=HERE, build_candidates=build_candidates11, claim_features=claim_features11, merge_occurrences=merge_occurrences)
-sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, analyze_claim_selected=analyze_claim_selected12, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CORP_RE=_CORP_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review)
+sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
+sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, tidy_relations=tidy_relations)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
 
 

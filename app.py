@@ -9,7 +9,7 @@
 任意の特許リスト（J-PlatPat などから出力した CSV／Excel）を読み込み、請求項から
 SAO（主語―関係―目的語）構造を取り出して、人が確認・修正しながら分析する
 「人とAIの協働型」の特許分析ツール。抽出方法は、532件の正解データで最も精度の
-高かった実験12（係り受け候補＋2段階選別）に固定している。
+高かった実験13（係り受け候補＋区間の主役の候補＋2段階選別）に固定している。
 
 ページ構成（サイドバーのナビゲーション）
   データ
@@ -32,7 +32,7 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 【ファイル構成】
 プログラムは app.py（画面）と patent_pipeline.py（解析の処理すべて）の2つ。
 同じフォルダに、次のデータファイルを置く。
-  sao_selector12_train.npz … 実験12の選別モデルの学習データ（必須）
+  sao_selector13_train.npz … 実験13の選別モデルの学習データ（必須）
   oz_world_embed.html      … Patent World（オズの世界）の表示部品
   corpus_sao_532.json      … サンプルデータ（半導体関連特許532件の解析結果）
 
@@ -84,6 +84,8 @@ SRC_GROUPS = [
     ("請求項の分割（手がかり句）", ("GS:",)),
     ("ノード結合（XのY）", ("MRG",)),
     ("係り受け候補（述語の項の組）", ("DEP",)),
+    ("区間の主役との組", ("SEG",)),
+    ("題名が持つ構成要素", ("TITLE",)),
 ]
 STATUS_COLORS = {PC.STATUS_ACCEPT: "#16a34a", PC.STATUS_REVIEW: "#d97706", PC.STATUS_REJECT: "#94a3b8"}
 
@@ -162,9 +164,23 @@ def load_pipeline():
     return ts._load_pipeline(str(APP_DIR))
 
 
-@st.cache_resource(show_spinner="SAO選別モデル（実験12）を準備中…（初回のみ、1分ほどかかります）")
+@st.cache_resource(show_spinner="SAO選別モデル（実験13）を準備中…（初回のみ、1分ほどかかります）")
 def load_selector():
-    return pp.Selector12()
+    return pp.Selector13()
+
+
+def tidy_candidates(cands):
+    """関係語の頭に残った助詞を取り（「には有する」→「有する」）、同じ候補になったものは
+    確率の高い方だけ残す（cands は確率の高い順）。"""
+    out, seen = [], set()
+    for c in cands:
+        c = dict(c, relation=PC.clean_relation(c["relation"]))
+        k = (c["source"], c["relation"], c["target"])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
 
 
 @st.cache_data(show_spinner="サンプルデータを読み込み中…")
@@ -174,6 +190,8 @@ def load_sample():
         return None
     data = PC.load_corpus(f)
     data["meta"].update({"name": SAMPLE_NAME, "sample": True})
+    for p in data["patents"]:
+        p["relations"] = tidy_candidates(p["relations"])
     PC.assign_groups(data)
     return data
 
@@ -220,14 +238,14 @@ def need_data():
 
 
 # ---------------------------------------------------------------------------
-# 抽出（実験12：係り受け候補＋2段階選別）
+# 抽出（実験13：係り受け候補＋区間の主役の候補＋2段階選別）
 # ---------------------------------------------------------------------------
 
 def duplicate_flags(gpp, info, keys):
     """選ばれた関係と同じ組で同義の関係（「有する」と「備える」など）の候補に印を付ける
     （人が確認するときに同じものが繰り返し出ないようにする）。"""
     n = gpp._normalize_node_text_lenient
-    cm = pp.canon(info)
+    cm = pp.canon13(info)
 
     def key(c):
         return frozenset((n(cm.get(c["source"], c["source"])), n(cm.get(c["target"], c["target"]))))
@@ -248,9 +266,9 @@ def analyze(text, model, host):
     gpp = load_pipeline()
     selector = load_selector()
     t0 = time.time()
-    info = pp.build_candidates12(ts, gpp, text, model=model, host=host)
+    info = pp.build_candidates13(ts, gpp, text, model=model, host=host)
     prob = selector.predict(gpp, info)
-    chosen = pp.select12(gpp, info, prob, selector.threshold, selector.max_per_pair)
+    chosen = pp.select13(gpp, info, prob, selector.threshold, selector.max_per_pair)
     keys = {(r["source"], r["relation"], r["target"]) for r in chosen}
     bands = dict(PC.DEFAULT_BANDS, threshold=selector.threshold)
     dup = duplicate_flags(gpp, info, keys)
@@ -263,6 +281,7 @@ def analyze(text, model, host):
                       "status": PC.STATUS_REJECT if dup[i] else PC.classify(p, sel, bands),
                       "origin": PC.origin_label(c.get("srcs", [])) or "選別", "srcs": list(c.get("srcs", []))})
     cands.sort(key=lambda r: -r["prob"])
+    cands = tidy_candidates(cands)
     steps = [("前処理・構成要素の抽出（GiNZA）", f"構成要素 {len(info['tags'])} 個／形式：{info.get('format', '―')}")]
     for label, prefixes in SRC_GROUPS:
         k = sum(1 for c in info["cands"] if any(s.startswith(prefixes) for s in c.get("srcs", [])))
@@ -295,7 +314,7 @@ def sao_graph(relations):
     if not relations:
         st.info("表示できるSAO関係がありません。")
         return
-    st.graphviz_chart(relations_to_nested_dot(relations), use_container_width=True)
+    st.graphviz_chart(relations_to_nested_dot(PC.tidy_relations(relations)), use_container_width=True)
     st.caption("箱の入れ子＝構成（備える・有する・含む）／矢印＝構成要素間の関係／点線の楕円＝どの構成要素にも属さない対象")
 
 
@@ -366,7 +385,7 @@ def page_data():
 
     with tab1:
         st.markdown(
-            "J-PlatPat などから出力した **CSV／Excel** を読み込み、各特許の請求項を実験12の方法で一括解析します。"
+            "J-PlatPat などから出力した **CSV／Excel** を読み込み、各特許の請求項を実験13の方法で一括解析します。"
             "請求項の列は必須、それ以外（文献番号・発明の名称・出願人・FI・出願日）はあれば使います。"
             "請求項の欄に【請求項１】【請求項２】…と複数入っている場合は、請求項1だけを解析します。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
@@ -610,7 +629,10 @@ def page_analyze():
     st.success(f"解析完了（{res['elapsed']:.1f}秒）")
 
     st.markdown("#### ① 処理の流れ")
-    cols = st.columns(len(res["steps"]))
+    per_row = 6
+    cols = []
+    for k in range(0, len(res["steps"]), per_row):
+        cols += st.columns(per_row)
     for i, (col, (name, detail)) in enumerate(zip(cols, res["steps"])):
         col.markdown(
             f"<div style='border:1px solid rgba(148,163,184,.5);border-radius:10px;padding:8px;min-height:110px'>"
