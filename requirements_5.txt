@@ -17,3 +17,4 @@ openpyxl
 graphviz
 ollama
 openai>=1.0
+plotly.graph_objects
