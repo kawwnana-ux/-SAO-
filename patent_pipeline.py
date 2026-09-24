@@ -11493,6 +11493,50 @@ def evaluate_triples_exact(pp, predicted, gold):
     }
 
 
+# ---------------------------------------------------------------- 緩い一致（補助指標）
+# 主指標はトリプル完全一致のまま。以下は規則だけで判定する補助指標で、埋め込みは使わない。
+# 1つの正解には1つの抽出だけを対応させる（1対1）。
+LOOSE_LEVELS = {1: "L1 ノードの部分一致", 2: "L2 関係名を問わない", 3: "L3 関係名・向きを問わない",
+                4: "L4 部分一致＋関係名・向きを問わない"}
+
+
+def _loose_node(a, b, partial):
+    if a == b:
+        return True
+    if not partial:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 2 and short in long_ and set(numbers(short)) <= set(numbers(long_))
+
+
+def loose_match_count(pp, predicted, gold, level):
+    """L1: 主語・目的語の片方がもう片方を含み（2文字以上）、番号が食い違わなければ一致（関係は完全一致と同じ）
+    L2: 主語・目的語は完全一致、関係名は問わない　L3: 主語と目的語の組が向きを問わず完全一致
+    L4: L1 と L3 を合わせたもの"""
+    n = pp._normalize_node_text_lenient
+    P = [(n(r["source"]), r["relation"], n(r["target"])) for r in predicted]
+    G = [(n(r["source"]), r["relation"], n(r["target"])) for r in gold]
+    partial = level in (1, 4)
+
+    def ok(p, g):
+        if level in (3, 4):
+            return ((_loose_node(p[0], g[0], partial) and _loose_node(p[2], g[2], partial))
+                    or (_loose_node(p[0], g[2], partial) and _loose_node(p[2], g[0], partial)))
+        if not (_loose_node(p[0], g[0], partial) and _loose_node(p[2], g[2], partial)):
+            return False
+        return level == 2 or rel_match(pp, p[1], g[1])
+
+    cands = [((p[0] == g[0]) + (p[2] == g[2]) + (p[1] == g[1]), i, j)
+             for i, p in enumerate(P) for j, g in enumerate(G) if ok(p, g)]
+    cands.sort(key=lambda x: -x[0])
+    up, ug = set(), set()
+    for _, i, j in cands:
+        if i not in up and j not in ug:
+            up.add(i)
+            ug.add(j)
+    return len(up)
+
+
 # ===========================================================================
 # 【統合】nested_graph.py
 # ===========================================================================
@@ -11734,6 +11778,212 @@ def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR", focu
 
     lines.append("}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 元の形の関係図（深海テーマ）
+# 箱の入れ子を使わず、すべての関係を「→ 関係」付きの矢印で描く、以前の見た目の図。
+DEEPSEA_BG = "#071b2b"
+DEEPSEA_NODE = {"fill": "#0E3A52", "border": "#5FD4E0", "font": "#E8FBFF"}
+DEEPSEA_ROOT = {"fill": "#04121C", "border": "#8FE0F0", "font": "#FFFFFF"}
+DEEPSEA_DIM = "#1f4a5a"
+
+
+def relations_to_flat_dot(relations, title="構成要素間関係", direction="LR", focus=None, groups=None,
+                          show_labels=True):
+    """以前の「構成要素間関係図」と同じ見た目（濃紺の背景・発光する水色の角丸の箱・「→ 関係」の矢印）。
+    focus を指定すると、その部品に関わる矢印以外を暗くする。groups で関係の種類を絞る（外れた矢印は描かない）。"""
+    rels = []
+    seen = set()
+    for r in relations:
+        k = (r["source"], r["relation"], r["target"])
+        if r["source"] == r["target"] or k in seen:
+            continue
+        seen.add(k)
+        rels.append(r)
+    names = []
+    indeg, outdeg = {}, {}
+    for r in rels:
+        for x in (r["source"], r["target"]):
+            if x not in names:
+                names.append(x)
+        outdeg[r["source"]] = outdeg.get(r["source"], 0) + 1
+        indeg[r["target"]] = indeg.get(r["target"], 0) + 1
+    roots = [x for x in names if not indeg.get(x)]
+    root = max(roots or names, key=lambda x: outdeg.get(x, 0)) if names else None
+    ids = {x: f"n{i}" for i, x in enumerate(names)}
+    lines = [
+        "digraph SAO {",
+        f'graph [rankdir={direction}, splines=spline, nodesep=0.3, ranksep=0.9, bgcolor="{DEEPSEA_BG}", pad=0.35, '
+        f'fontname="{FONT}", fontsize=16, fontcolor="#E8FBFF", labelloc=t'
+        + (f', label="{_esc(title)}"' if title else "") + "];",
+        f'node [shape=box, style="rounded,filled", fontname="{FONT}", fontsize=13, margin="0.2,0.1", penwidth=2.2];',
+        f'edge [fontname="{FONT}", fontsize=11, penwidth=1.8, arrowsize=0.9];',
+    ]
+    for x in names:
+        s = DEEPSEA_ROOT if x == root else DEEPSEA_NODE
+        extra = ', penwidth=3.4, color="#fde68a"' if focus and x == focus else f', color="{s["border"]}"'
+        lines.append(f'  {ids[x]} [label="{_esc(x)}", fillcolor="{s["fill"]}", fontcolor="{s["font"]}"{extra}];')
+    for r in rels:
+        if groups is not None and relation_group(r["relation"]) not in groups:
+            continue
+        dim = focus and focus not in (r["source"], r["target"])
+        color = DEEPSEA_DIM if dim else DEEPSEA_NODE["border"]
+        a = [f'color="{color}"', f'tooltip="{_esc(r["source"])} → {_esc(r["relation"])} → {_esc(r["target"])}"']
+        if show_labels and not dim:
+            a.append(f'label="→ {_esc(r["relation"])}", fontcolor="{color}"')
+        lines.append(f"  {ids[r['source']]} -> {ids[r['target']]} [{', '.join(a)}];")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 階層図（上位概念 → 下位概念の木）
+TREE_STYLES = [
+    {"fill": "#fde2ea", "border": "#e0527a", "font": "#6b0f2e", "role": "主語・上位概念"},
+    {"fill": "#d9f5e8", "border": "#22a06b", "font": "#0f3d2c", "role": "下位概念"},
+    {"fill": "#efe4fb", "border": "#9b6bd6", "font": "#3b1a66", "role": "さらに下位の概念"},
+]
+TREE_LINE = "#1e3a8a"
+WRAP = 5  # 階層図で1段に並べる子の数（これを超えると次の段へ折り返す）
+
+
+def _tree_levels(rels):
+    """各ノードの階層（0＝一番上の上位概念）。どこからも矢印を受けないノードを上に置き、
+    そこから矢印の向きにたどった段数を階層とする（輪になっている部分は、残りのうち矢印の多いノードから）。"""
+    names, out, indeg = [], {}, {}
+    for r in rels:
+        for x in (r["source"], r["target"]):
+            if x not in names:
+                names.append(x)
+        out.setdefault(r["source"], []).append(r["target"])
+        indeg[r["target"]] = indeg.get(r["target"], 0) + 1
+    level = {}
+    roots = sorted([x for x in names if not indeg.get(x)], key=lambda x: -len(out.get(x, [])))
+    while len(level) < len(names):
+        if not roots:
+            rest = [x for x in names if x not in level]
+            roots = [max(rest, key=lambda x: len(out.get(x, [])))]
+        frontier = [x for x in roots if x not in level]
+        for x in frontier:
+            level[x] = 0
+        while frontier:
+            nxt = []
+            for u in frontier:
+                for v in out.get(u, []):
+                    if v not in level:
+                        level[v] = level[u] + 1
+                        nxt.append(v)
+            frontier = nxt
+        roots = []
+    return names, level
+
+
+def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, show_labels=True, show_roles=True,
+                          show_cross=False):
+    """階層図：一番上に主語（上位概念）、その下に「関係」を挟んで目的語（下位概念）を並べる木の形の図。
+    同じ主語・同じ関係の目的語はまとめて枝分かれさせる。階層を上に戻る関係や、同じ階層どうしの関係は、
+    show_cross=True のときだけ点線で描く（既定では木の形を見やすくするため描かない）。"""
+    rels, seen = [], set()
+    for r in relations:
+        k = (r["source"], r["relation"], r["target"])
+        if r["source"] != r["target"] and k not in seen:
+            seen.add(k)
+            rels.append(r)
+    if groups is not None:
+        rels = [r for r in rels if relation_group(r["relation"]) in groups]
+    names, level = _tree_levels(rels)
+    ids = {x: f"n{i}" for i, x in enumerate(names)}
+    lines = [
+        "digraph SAO {",
+        f'graph [rankdir={direction}, splines=ortho, nodesep=0.45, ranksep=0.42, bgcolor="white", pad=0.3, '
+        f'fontname="{FONT}", newrank=true];',
+        f'node [shape=box, style="rounded,filled", fontname="{FONT}", penwidth=2.0, margin="0.22,0.08"];',
+        f'edge [color="{TREE_LINE}", penwidth=1.6, arrowsize=0.8, fontname="{FONT}"];',
+    ]
+    for x in names:
+        s = TREE_STYLES[min(level[x], 2)]
+        hot = focus and x == focus
+        role = (f'<br/><font point-size="10" color="{s["font"]}">（{s["role"]}）</font>' if show_roles else "")
+        lines.append(f'  {ids[x]} [label=<<b><font point-size="15" color="{s["font"]}">{html.escape(x)}</font></b>{role}>, '
+                     f'fillcolor="{s["fill"]}", color="{"#ca8a04" if hot else s["border"]}"'
+                     f'{", penwidth=3.6" if hot else ""}];')
+    # 下向きの関係は、主語と関係ごとに1つの「関係」ラベルを挟んで枝分かれさせる
+    groups_down, others = {}, []
+    for r in rels:
+        if level[r["target"]] > level[r["source"]]:
+            groups_down.setdefault((r["source"], r["relation"]), []).append(r["target"])
+        else:
+            others.append(r)
+    for k, ((src, rel), tgts) in enumerate(groups_down.items()):
+        dim = focus and focus != src and focus not in tgts
+        color = "#cbd5e1" if dim else relation_color(rel, "#1d4ed8")
+        line = "#cbd5e1" if dim else TREE_LINE
+        rid = f"r{k}"
+        lab = html.escape(rel) if show_labels else ""
+        lines.append(f'  {rid} [shape=plaintext, style="", margin=0, label=<<b><font point-size="13" color="{color}">'
+                     f'{lab}</font></b>>, width=0.1, height=0.1];')
+        lines.append(f'  {ids[src]} -> {rid} [arrowhead=none, color="{line}"];')
+        for t in tgts:
+            lines.append(f'  {rid} -> {ids[t]} [color="{line}"];')
+        # 子が多いときは、横に長くなりすぎないよう WRAP 個ずつ段を下げて折り返す（見えない線で下へ押す）
+        for a in range(WRAP, len(tgts)):
+            lines.append(f'  {ids[tgts[a - WRAP]]} -> {ids[tgts[a]]} [style=invis, weight=5];')
+    for r in (others if show_cross else []):
+        dim = focus and focus not in (r["source"], r["target"])
+        color = "#cbd5e1" if dim else relation_color(r["relation"], "#475569")
+        lab = f', xlabel=<<font point-size="11" color="{color}">{html.escape(r["relation"])}</font>>' if show_labels and not dim else ""
+        lines.append(f'  {ids[r["source"]]} -> {ids[r["target"]]} [style=dashed, constraint=false, color="{color}"{lab}];')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def relations_to_tree_html(relations, groups=None, max_depth=6):
+    """階層図と同じ構造を、字下げした文字の木で表す（「この図の構造」）。"""
+    rels, seen = [], set()
+    for r in relations:
+        k = (r["source"], r["relation"], r["target"])
+        if r["source"] != r["target"] and k not in seen:
+            seen.add(k)
+            rels.append(r)
+    if groups is not None:
+        rels = [r for r in rels if relation_group(r["relation"]) in groups]
+    names, level = _tree_levels(rels)
+    down = {}
+    for r in rels:
+        if level[r["target"]] > level[r["source"]]:
+            down.setdefault(r["source"], {}).setdefault(r["relation"], []).append(r["target"])
+    chip = ('<span style="background:{f};border:1px solid {b};color:{c};border-radius:5px;padding:1px 6px;'
+            'font-weight:700">{t}</span>')
+    out = []
+    shown = set()
+
+    def walk(x, depth):
+        s = TREE_STYLES[min(level[x], 2)]
+        pad = depth * 1.4
+        out.append(f'<div style="margin-left:{pad}em;margin-top:3px">{"└ " if depth else ""}'
+                   + chip.format(f=s["fill"], b=s["border"], c=s["font"], t=html.escape(x))
+                   + ('<span style="opacity:.6;font-size:.8em">（上に同じ）</span>' if x in shown else "") + "</div>")
+        if x in shown or depth >= max_depth:
+            return
+        shown.add(x)
+        for rel, tgts in down.get(x, {}).items():
+            out.append(f'<div style="margin-left:{pad + 1.0}em;color:{relation_color(rel, "#1d4ed8")};font-weight:700">'
+                       f'└ {html.escape(rel)}</div>')
+            for t in tgts:
+                walk(t, depth + 2)
+
+    for x in names:
+        if level[x] == 0:
+            walk(x, 0)
+    return '<div style="font-size:.9rem;line-height:1.55">' + "".join(out) + "</div>"
+
+
+def tree_cross_relations(relations, groups=None):
+    """階層図で木の枝にならない関係（同じ階層どうし・上に戻る関係）の一覧。"""
+    rels = [r for r in relations if r["source"] != r["target"]]
+    if groups is not None:
+        rels = [r for r in rels if relation_group(r["relation"]) in groups]
+    _, level = _tree_levels(rels)
+    return [r for r in rels if level[r["target"]] <= level[r["source"]]]
 
 
 # ===========================================================================
@@ -12868,6 +13118,401 @@ def analyze_claim_selected13(ts, pp, selector, text, threshold=None, max_per_pai
 
 
 # ===========================================================================
+# 【統合】node_pairs.py
+# ===========================================================================
+"""
+node_pairs.py
+==============
+【実験14】候補生成の網羅性を最大化するための、ノードの拡張と区間内の総当たりの組。
+
+実験13でも正解のSAOの29.2%が候補に入っていなかった。その内訳（正解に占める割合）は
+  ・一方のノードが本文にあるのに構成要素として切り出されていない（「ケースの外側」「外部」
+    「基材の長手方向」など、位置・部分・属性を表す名詞句）          約7%
+  ・一方のノードが「XのY」の形で本文にそのまま無い（「第1トランジスタの第1端」「接着剤の膜厚」
+    のように、正解データが部分・属性に持ち主を付けて呼ぶもの）        約5%
+  ・両方のノードは候補にあるが、同じ区間にあるのに組になっていない    約6%
+  ・組はあるが関係名が合わない                                        約4%
+だった。そこで、特定の書き方に頼らない次の一般的な規則で、ノードと組を増やす。
+
+ノード（区間ごと）
+  N1 構成要素（従来の抽出器）
+  N2 名詞のまとまり（名詞・数詞・記号の連続。「前記」「複数の」等の前置きは除く）
+  N3 「の」でつながった名詞句と、その途中からの部分（「Aの一方の面」「一方の面」）
+  N4 持ち主つきの名前：区間の主役（先頭の主題「Xは、」と、最後の名詞「…Yと、」）＋「の」＋同じ区間の名詞
+     （「…第1端を有する第1トランジスタ」→「第1トランジスタの第1端」）、および並列の展開
+     （「A及びBの膜厚」→「Aの膜厚」「Bの膜厚」）
+組（区間ごと）
+  同じ区間の2つのノードを、その区間の述語（2つのうち前のノードより後ろにあるもの）で結ぶ。両方の向き。
+  N3・N4 の「XのY」とその持ち主 X には「の」「有する」の組を作る。
+どの組・どの述語・どの向きを採るかは、選別モデルが特徴量から判断する（実験12・13と同じ）。
+"""
+import re
+
+pass  # （統合済み）import claim_segmenter as CS
+pass  # （統合済み）import dep_pairs as D
+
+NOUNISH = {"NOUN", "PROPN", "NUM", "SYM"}
+LEAD = {"前記", "該", "上記", "当該", "各", "複数", "所定"}
+FORMAL = {"とき", "場合", "こと", "もの", "ため", "それぞれ", "各々", "以上", "以下", "未満", "程度", "状態", "際",
+          "少なくとも", "一部", "全部", "うち", "間", "後", "前", "上", "下", "中", "内", "外", "式", "数", "値"}
+QTY_RE = re.compile(r"^[0-9０-９一二三四五六七八九十]+(個|つ|本|枚|箇所|か所|層)?(以上|以下)?$")
+HAS_LABELS = ("有する",)
+OWNER_LABELS = ("の", "有する")
+MAX_NODES = 14
+
+
+def _units(doc):
+    """名詞のまとまり（開始・終了のトークン番号とテキスト）。"""
+    out, cur = [], []
+    for t in doc:
+        if t.pos_ in NOUNISH and t.text not in ("、", "，", "。"):
+            cur.append(t)
+            continue
+        if cur:
+            out.append(cur)
+        cur = []
+    if cur:
+        out.append(cur)
+    units = []
+    for toks in out:
+        while toks and (toks[0].text in LEAD or toks[0].text in ("の",)):
+            toks = toks[1:]
+        if not toks:
+            continue
+        text = "".join(t.text for t in toks)
+        if text in FORMAL or QTY_RE.match(text) or not re.search(r"[一-龥ァ-ヶA-Za-zＡ-Ｚａ-ｚ]", text):
+            continue
+        units.append({"start": toks[0].i, "end": toks[-1].i, "text": text})
+    return units
+
+
+def _chains(doc, units):
+    """「の」でつながった名詞句。[[unit, unit, ...], ...]"""
+    by_start = {u["start"]: u for u in units}
+    chains, used = [], set()
+    for u in units:
+        if u["start"] in used:
+            continue
+        ch = [u]
+        while True:
+            e = ch[-1]["end"]
+            if e + 2 < len(doc) and doc[e + 1].text == "の" and (e + 2) in by_start:
+                nxt = by_start[e + 2]
+                ch.append(nxt)
+                used.add(nxt["start"])
+            elif (e + 3 < len(doc) and doc[e + 1].text == "の" and doc[e + 2].text in LEAD
+                  and (e + 3) in by_start):
+                nxt = by_start[e + 3]
+                ch.append(nxt)
+                used.add(nxt["start"])
+            else:
+                break
+        if len(ch) >= 2:
+            chains.append(ch[:4])
+    return chains
+
+
+def _coord_partner(doc, unit, units):
+    """「A及びBの…」「AとBとの…」「A、Bの…」の A（Bと並列の名詞）。"""
+    s = unit["start"]
+    j = s - 1
+    while j >= 0 and doc[j].text in LEAD:
+        j -= 1
+    if j < 1 or doc[j].text not in ("及び", "および", "並びに", "ならびに", "と", "、", "又は", "または"):
+        return None
+    for u in units:
+        if u["end"] == j - 1 or (u["end"] == j - 2 and doc[j - 1].text in LEAD):
+            return u
+    return None
+
+
+def segment_nodes(pp, doc):
+    """区間のノード一覧: {text: {"pos": 代表位置, "kind": 種類, "len": 連結数, "owner": 持ち主}}"""
+    nodes = {}
+
+    def add(text, pos, kind, n=1, owner=None, start=None):
+        if not text or len(text) < 2 or text in FORMAL:
+            return
+        cur = nodes.get(text)
+        if cur is None or ["N4", "N3", "N2", "N1"].index(kind) > ["N4", "N3", "N2", "N1"].index(cur["kind"]):
+            nodes[text] = {"pos": pos, "kind": kind, "len": n, "owner": owner, "start": pos if start is None else start}
+
+    cmap = _comp_map(pp, doc)
+    comps = {}
+    for c in cmap.values():
+        comps[(c["start"], c["end"])] = c
+    for c in comps.values():
+        add(c["text"], c["end"], "N1", start=c["start"])
+    units = _units(doc)
+    for u in units:
+        add(u["text"], u["end"], "N2", start=u["start"])
+    for ch in _chains(doc, units):
+        k = len(ch)
+        for a in range(k):
+            for b in range(a + 1, k):
+                sub = ch[a:b + 1]
+                add("の".join(x["text"] for x in sub), sub[-1]["end"], "N3", n=len(sub),
+                    owner="の".join(x["text"] for x in sub[:-1]), start=sub[0]["start"])
+        partner = _coord_partner(doc, ch[0], units)
+        if partner is not None:
+            add(partner["text"] + "の" + "の".join(x["text"] for x in ch[1:]), ch[-1]["end"], "N4", n=k,
+                owner=partner["text"], start=partner["start"])
+    # 区間の主役（先頭の主題と、最後の名詞）
+    heads = []
+    names = sorted(((v["pos"], t) for t, v in nodes.items() if v["kind"] in ("N1", "N2")))
+    if names:
+        heads.append(names[-1][1])
+        first = min(names)
+        after = [t.text for t in doc[first[0] + 1:first[0] + 3]]
+        if after and after[0] in ("は", "が"):
+            heads.append(first[1])
+    for h in dict.fromkeys(heads):
+        for t, v in list(nodes.items()):
+            if t == h or v["kind"] not in ("N1", "N2") or h in t or t in h:
+                continue
+            add(h + "の" + t, v["pos"], "N4", n=2, owner=h, start=v["start"])
+    if len(nodes) > MAX_NODES * 3:
+        # 長すぎる区間は、構成要素と名詞のまとまりを優先して上限まで
+        keep = sorted(nodes.items(), key=lambda kv: (["N1", "N2", "N3", "N4"].index(kv[1]["kind"]), kv[1]["pos"]))
+        nodes = dict(keep[:MAX_NODES * 3])
+    return nodes, heads
+
+
+def pairs_in_segment(pp, doc, max_preds=3):
+    nodes, heads = segment_nodes(pp, doc)
+    if len(nodes) < 2:
+        return []
+    preds = []
+    for t in doc:
+        if _is_pred(t):
+            lab, passive = _label(pp, t)
+            if lab and len(lab) <= 12:
+                preds.append((t.i, lab, passive, t.pos_))
+    out = []
+    items = list(nodes.items())
+    for s, sv in items:
+        for t, tv in items:
+            if s == t:
+                continue
+            base = {"n_nodes": len(nodes), "n_preds": len(preds), "kind_s": sv["kind"], "kind_t": tv["kind"],
+                    "len_s": sv["len"], "len_t": tv["len"], "head_s": s in heads, "head_t": t in heads,
+                    "gap": abs(sv["pos"] - tv["pos"]), "s_before": sv["pos"] < tv["pos"]}
+            # 持ち主と「XのY」
+            if tv["owner"] == s:
+                for lab in OWNER_LABELS:
+                    out.append(dict(base, source=s, relation=lab, target=t, owner=True, pred_after=0,
+                                    between=False, passive=False, rank=0, after_rank=0, pred_gap=0))
+                continue
+            if sv["owner"] == t:
+                continue
+            # 片方がもう片方の名前の一部（「基板」と「基板の面」）は、持ち主の組以外は作らない
+            if s in t or t in s:
+                continue
+            # 範囲が重なるノード（同じ語の別の切り出し）は組にしない
+            if not (sv["pos"] < tv["start"] or tv["pos"] < sv["start"]):
+                continue
+            lo, hi = min(sv["pos"], tv["pos"]), max(sv["pos"], tv["pos"])
+            cand = [p for p in preds if p[0] > lo]
+            between = [p for p in cand if p[0] < hi]
+            after = [p for p in cand if p[0] > hi][:max_preds]
+            for rank, p in enumerate(between + after):
+                out.append(dict(base, source=s, relation=p[1], target=t, owner=False,
+                                pred_after=int(p[0] > hi), between=p[0] < hi, passive=p[2], rank=rank,
+                                after_rank=rank - len(between), pred_gap=p[0] - hi))
+    return out
+
+
+def keep_pair(d):
+    """生成した組のうち、残すもの（120件で「新たに候補に入る正解の数／候補の数」を調べて決めた一般的な条件）。
+    ・持ち主つきの名前（N4）どうし・名詞のまとまり（N2）どうしの組は、正解がほぼ無いので作らない
+    ・述語は、2つのノードの間にあるものと、後ろ側のノードの直後の1つ（「…を有する」の締め）まで
+    ・持ち主つきの名前（N4）は、持ち主との組と、近く（8語以内）で間に述語がある組だけ"""
+    ks = {d["kind_s"], d["kind_t"]}
+    if d["owner"]:
+        return ks != {"N2", "N4"}
+    if ks == {"N2"} or ks == {"N4"} or ks == {"N2", "N4"} or ks == {"N3", "N4"}:
+        return False
+    if "N4" in ks:
+        return d["between"] and d["gap"] <= 8
+    # 間に述語が無いときは、後ろ側のノードの直後の述語1つだけ
+    return d["between"] or d["after_rank"] == 0
+
+
+def node_pair_candidates(pp, text, max_preds=3, filtered=True):
+    res = []
+    with _enzai(pp, True):
+        for seg in split_claim(pp, text):
+            sent = to_sentence(seg)
+            if sent is None:
+                continue
+            for s in distribute(sent):
+                try:
+                    doc = pp.nlp(pp._clean_claim_text(s))
+                    res += [d for d in pairs_in_segment(pp, doc, max_preds=max_preds) if not filtered or keep_pair(d)]
+                except Exception:  # noqa: BLE001
+                    continue
+    return res
+
+
+# ===========================================================================
+# 【統合】sao_selector14.py
+# 名前の付け替え: Selector → Selector14, TRAIN_FILE → TRAIN_FILE14, analyze_claim_selected → analyze_claim_selected14, build_candidates → build_candidates14, canon → canon14, claim_features → claim_features14, select → select14
+# ===========================================================================
+"""
+sao_selector14.py
+==================
+【実験14】候補生成の網羅性の最大化。実験13の候補に、区間内のノードを拡張（名詞のまとまり・
+「の」でつながった名詞句・持ち主つきの名前）し、区間の述語で組にした候補（NP、node_pairs.py）を加える。
+選別の仕組み（2段階・1組1件・内側の交差検証でしきい値を選ぶ）は実験12・13と同じ。
+
+「有する」の付け足し（HASV：既にある組に関係「有する」を両方の向きで付ける候補）も試したが、
+候補の上限は上がったものの主指標（完全一致F1）は上がらなかったため採用していない
+（add_has_variants は研究の再現用に残してあるが、build_candidates では使わない）。
+"""
+import pathlib as _pathlib
+
+import numpy as np
+
+pass  # （統合済み）import node_pairs as NP
+pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import sao_selector12 as S12
+pass  # （統合済み）import sao_selector13 as S13
+
+HERE = _pathlib.Path(__file__).resolve().parent
+TRAIN_FILE14 = HERE / "sao_selector14_train.npz"
+canon14 = canon
+select14 = select12
+structural_features = structural_features12
+HAS_REL = "有する"
+HAS_LIKE = {"有する", "備える", "含む", "具備する", "の"}
+KINDS = ("N1", "N2", "N3", "N4")
+
+
+def add_node_pair_candidates(info, pairs):
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    for d in pairs:
+        rel = d["relation"].translate(SIMP)
+        key = (d["source"], rel, d["target"])
+        c = index.get(key)
+        if c is None:
+            c = {"source": key[0], "relation": rel, "target": key[2], "srcs": [], "type": "NP", "dep": None}
+            info["cands"].append(c)
+            index[key] = c
+        if "NP" not in c["srcs"]:
+            c["srcs"].append("NP")
+        a = c.get("np") or {"n": 0, "kind_s": 9, "kind_t": 9, "owner": False, "between": False, "after_rank": 9,
+                            "rank": 9, "gap": 99, "pred_gap": 99, "n_nodes": 0, "n_preds": 0, "head_s": False,
+                            "head_t": False, "len_s": 0, "len_t": 0, "passive": False, "s_before": False}
+        a["n"] += 1
+        a["kind_s"] = min(a["kind_s"], KINDS.index(d["kind_s"]))
+        a["kind_t"] = min(a["kind_t"], KINDS.index(d["kind_t"]))
+        a["owner"] |= bool(d["owner"])
+        a["between"] |= bool(d["between"])
+        a["after_rank"] = min(a["after_rank"], max(d.get("after_rank", 0), -3))
+        a["rank"] = min(a["rank"], d["rank"])
+        a["gap"] = min(a["gap"], d["gap"])
+        a["pred_gap"] = min(a["pred_gap"], abs(d.get("pred_gap", 0)))
+        a["n_nodes"] = max(a["n_nodes"], d["n_nodes"])
+        a["n_preds"] = max(a["n_preds"], d["n_preds"])
+        a["head_s"] |= bool(d["head_s"])
+        a["head_t"] |= bool(d["head_t"])
+        a["len_s"] = max(a["len_s"], d["len_s"])
+        a["len_t"] = max(a["len_t"], d["len_t"])
+        a["passive"] |= bool(d["passive"])
+        a["s_before"] |= bool(d["s_before"])
+        c["np"] = a
+    return info
+
+
+def _pair_origin(c):
+    srcs = set(c["srcs"])
+    if srcs - {"SEG", "TITLE", "DEP", "NP", "HASV"}:
+        return 3  # LLM・GiNZA などの従来の候補
+    if "DEP" in srcs:
+        return 2
+    if srcs & {"SEG", "TITLE"}:
+        return 1
+    a = c.get("np")
+    if a and not a["between"] and a["gap"] <= 8:
+        return 0  # 区間内の組のうち、近くて後ろの述語で結んだもの
+    return -1
+
+
+def add_has_variants(info):
+    """既にある組（従来の候補・区間の主役の組・係り受けの組・近い区間内の組）に、「有する」を両方の向きで付ける。"""
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    pairs = {}
+    for c in info["cands"]:
+        if c["relation"] in HAS_LIKE:
+            continue
+        o = _pair_origin(c)
+        if o < 0:
+            continue
+        for d, (s, t) in ((0, (c["source"], c["target"])), (1, (c["target"], c["source"]))):
+            k = (s, t)
+            pairs[k] = max(pairs.get(k, (-1, 0))[0], o), d
+    for (s, t), (o, d) in pairs.items():
+        key = (s, HAS_REL, t)
+        c = index.get(key)
+        if c is None:
+            c = {"source": s, "relation": HAS_REL, "target": t, "srcs": [], "type": "HASV", "dep": None}
+            info["cands"].append(c)
+            index[key] = c
+        if "HASV" not in c["srcs"]:
+            c["srcs"].append("HASV")
+        c["hasv"] = {"origin": o, "rev": d}
+    return info
+
+
+def build_candidates14(ts, pp, text, **kw):
+    info = build_candidates13(ts, pp, text, **kw)
+    return add_node_pair_candidates(info, node_pair_candidates(pp, text))
+
+
+def claim_features14(pp, info):
+    X = claim_features13(pp, info)
+    if not len(info["cands"]):
+        return X
+    rows = []
+    for c in info["cands"]:
+        f = [float("NP" in c["srcs"]), float("HASV" in c["srcs"]), float(c["srcs"] in (["NP"], ["HASV"], ["NP", "HASV"], ["HASV", "NP"]))]
+        a = c.get("np")
+        if a:
+            f += [float(a["n"]), float(a["kind_s"]), float(a["kind_t"]), float(a["owner"]), float(a["between"]),
+                  float(a["after_rank"]), float(a["rank"]), float(a["gap"]), float(a["pred_gap"]), float(a["n_nodes"]),
+                  float(a["n_preds"]), float(a["head_s"]), float(a["head_t"]), float(a["len_s"]), float(a["len_t"]),
+                  float(a["passive"]), float(a["s_before"])]
+        else:
+            f += [0.0, -1.0, -1.0, 0.0, 0.0, -9.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        h = c.get("hasv")
+        f += [float(h["origin"]), float(h["rev"])] if h else [-1.0, -1.0]
+        rows.append(f)
+    return np.hstack([X, np.array(rows, dtype=float)])
+
+
+class Selector14(Selector13):
+    """実験12・13と同じ2段階の選別モデル（特徴量に実験14の候補の手がかりを加えたもの）。"""
+
+    def __init__(self, exclude_ids=None, train_file=TRAIN_FILE14, fold=None):
+        super().__init__(exclude_ids=exclude_ids, train_file=train_file, fold=fold)
+
+    def predict(self, pp, info):
+        if not len(info["cands"]):
+            return np.zeros(0)
+        X1 = claim_features14(pp, info)
+        p1 = self.m1.predict_proba(X1)[:, 1]
+        X2 = structural_features(pp, info, p1)
+        return self.m2.predict_proba(np.hstack([X1, X2]))[:, 1]
+
+
+def analyze_claim_selected14(ts, pp, selector, text, threshold=None, max_per_pair=None, **kw):
+    info = build_candidates14(ts, pp, text, **kw)
+    prob = selector.predict(pp, info)
+    return info, select14(pp, info, prob, selector.threshold if threshold is None else threshold,
+                        selector.max_per_pair if max_per_pair is None else max_per_pair)
+
+
+# ===========================================================================
 # 【統合】platform_core.py
 # 名前の付け替え: structural_features → claim_structure_features
 # ===========================================================================
@@ -13042,7 +13687,7 @@ _ORIGIN = [("LLM", ("LLMraw", "E1:llm_direct")),
            ("GiNZA補完", ("E1:claim_title_ginza", "E1:ginza_has_fallback", "E1:attribute",
                         "E1:ginza_has_fallback_conflict", "E1:claim_title_ginza_conflict")),
            ("GiNZA", ("G",)), ("分割GiNZA", ("GS",)), ("ノード結合", ("MRG",)), ("係り受け", ("DEP",)),
-           ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",))]
+           ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",)), ("区間内の名詞句", ("NP",))]
 
 
 def origin_label(srcs):
@@ -13361,15 +14006,16 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-24"
+PIPELINE_VERSION = "2026-09-24b"
 
 DEFAULT_BANDS = {
-    "accept": 0.58, "threshold": 0.275, "review_low": 0.175, "target_precision": 0.8,
-    "stats": {"採用": {"精度": 0.8034}, "要確認": {"精度": 0.288}, "除外": {"精度": 0.0576},
-              "正解の所在": {"採用": 0.3731, "要確認": 0.1988, "除外": 0.1358, "候補なし": 0.2924}},
+    "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
+    "stats": {"採用": {"精度": 0.801}, "要確認": {"精度": 0.3034}, "除外": {"精度": 0.0224},
+              "正解の所在": {"採用": 0.3799, "要確認": 0.1907, "除外": 0.2288, "候補なし": 0.2005}},
 }
-METHOD_NAME = "実験13（係り受け候補＋区間の主役の候補＋2段階選別）"
-METHOD_SCORE = "532件の正解データで、トリプル完全一致 F1 56.0%（適合率 64.2%・再現率 49.7%）"
+METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
+METHOD_SCORE = ("532件の正解データで、トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
+                "補助指標：ノードの表記ゆれを許すと F1 62.9%、関係名を問わないと F1 58.4%")
 
 GROUP_PALETTE = ["#3987e5", "#d95926", "#199e70", "#9b59d0", "#e0a100", "#2bb3c0", "#e0457b", "#7a8b2c"]
 OTHER_COLOR = "#8a8880"
@@ -13501,7 +14147,7 @@ def apply_analysis(patent, cands):
 
 
 def new_dataset(name, patents, bands=None):
-    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector13", "n": len(patents)},
+    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector14", "n": len(patents)},
             "bands": dict(bands or DEFAULT_BANDS), "patents": patents}
 
 
@@ -14007,7 +14653,7 @@ def wordcloud_svg(placed, width=900, height=520, legend=("少ない（冷）", "
 ================================
 532件の正解データに対して、実験13の抽出を5分割交差検証で評価する。
 
-    python patent_pipeline.py --eval-mode exact --limit 532 --llm-cache llm_cache.json --out exp12_exact.json
+    python patent_pipeline.py --eval-mode exact --limit 532 --llm-cache llm_cache.json --out exp14_exact.json
 
 --eval-mode exact（主指標：トリプル完全一致）／node（主語・目的語ごとの意味的一致）／
 lenient（旧：トリプル全体の意味的類似度 0.75）／strict（旧：表記の完全一致）。
@@ -14407,19 +15053,19 @@ def main_eval():
     if args.filter_redundant_root_ownership:
         print("--filter-redundant-root-ownership有効: クレームタイトルによる二重所有を除去")
 
-    # 抽出は実験13（係り受け候補＋区間の主役の候補＋2段階選別）のみ。交差検証の分割ごとに、その分割を
+    # 抽出は実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）のみ。交差検証の分割ごとに、その分割を
     # 除いた請求項だけで学習した選別モデルを使う（評価する請求項を学習に使わない）
     pass  # （統合済み）import sao_selector
-    pass  # （統合済み）import sao_selector13
+    pass  # （統合済み）import sao_selector14
     folds = cv_folds({c["id"]: c["text"] for c in json.load(
         open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
     fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
     import numpy as _np
-    _train = _np.load(TRAIN_FILE13, allow_pickle=False)
+    _train = _np.load(TRAIN_FILE14, allow_pickle=False)
     fold_threshold = [float(t) for t in _train["fold_thresholds"]]
     print("交差検証の5分割ごとに選別モデルを学習しています…")
     # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
-    fold_selector = [Selector13(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
+    fold_selector = [Selector14(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
     print(f"  分割ごとのしきい値: {fold_threshold}")
     if args.eval_mode in ("node", "exact"):
         pass  # （統合済み）import node_match_eval
@@ -14431,7 +15077,7 @@ def main_eval():
             extra = {}
             if selector.fold_max_per_pair:
                 extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
-            _, predicted = analyze_claim_selected13(
+            _, predicted = analyze_claim_selected14(
                 ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
                 llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
         except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
@@ -14440,6 +15086,9 @@ def main_eval():
         gold = gold_all[cid]
         if args.eval_mode == "exact":
             metrics = evaluate_triples_exact(pp, predicted, gold)
+            # 補助指標（緩い一致）の正解数も記録する（主指標は完全一致のまま）
+            metrics["緩い一致の正解数"] = {str(lv): loose_match_count(pp, predicted, gold, lv)
+                                      for lv in LOOSE_LEVELS}
         elif args.eval_mode == "node":
             metrics = evaluate_triples_node(pp, predicted, gold, theta=args.node_threshold)
         elif args.eval_mode == "lenient":
@@ -14459,6 +15108,8 @@ def main_eval():
         ]
         if "正解内訳" in metrics:
             keep_keys.append("正解内訳")
+        if "緩い一致の正解数" in metrics:
+            keep_keys.append("緩い一致の正解数")
 
         # 【type×関係語ごとのTP/FP内訳】translate_sao.pyの各関係には、どの処理が
         # 作ったかを示す"type"（llm_direct / claim_title_ginza /
@@ -14539,6 +15190,18 @@ def main_eval():
              else f"（閾値={args.semantic_threshold}, 意味的類似度={'無効' if args.no_semantic else '有効'}）"))
     print(f"MICRO precision={agg['micro']['precision']:.4f} recall={agg['micro']['recall']:.4f} f1={agg['micro']['f1']:.4f}")
     print(f"MACRO precision={agg['macro']['precision']:.4f} recall={agg['macro']['recall']:.4f} f1={agg['macro']['f1']:.4f}")
+    if args.eval_mode == "exact":
+        rows = [m for m in per_claim if "緩い一致の正解数" in m]
+        if rows:
+            n_pred = sum(m["システム抽出数"] for m in rows)
+            n_gold = sum(m["正解データ数"] for m in rows)
+            print("補助指標（緩い一致。主指標は上の完全一致）:")
+            for lv, name in LOOSE_LEVELS.items():
+                tp = sum(m["緩い一致の正解数"][str(lv)] for m in rows)
+                P = tp / n_pred if n_pred else 0.0
+                R = tp / n_gold if n_gold else 0.0
+                F = 2 * P * R / (P + R) if P + R else 0.0
+                print(f"  {name}: precision={P:.4f} recall={R:.4f} f1={F:.4f}")
 
     # 【(type, 関係語)ごとのPrecision表】claim_title_ginza / ginza_has_fallback /
     # attribute（＝GiNZA由来のフォールバックで、LLMの自由な言い換えと違って
@@ -14566,8 +15229,8 @@ _THIS = sys.modules[__name__]
 
 en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
 translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
-node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, node_score=node_score, numbers=numbers, rel_match=rel_match)
-nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, _esc=_esc, relation_color=relation_color, relation_group=relation_group, relations_to_nested_dot=relations_to_nested_dot)
+node_match_eval = _types.SimpleNamespace(LOOSE_LEVELS=LOOSE_LEVELS, _KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, _loose_node=_loose_node, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, loose_match_count=loose_match_count, node_score=node_score, numbers=numbers, rel_match=rel_match)
+nested_graph = _types.SimpleNamespace(DEEPSEA_BG=DEEPSEA_BG, DEEPSEA_DIM=DEEPSEA_DIM, DEEPSEA_NODE=DEEPSEA_NODE, DEEPSEA_ROOT=DEEPSEA_ROOT, FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, TREE_LINE=TREE_LINE, TREE_STYLES=TREE_STYLES, WRAP=WRAP, _esc=_esc, _tree_levels=_tree_levels, relation_color=relation_color, relation_group=relation_group, relations_to_flat_dot=relations_to_flat_dot, relations_to_nested_dot=relations_to_nested_dot, relations_to_tree_dot=relations_to_tree_dot, relations_to_tree_html=relations_to_tree_html, tree_cross_relations=tree_cross_relations)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
 seg_pairs = _types.SimpleNamespace(HAS_VERBS=HAS_VERBS_sp, _tree_dist=_tree_dist, pairs_from_segment=pairs_from_segment, segment_pairs=segment_pairs)
@@ -14576,6 +15239,8 @@ sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, build_cand
 sao_selector11 = _types.SimpleNamespace(HERE=HERE, build_candidates=build_candidates11, claim_features=claim_features11, merge_occurrences=merge_occurrences)
 sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
+node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=LEAD, MAX_NODES=MAX_NODES, NOUNISH=NOUNISH, OWNER_LABELS=OWNER_LABELS, QTY_RE=QTY_RE, _chains=_chains, _coord_partner=_coord_partner, _units=_units, keep_pair=keep_pair, node_pair_candidates=node_pair_candidates, pairs_in_segment=pairs_in_segment, segment_nodes=segment_nodes)
+sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
 platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
 

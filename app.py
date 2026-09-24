@@ -9,7 +9,7 @@
 任意の特許リスト（J-PlatPat などから出力した CSV／Excel）を読み込み、請求項から
 SAO（主語―関係―目的語）構造を取り出して、人が確認・修正しながら分析する
 「人とAIの協働型」の特許分析ツール。抽出方法は、532件の正解データで最も精度の
-高かった実験13（係り受け候補＋区間の主役の候補＋2段階選別）に固定している。
+高かった実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）に固定している。
 
 ページ構成（サイドバーのナビゲーション）
   データ
@@ -32,7 +32,7 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 【ファイル構成】
 プログラムは app.py（画面）と patent_pipeline.py（解析の処理すべて）の2つ。
 同じフォルダに、次のデータファイルを置く。
-  sao_selector13_train.npz … 実験13の選別モデルの学習データ（必須）
+  sao_selector14_train.npz … 実験14の選別モデルの学習データ（必須）
   oz_world_embed.html      … Patent World（オズの世界）の表示部品
   corpus_sao_532.json      … サンプルデータ（半導体関連特許532件の解析結果）
 
@@ -72,7 +72,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-24"
+NEED_PIPELINE = "2026-09-24b"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -95,6 +95,7 @@ SRC_GROUPS = [
     ("係り受け候補（述語の項の組）", ("DEP",)),
     ("区間の主役との組", ("SEG",)),
     ("題名が持つ構成要素", ("TITLE",)),
+    ("区間内の名詞句の組（ノード拡張）", ("NP",)),
 ]
 STATUS_COLORS = {PC.STATUS_ACCEPT: "#16a34a", PC.STATUS_REVIEW: "#d97706", PC.STATUS_REJECT: "#94a3b8"}
 
@@ -173,9 +174,9 @@ def load_pipeline():
     return ts._load_pipeline(str(APP_DIR))
 
 
-@st.cache_resource(show_spinner="SAO選別モデル（実験13）を準備中…（初回のみ、1分ほどかかります）")
+@st.cache_resource(show_spinner="SAO選別モデル（実験14）を準備中…（初回のみ、1分ほどかかります）")
 def load_selector():
-    return pp.Selector13()
+    return pp.Selector14()
 
 
 def tidy_candidates(cands):
@@ -261,14 +262,14 @@ def need_data():
 
 
 # ---------------------------------------------------------------------------
-# 抽出（実験13：係り受け候補＋区間の主役の候補＋2段階選別）
+# 抽出（実験14：区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）
 # ---------------------------------------------------------------------------
 
 def duplicate_flags(gpp, info, keys):
     """選ばれた関係と同じ組で同義の関係（「有する」と「備える」など）の候補に印を付ける
     （人が確認するときに同じものが繰り返し出ないようにする）。"""
     n = gpp._normalize_node_text_lenient
-    cm = pp.canon13(info)
+    cm = pp.canon14(info)
 
     def key(c):
         return frozenset((n(cm.get(c["source"], c["source"])), n(cm.get(c["target"], c["target"]))))
@@ -289,9 +290,9 @@ def analyze(text, model, host):
     gpp = load_pipeline()
     selector = load_selector()
     t0 = time.time()
-    info = pp.build_candidates13(ts, gpp, text, model=model, host=host)
+    info = pp.build_candidates14(ts, gpp, text, model=model, host=host)
     prob = selector.predict(gpp, info)
-    chosen = pp.select13(gpp, info, prob, selector.threshold, selector.max_per_pair)
+    chosen = pp.select14(gpp, info, prob, selector.threshold, selector.max_per_pair)
     keys = {(r["source"], r["relation"], r["target"]) for r in chosen}
     bands = dict(PC.DEFAULT_BANDS, threshold=selector.threshold)
     dup = duplicate_flags(gpp, info, keys)
@@ -336,39 +337,75 @@ def llm_error_message():
 GRAPH_GROUPS = list(pp.RELATION_GROUP_NAMES) + ["その他"]
 
 
-def sao_graph(relations, key="main"):
+def sao_graph(relations, key="main", title="構成要素間関係"):
     if not relations:
         st.info("表示できるSAO関係がありません。")
         return
     direction = "TB" if st.session_state.get("graph_dir", "").startswith("縦") else "LR"
     rels = PC.tidy_relations(relations)
-    # 矢印の多い部品から並べる（構成を表す「備える・有する」は箱の入れ子で描くので数えない）
+    c0, c1, c2, c3 = st.columns([1.5, 1.8, 2.6, 1.1])
+    style = c0.selectbox("図の形式", ["階層図", "関係図", "構成の入れ子"], key=f"g_style_{key}",
+                         help="階層図＝上位概念（主語）から「関係」を挟んで下位概念（目的語）へ枝分かれする木の形。"
+                              "関係図＝すべての関係を「→ 関係」の矢印で描く（濃紺の背景）。"
+                              "構成の入れ子＝備える・有する等を箱の入れ子で描き、それ以外の関係を矢印で描く。")
+    flat = style == "関係図"
+    tree = style == "階層図"
     deg = Counter()
     for r in rels:
-        if r["relation"] not in pp.HAS_RELATIONS and r["source"] != r["target"]:
+        if r["source"] != r["target"] and (flat or r["relation"] not in pp.HAS_RELATIONS):
             deg[r["source"]] += 1
             deg[r["target"]] += 1
-    n_arrows = sum(1 for r in rels if r["relation"] not in pp.HAS_RELATIONS)
-    c1, c2, c3 = st.columns([2, 3, 1.2])
-    ALL = "（すべての矢印を表示）"
+    ALL = "（すべて）"
     focus = c1.selectbox("注目する部品", [ALL] + [n for n, _ in deg.most_common()], key=f"g_focus_{key}",
                          format_func=lambda n: n if n == ALL else f"{n}（矢印 {deg[n]}本）",
-                         help="選んだ部品に関わる矢印だけを色つきで表示し、他の矢印は薄い灰色にします。")
+                         help="選んだ部品に関わる矢印だけを目立たせ、他の矢印は暗く（薄く）します。")
     groups = c2.multiselect("表示する関係の種類", GRAPH_GROUPS, default=GRAPH_GROUPS, key=f"g_groups_{key}")
-    labels = c3.checkbox("関係名を表示", value=True, key=f"g_labels_{key}")
-    if focus == ALL and n_arrows > 25:
-        st.caption(f"矢印が {n_arrows} 本あります。見にくいときは「注目する部品」を選ぶか、関係の種類を絞ってください。"
-                   "同じ2つの部品をつなぐ矢印は1本にまとめ、関係名を「／」で並べています。")
-    st.graphviz_chart(relations_to_nested_dot(rels, direction=direction, focus=None if focus == ALL else focus,
-                                              groups=set(groups), show_labels=labels),
-                      use_container_width=True)
-    st.markdown(
-        "<div style='font-size:.8rem;opacity:.85'>箱の入れ子＝構成（備える・有する・含む）／点線の楕円＝どの構成要素にも"
-        "属さない対象（方向・設置対象など）／両矢印＝2つの部品の間に両方向の関係がある／矢印の色："
-        "<span style='color:#2563eb'>■接続</span>　<span style='color:#16a34a'>■配置・位置</span>　"
-        "<span style='color:#9333ea'>■覆う・収める</span>　<span style='color:#ea580c'>■動作・機能</span>　"
-        "<span style='color:#475569'>■その他</span>（矢印にマウスを重ねると関係名がすべて出ます。右上のボタンで全画面表示）</div>",
-        unsafe_allow_html=True)
+    labels = c3.checkbox("関係名", value=True, key=f"g_labels_{key}")
+    focus = None if focus == ALL else focus
+    if tree:
+        cross = pp.tree_cross_relations(rels, groups=set(groups))
+        show_cross = st.checkbox(f"階層を横切る関係（同じ階層どうし・上に戻る関係 {len(cross)} 件）も点線で表示",
+                                 value=False, key=f"g_cross_{key}") if cross else False
+        g1, g2 = st.columns([3, 1.15])
+        with g1:
+            st.graphviz_chart(pp.relations_to_tree_dot(rels, focus=focus, groups=set(groups), show_labels=labels,
+                                                       show_cross=show_cross), use_container_width=True)
+        with g2:
+            st.markdown(
+                "<div style='border:1px solid #cbd5e1;border-radius:10px;padding:10px 12px;font-size:.85rem'>"
+                "<b>凡例</b><br>"
+                "<span style='background:#fde2ea;border:1.5px solid #e0527a;border-radius:4px;padding:0 10px'>　</span>"
+                " 主語（上位概念）<br>"
+                "<span style='background:#d9f5e8;border:1.5px solid #22a06b;border-radius:4px;padding:0 10px'>　</span>"
+                " 目的語（下位概念）<br>"
+                "<span style='background:#efe4fb;border:1.5px solid #9b6bd6;border-radius:4px;padding:0 10px'>　</span>"
+                " さらに下位の概念<br>"
+                "<b style='color:#1d4ed8'>有する</b> 関係（動詞）　<b style='color:#1e3a8a'>→</b> 関係の向き（上位→下位）"
+                "</div>", unsafe_allow_html=True)
+            st.markdown("**この図の構造**")
+            st.markdown(pp.relations_to_tree_html(rels, groups=set(groups)), unsafe_allow_html=True)
+        if cross and not show_cross:
+            with st.expander(f"図に描いていない関係（階層を横切る関係 {len(cross)} 件）"):
+                st.dataframe(pd.DataFrame([{"主語": r["source"], "関係": r["relation"], "目的語": r["target"]}
+                                           for r in cross]), hide_index=True, use_container_width=True)
+        return
+    if flat:
+        dot = pp.relations_to_flat_dot(rels, title=title, direction=direction, focus=focus, groups=set(groups),
+                                       show_labels=labels)
+    else:
+        dot = relations_to_nested_dot(rels, direction=direction, focus=focus, groups=set(groups), show_labels=labels)
+    st.graphviz_chart(dot, use_container_width=True)
+    if flat:
+        st.caption("矢印＝「主語 → 関係 → 目的語」。枠の色が違う箱は、図の起点（どこからも矢印を受けない部品のうち、"
+                   "矢印の多いもの）。矢印にマウスを重ねると関係が出ます（右上のボタンで全画面表示）。")
+    else:
+        st.markdown(
+            "<div style='font-size:.8rem;opacity:.85'>箱の入れ子＝構成（備える・有する・含む）／点線の楕円＝どの構成要素にも"
+            "属さない対象（方向・設置対象など）／両矢印＝2つの部品の間に両方向の関係がある／矢印の色："
+            "<span style='color:#2563eb'>■接続</span>　<span style='color:#16a34a'>■配置・位置</span>　"
+            "<span style='color:#9333ea'>■覆う・収める</span>　<span style='color:#ea580c'>■動作・機能</span>　"
+            "<span style='color:#475569'>■その他</span>（矢印にマウスを重ねると関係名がすべて出ます）</div>",
+            unsafe_allow_html=True)
 
 
 def status_badges(counts):
@@ -440,7 +477,7 @@ def page_data():
 
     with tab1:
         st.markdown(
-            "J-PlatPat などから出力した **CSV／Excel** を読み込み、各特許の請求項を実験13の方法で一括解析します。"
+            "J-PlatPat などから出力した **CSV／Excel** を読み込み、各特許の請求項を実験14の方法で一括解析します。"
             "請求項の列は必須、それ以外（文献番号・発明の名称・出願人・FI・出願日）はあれば使います。"
             "請求項の欄に【請求項１】【請求項２】…と複数入っている場合は、請求項1だけを解析します。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
