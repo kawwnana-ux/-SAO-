@@ -11513,11 +11513,29 @@ HAS_RELATIONS = {"有する", "備える", "具備する", "含む", "含める"
 FONT = "Noto Sans CJK JP,Yu Gothic,Meiryo,sans-serif"
 
 
+RELATION_COLORS = [
+    ("#2563eb", ("接続", "導通", "連結", "結合")),                                   # 接続
+    ("#16a34a", ("配置", "設け", "位置", "形成", "積層", "搭載", "実装", "載置", "固定", "取り付",
+                 "接合", "接着", "延在", "延び", "対向", "隣接", "間に", "上に", "下に")),      # 配置・位置
+    ("#9333ea", ("覆", "封止", "収容", "収納", "囲", "挟", "埋め込", "貫通", "挿入")),       # 覆う・収める
+    ("#ea580c", ("制御", "駆動", "供給", "出力", "入力", "検出", "流れ", "流す", "生成", "変換",
+                 "スイッチング", "冷却", "放熱")),                                        # 動作・機能
+]
+
+
+def relation_color(rel, default="#475569"):
+    """関係語の種類ごとの色（接続＝青、配置・位置＝緑、覆う・収める＝紫、動作・機能＝橙、その他＝灰）。"""
+    for color, keys in RELATION_COLORS:
+        if any(k in rel for k in keys):
+            return color
+    return "#475569"
+
+
 def _esc(s):
     return html.escape(s).replace('"', '\\"')
 
 
-def relations_to_nested_dot(relations, rel_color="#2563eb"):
+def relations_to_nested_dot(relations, rel_color="#2563eb", direction="LR"):
     rels = [r for r in relations if r["source"] != r["target"]]
 
     names = []
@@ -11589,20 +11607,20 @@ def relations_to_nested_dot(relations, rel_color="#2563eb"):
 
     lines = [
         "digraph SAO {",
-        'graph [compound=true, rankdir=LR, newrank=true, nodesep=0.3, ranksep=1.1, '
-        f'fontname="{FONT}", fontsize=13, bgcolor="white"];',
-        f'node [fontname="{FONT}", fontsize=12, shape=box, style="rounded,filled", '
-        'fillcolor="#ffffff", color="#94a3b8"];',
-        f'edge [fontname="{FONT}", fontsize=11];',
+        f'graph [compound=true, rankdir={direction}, newrank=true, nodesep=0.45, ranksep=0.9, splines=true, '
+        f'fontname="{FONT}", fontsize=15, bgcolor="white", pad=0.3];',
+        f'node [fontname="{FONT}", fontsize=14, shape=box, style="rounded,filled", margin="0.18,0.08", '
+        'fillcolor="#ffffff", color="#94a3b8", penwidth=1.2];',
+        f'edge [fontname="{FONT}", fontsize=12, arrowsize=0.8];',
     ]
 
     def emit(p, indent):
         pad = "  " * indent
         if p in containers:
-            fill = ["#eef2ff", "#f5f7fb", "#ffffff"][min(len(p) - 1, 2)]
+            fill = ["#eef2ff", "#f0fdf4", "#fff7ed", "#ffffff"][min(len(p) - 1, 3)]
             lines.append(f"{pad}subgraph cluster_{ids[p]} {{")
-            lines.append(f'{pad}  label="{_esc(p[-1])}"; labeljust=l; style="rounded,filled"; '
-                         f'fillcolor="{fill}"; color="#64748b"; penwidth=1.3;')
+            lines.append(f'{pad}  label=<<b>{html.escape(p[-1])}</b>>; labeljust=l; style="rounded,filled"; '
+                         f'fillcolor="{fill}"; color="#64748b"; penwidth=1.4; margin=12;')
             lines.append(f'{pad}  {anchor(p)} [shape=point, width=0.01, style=invis, label=""];')
             for c in children[p]:
                 emit(c, indent + 1)
@@ -11628,23 +11646,36 @@ def relations_to_nested_dot(relations, rel_color="#2563eb"):
             return k
         return max(instances[tgt_name], key=lambda q: shared(src_path, q))
 
+    # 関係の種類ごとに色を分け、ラベルには白い背景を付けて線と重なっても読めるようにする。
+    # 部品が複数の箱に複製されている場合でも、1つの関係は1本の矢印だけにする。
     drawn = set()
     for r in rels:
         if r["relation"] in HAS_RELATIONS:
             continue
+        key0 = (r["source"], r["relation"], r["target"])
+        if key0 in drawn:
+            continue
+        drawn.add(key0)
+        best = None
         for sp in instances[r["source"]]:
             tp = closest(sp, r["target"])
-            key = (sp, r["relation"], tp)
-            if key in drawn or sp == tp:
+            if sp == tp:
                 continue
-            drawn.add(key)
-            a = [f'label="{_esc(r["relation"])}"', f'color="{rel_color}"',
-                 f'fontcolor="{rel_color}"', "penwidth=1.3"]
-            if sp in containers:
-                a.append(f"ltail=cluster_{ids[sp]}")
-            if tp in containers:
-                a.append(f"lhead=cluster_{ids[tp]}")
-            lines.append(f"  {anchor(sp)} -> {anchor(tp)} [{', '.join(a)}];")
+            score = sum(1 for x, y in zip(sp, tp) if x == y)
+            if best is None or score > best[0]:
+                best = (score, sp, tp)
+        if best is None:
+            continue
+        _, sp, tp = best
+        color = relation_color(r["relation"], rel_color)
+        label = ('<<table border="0" cellborder="0" cellpadding="1" cellspacing="0" bgcolor="white">'
+                 f'<tr><td><font color="{color}">{html.escape(r["relation"])}</font></td></tr></table>>')
+        a = [f"label={label}", f'color="{color}"', "penwidth=1.5"]
+        if sp in containers:
+            a.append(f"ltail=cluster_{ids[sp]}")
+        if tp in containers:
+            a.append(f"lhead=cluster_{ids[tp]}")
+        lines.append(f"  {anchor(sp)} -> {anchor(tp)} [{', '.join(a)}];")
 
     lines.append("}")
     return "\n".join(lines)
@@ -14198,7 +14229,7 @@ _THIS = sys.modules[__name__]
 en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
 translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
 node_match_eval = _types.SimpleNamespace(_KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, node_score=node_score, numbers=numbers, rel_match=rel_match)
-nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, _esc=_esc, relations_to_nested_dot=relations_to_nested_dot)
+nested_graph = _types.SimpleNamespace(FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, _esc=_esc, relation_color=relation_color, relations_to_nested_dot=relations_to_nested_dot)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
 seg_pairs = _types.SimpleNamespace(HAS_VERBS=HAS_VERBS_sp, _tree_dist=_tree_dist, pairs_from_segment=pairs_from_segment, segment_pairs=segment_pairs)

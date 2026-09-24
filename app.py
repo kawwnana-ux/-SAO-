@@ -14,7 +14,7 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 ページ構成（サイドバーのナビゲーション）
   データ
     📥 データの読み込み       … 特許リストを読み込んで一括解析／解析済みデータを開く／サンプル（532件）
-    🏠 ダッシュボード          … 抽出・確認の進み具合と、判定の根拠
+    🏠 ダッシュボード          … 抽出・確認の進み具合、判定の根拠、抽出の自動チェック
   抽出と確認
     🧪 AI解析                 … 1件の請求項を解析し、処理の各段階と採用／要確認／除外を表示
     ✍️ 人手確認               … AIの判定を人が確認・修正して確定する
@@ -23,9 +23,9 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
     🕸️ SAOネットワーク         … 構成要素のつながり。ノードをクリックすると該当請求項へ
     🗺️ 類似性マップ            … SAOの近さで配置。点をクリックすると似た特許と共通部分
     🧭 FIレーダー              … 出願人（または出願年）ごとのFIの分布
-    🫧 技術分布               … 出願年×SAO数×件数のバブル、出願人×技術のヒートマップ
+    🫧 技術分布               … 出願年×FIのバブル、出願人×技術のヒートマップ、出願の推移とランキング
   個別ツール
-    🐚 2つの請求項を比較 / 🪼 従属請求項を展開 / 🔦 まとめて検索 / 📊 特許統計分析 / ✅ 精度検証
+    🐚 2つの請求項を比較 / 🪼 従属請求項を展開
   出力
     📤 エクスポート            … Excel／CSV／解析済みデータ（JSON）、人手確認結果の保存と読み込み
 
@@ -328,8 +328,15 @@ def sao_graph(relations):
     if not relations:
         st.info("表示できるSAO関係がありません。")
         return
-    st.graphviz_chart(relations_to_nested_dot(PC.tidy_relations(relations)), use_container_width=True)
-    st.caption("箱の入れ子＝構成（備える・有する・含む）／矢印＝構成要素間の関係／点線の楕円＝どの構成要素にも属さない対象")
+    direction = "TB" if st.session_state.get("graph_dir", "").startswith("縦") else "LR"
+    st.graphviz_chart(relations_to_nested_dot(PC.tidy_relations(relations), direction=direction),
+                      use_container_width=True)
+    st.markdown(
+        "<div style='font-size:.8rem;opacity:.85'>箱の入れ子＝構成（備える・有する・含む）／点線の楕円＝どの構成要素にも"
+        "属さない対象（方向・設置対象など）／矢印の色："
+        "<span style='color:#2563eb'>■接続</span>　<span style='color:#16a34a'>■配置・位置</span>　"
+        "<span style='color:#9333ea'>■覆う・収める</span>　<span style='color:#ea580c'>■動作・機能</span>　"
+        "<span style='color:#475569'>■その他</span>（右上のボタンで全画面表示）</div>", unsafe_allow_html=True)
 
 
 def status_badges(counts):
@@ -384,6 +391,8 @@ with st.sidebar:
         st.info("💻 ローカルモード：このPCのOllamaに接続します", icon="💻")
         model_name = st.text_input("Ollamaモデル名", value=ts.DEFAULT_MODEL)
         ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
+    st.markdown("### 🧩 SAO構造図")
+    graph_dir = st.radio("図の向き", ["横（左→右）", "縦（上→下）"], horizontal=True, key="graph_dir")
     st.caption(f"抽出方法：{PC.METHOD_NAME}。{PC.METHOD_SCORE}。")
 
 
@@ -595,6 +604,34 @@ def page_dashboard():
     fig = px.bar(top[::-1], x="特許件数", y="構成要素", orientation="h", height=520)
     fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     plot(fig)
+
+    with st.expander("✅ 抽出の自動チェック（関係が0件・自己ループ・意味のない語・孤立した部品 などの不具合パターン）"):
+        texts = {p["id"]: (p["text"], PC.effective_relations(p, reviews)) for p in DATA["patents"]}
+
+        def _from_data(pid):
+            rels = texts[pid][1]
+            return [{"text": x} for x in {y for r in rels for y in (r["source"], r["target"])}], rels
+
+        results, summary = pp.evaluate_corpus_health([(pid, pid) for pid in texts], analyze_fn=_from_data)
+        m2 = st.columns(3)
+        m2[0].metric("合格率", f"{summary['pass_rate'] * 100:.1f}%")
+        m2[1].metric("平均構成要素数", f"{summary['avg_components']:.1f}")
+        m2[2].metric("平均関係数", f"{summary['avg_relations']:.1f}")
+        names = {"check_has_components": "構成要素が取れている", "check_has_relations": "関係が1件以上ある",
+                 "check_no_self_loop": "自己ループがない", "check_no_bare_generic_node": "「面」「部」だけの曖昧なノードがない",
+                 "check_ending_noun_present": "題名（末尾の名詞）がノードにある",
+                 "check_orphan_ratio_ok": "どこにもつながらない構成要素が少ない",
+                 "check_no_fan_in_anomaly": "1つの部品に持ち主が集中していない"}
+        rdf = pd.DataFrame(results).rename(columns=names)
+        checks = [c for c in rdf.columns if c.startswith("check_") or c in names.values()]
+        if checks:
+            st.dataframe((rdf[checks].mean().sort_values() * 100).round(1).rename("合格率(%)").reset_index()
+                         .rename(columns={"index": "チェック項目"}), use_container_width=True, hide_index=True)
+        bad = rdf[~rdf["passed"]]
+        if len(bad):
+            st.markdown(f"不合格の特許（{len(bad)}件）：人手確認で優先して見るとよい")
+            st.dataframe(bad[["id"] + checks].rename(columns={"id": "特許番号"}), use_container_width=True,
+                         hide_index=True)
 
     queue = sorted(DATA["patents"], key=lambda p: -sum(r["status"] == PC.STATUS_REVIEW for r in p["relations"]))
     queue = [p for p in queue if p["id"] not in reviews][:10]
@@ -1029,20 +1066,45 @@ def page_distribution():
     import plotly.express as px
 
     st.title("🫧 技術分布")
-    tab1, tab2 = st.tabs(["🫧 出願年 × SAO数 × 件数", "🔥 出願人 × 技術 ヒートマップ"])
+    tab1, tab2, tab3 = st.tabs(["🫧 出願年 × FI（バブル）", "🔥 出願人 × 技術（ヒートマップ）", "📈 出願の推移とランキング"])
     reviews = st.session_state.reviews
     with tab1:
-        df = PC.company_year_bubble(DATA, reviews)
-        if df.empty:
-            st.info("出願日の列がないため表示できません。")
+        if not any(p.get("fi") for p in DATA["patents"]) or not any(p.get("year") for p in DATA["patents"]):
+            st.info("出願日とFIの列があるデータで表示できます。")
         else:
-            ymetric = st.radio("縦軸", ["平均SAO数", "SAO数合計"], horizontal=True)
-            fig = px.scatter(df, x="出願年", y=ymetric, size="請求項数", color="企業", color_discrete_map=COLORS,
-                             labels={"企業": "出願人"}, size_max=48, height=560,
-                             hover_data={"請求項数": True, "平均SAO数": ":.1f", "SAO数合計": True})
-            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(dtick=1))
-            plot(fig)
-            st.caption("横軸＝出願年、縦軸＝請求項あたりのSAO数（構造の細かさ）、バブルの大きさ＝その年の特許の件数。")
+            c1, c2, c3, c4 = st.columns(4)
+            level_name = c1.selectbox("FIの細かさ", list(PC.FI_LEVELS)[:2], key="bub_level")
+            top_fi = c2.slider("表示するFIの数", 5, 30, 12, key="bub_top")
+            comps = c3.multiselect("出願人で絞り込む", sorted({p["company"] for p in DATA["patents"]}), key="bub_comp")
+            color_by = c4.radio("色", ["平均SAO数", "出願人（最多）"], key="bub_color")
+            level = PC.FI_LEVELS[level_name]
+            rows = []
+            for p in DATA["patents"]:
+                if not p.get("year") or (comps and p["company"] not in comps):
+                    continue
+                n_sao = len(PC.effective_relations(p, reviews))
+                for f in set(PC.fi_codes(p, level)):
+                    rows.append({"出願年": p["year"], "FI": f, "SAO数": n_sao, "出願人": p["group"]})
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("条件に合うデータがありません。")
+            else:
+                order = df.groupby("FI").size().sort_values(ascending=False).head(top_fi).index.tolist()
+                df = df[df["FI"].isin(order)]
+                agg = (df.groupby(["出願年", "FI"])
+                       .agg(件数=("SAO数", "size"), 平均SAO数=("SAO数", "mean"),
+                            出願人=("出願人", lambda x: x.value_counts().index[0])).reset_index())
+                agg["平均SAO数"] = agg["平均SAO数"].round(1)
+                kw = dict(color="平均SAO数", color_continuous_scale="Viridis") if color_by == "平均SAO数" else \
+                    dict(color="出願人", color_discrete_map=COLORS)
+                fig = px.scatter(agg, x="出願年", y="FI", size="件数", size_max=26, height=160 + 42 * len(order),
+                                 category_orders={"FI": order}, hover_data={"件数": True, "平均SAO数": True,
+                                                                             "出願人": True}, **kw)
+                fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(dtick=1))
+                plot(fig)
+                st.caption("横軸＝出願年、縦軸＝FI（件数の多い順）、バブルの大きさ＝その年・そのFIの特許の件数。"
+                           "色は、その特許の平均SAO数（請求項の構造の細かさ）か、いちばん多い出願人。"
+                           "1件の特許に複数のFIがあれば、それぞれに数える。")
     with tab2:
         c1, c2, c3, c4 = st.columns(4)
         axis = c1.selectbox("技術の軸", ["FIサブクラス", "FIメイングループ", "主要構成要素（SAO）"])
@@ -1052,29 +1114,47 @@ def page_distribution():
         m = PC.company_tech_matrix(DATA, axis=axis, reviews=reviews, top_tech=top, top_comp=top_comp)
         if m.empty:
             st.info("データがありません（FIの列がない場合は「主要構成要素（SAO）」を選んでください）。")
-            return
-        z = m.div(m.sum(axis=1), axis=0).round(3) if norm else m
-        fig = px.imshow(z, text_auto=".0%" if norm else True, aspect="auto", color_continuous_scale="YlOrRd",
-                        height=180 + 40 * len(z))
-        fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title=axis, yaxis_title="出願人")
-        plot(fig)
-        a, b = st.columns(2)
-        comp = a.selectbox("出願人", m.index.tolist())
-        tech = b.selectbox("技術", m.columns.tolist())
-        hits = []
-        for p in DATA["patents"]:
-            if p["company"] != comp:
-                continue
-            if axis == "FIサブクラス":
-                ok = tech in p["fi_sub"]
-            elif axis == "FIメイングループ":
-                ok = tech in p["fi_main"]
-            else:
-                ok = any(PC.base_term(x) == tech for r in PC.effective_relations(p, reviews) for x in (r["source"], r["target"]))
-            if ok:
-                hits.append({"特許番号": p["id"], "発明の名称": p["title"], "出願年": p["year"], "FI": p["fi"]})
-        st.markdown(f"**{comp} × {tech}：{len(hits)} 件**")
-        st.dataframe(pd.DataFrame(hits), hide_index=True, use_container_width=True)
+        else:
+            z = m.div(m.sum(axis=1), axis=0).round(3) if norm else m
+            fig = px.imshow(z, text_auto=".0%" if norm else True, aspect="auto", color_continuous_scale="YlOrRd",
+                            height=180 + 40 * len(z))
+            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title=axis, yaxis_title="出願人")
+            plot(fig)
+            a, b = st.columns(2)
+            comp = a.selectbox("出願人", m.index.tolist())
+            tech = b.selectbox("技術", m.columns.tolist())
+            hits = []
+            for p in DATA["patents"]:
+                if p["company"] != comp:
+                    continue
+                if axis == "FIサブクラス":
+                    ok = tech in p["fi_sub"]
+                elif axis == "FIメイングループ":
+                    ok = tech in p["fi_main"]
+                else:
+                    ok = any(PC.base_term(x) == tech for r in PC.effective_relations(p, reviews)
+                             for x in (r["source"], r["target"]))
+                if ok:
+                    hits.append({"特許番号": p["id"], "発明の名称": p["title"], "出願年": p["year"], "FI": p["fi"]})
+            st.markdown(f"**{comp} × {tech}：{len(hits)} 件**")
+            st.dataframe(pd.DataFrame(hits), hide_index=True, use_container_width=True)
+    with tab3:
+        top_n = st.slider("ランキングの表示件数", 5, 30, 15)
+        years = pd.DataFrame([{"出願年": p["year"], "出願人": p["group"]} for p in DATA["patents"] if p.get("year")])
+        if not years.empty:
+            y = years.groupby(["出願年", "出願人"]).size().rename("件数").reset_index()
+            fig = px.bar(y, x="出願年", y="件数", color="出願人", color_discrete_map=COLORS, title="年別出願件数",
+                         height=380)
+            fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(dtick=1))
+            plot(fig)
+        c1, c2 = st.columns(2)
+        fi = pd.Series([(PC.fi_codes(p, 0) or [None])[0] for p in DATA["patents"]]).dropna().value_counts().head(top_n)
+        if len(fi):
+            c1.plotly_chart(px.bar(x=fi.values[::-1], y=fi.index[::-1], orientation="h", title="筆頭FIサブクラス",
+                                   labels={"x": "件数", "y": "FI"}), use_container_width=True)
+        ap = pd.Series([p["company"] for p in DATA["patents"]]).value_counts().head(top_n)
+        c2.plotly_chart(px.bar(x=ap.values[::-1], y=ap.index[::-1], orientation="h", title="筆頭出願人",
+                               labels={"x": "件数", "y": "出願人"}), use_container_width=True)
 
 
 # ===========================================================================
@@ -1085,10 +1165,14 @@ def page_compare():
     st.title("🐚 2つの請求項を比較")
     st.caption("請求項A・Bを解析し、Jaccard類似度・構造の類似度・クレームの広さ狭さ・意味マッチングで比較します。")
     col_a, col_b = st.columns(2)
+    opts = ["（貼り付ける）"] + ([p["id"] for p in DATA["patents"]] if DATA else [])
+    fmt = lambda x: x if x == "（貼り付ける）" else patent_label(x)  # noqa: E731
     with col_a:
-        text_a = st.text_area("請求項A", height=220, key="text_a")
+        pa = st.selectbox("請求項A（データセットから選ぶか貼り付け）", opts, format_func=fmt, key="cmp_a")
+        text_a = st.text_area("請求項A", value=PATENTS[pa]["text"] if pa in PATENTS else "", height=220, key=f"text_a_{pa}")
     with col_b:
-        text_b = st.text_area("請求項B", height=220, key="text_b")
+        pb = st.selectbox("請求項B（データセットから選ぶか貼り付け）", opts, format_func=fmt, key="cmp_b")
+        text_b = st.text_area("請求項B", value=PATENTS[pb]["text"] if pb in PATENTS else "", height=220, key=f"text_b_{pb}")
     use_semantic = st.checkbox("②意味マッチングも使う（初回はモデルの読み込みに1分程度かかります）", value=False)
     if st.button("🐚 比較する", type="primary", key="compare_run"):
         if not text_a.strip() or not text_b.strip():
@@ -1205,247 +1289,6 @@ def page_dependent():
 
 
 # ===========================================================================
-# 🔦 まとめて検索
-# ===========================================================================
-
-def build_patent_database_llm(records, progress_callback=None):
-    model = pp._get_embed_model()
-    database = []
-    for i, (rid, text) in enumerate(records):
-        try:
-            _, relations = llm_extract(text)
-        except Exception:  # noqa: BLE001
-            relations = []
-        if progress_callback:
-            progress_callback(i + 1, len(records))
-        if not relations:
-            continue
-        triples = sorted(pp.relations_to_triple_set(relations, normalize_numbers=True))
-        emb = model.encode([pp._triple_to_text(t) for t in triples], normalize_embeddings=True)
-        v = np.mean(emb, axis=0)
-        database.append({"id": rid, "text": text, "relations": relations, "doc_embedding": v / (np.linalg.norm(v) + 1e-8)})
-    return database
-
-
-def search_similar_claims_llm(query_text, database, top_k=10, rerank_k=5):
-    _, q_rel = llm_extract(query_text)
-    if not q_rel:
-        return []
-    model = pp._get_embed_model()
-    triples = sorted(pp.relations_to_triple_set(q_rel, normalize_numbers=True))
-    emb = model.encode([pp._triple_to_text(t) for t in triples], normalize_embeddings=True)
-    q = np.mean(emb, axis=0)
-    q = q / (np.linalg.norm(q) + 1e-8)
-    scored = sorted(({"id": e["id"], "text": e["text"], "relations": e["relations"],
-                      "fast_score": float(np.dot(q, e["doc_embedding"]))} for e in database), key=lambda x: -x["fast_score"])
-    top = scored[:top_k]
-    for e in top[:rerank_k]:
-        e["precise_score"], e["matches"] = pp.semantic_similarity(q_rel, e["relations"])
-    return sorted([e for e in top if "precise_score" in e], key=lambda x: -x["precise_score"]) + \
-        [e for e in top if "precise_score" not in e]
-
-
-def page_search():
-    st.title("🔦 まとめて検索")
-    target = st.radio("検索対象", ["現在のデータセット（解析済み・高速）", "ここで登録する請求項"], horizontal=True)
-    if target.startswith("現在"):
-        need_data()
-        from sklearn.feature_extraction.text import TfidfVectorizer
-
-        st.caption("検索したい請求項を解析し、現在のデータセットのSAO（基本語のトリプル・組・構成要素）と"
-                   "TF-IDFのコサイン類似度で比べます。")
-        q = st.text_area("検索したい請求項テキスト", height=160, key="corpus_query")
-        k = st.slider("表示件数", 1, 30, min(10, len(DATA["patents"])))
-        if st.button("🔍 検索する", type="primary", key="corpus_search") and q.strip():
-            with st.spinner("解析・検索中…"):
-                _, q_rel = llm_extract(PC.first_claim(q))
-                docs = [PC.sao_tokens(PC.effective_relations(p, st.session_state.reviews)) or ["SAOなし"]
-                        for p in DATA["patents"]]
-                vec = TfidfVectorizer(analyzer=lambda x: x, sublinear_tf=True).fit(docs)
-                sims = (vec.transform(docs) @ vec.transform([PC.sao_tokens(q_rel) or ["SAOなし"]]).T).toarray().ravel()
-            st.session_state.search_results = {"mode": "corpus", "q_rel": q_rel, "sims": sims, "k": k,
-                                               "uid": DATA["meta"]["uid"]}
-        res = st.session_state.search_results
-        if res and res.get("mode") == "corpus" and res.get("uid") == DATA["meta"]["uid"]:
-            for rank, j in enumerate(np.argsort(-res["sims"])[:res["k"]], 1):
-                p = DATA["patents"][j]
-                ex = PC.similarity_explain(res["q_rel"], PC.effective_relations(p, st.session_state.reviews))
-                with st.expander(f"{rank}位｜{p['id']}｜{p['title']}｜{p['company']}｜類似度 {res['sims'][j]:.3f}"):
-                    st.write("共通のSAO：" + ("、".join(ex["共通のSAO"][:15]) or "―"))
-                    st.write("共通の構成要素：" + ("、".join(ex["共通の構成要素"][:20]) or "―"))
-                    st.markdown(PC.highlight(p["text"], set()), unsafe_allow_html=True)
-        return
-
-    st.caption("複数の請求項をデータベース化し、調べたい請求項に似ているものを検索します（解析→埋め込みベクトルで検索）。")
-    uploaded_csv = st.file_uploader("CSVファイル（id, text の2列）", type=["csv"])
-    bulk_text = st.text_area("またはここに、請求項を「-----」で区切って貼り付ける", height=180, key="bulk_text")
-    if st.button("📚 データベースを構築する"):
-        records = []
-        if uploaded_csv is not None:
-            reader = csv.DictReader(io.StringIO(uploaded_csv.getvalue().decode("utf-8-sig")))
-            for row in reader:
-                rtext = row.get("text") or row.get("本文") or ""
-                if rtext.strip():
-                    records.append((row.get("id") or row.get("番号") or f"行{len(records) + 1}", rtext.strip()))
-        elif bulk_text.strip():
-            records = [(f"請求項{i + 1}", p.strip()) for i, p in enumerate(bulk_text.split("-----")) if p.strip()]
-        if not records:
-            st.warning("CSVのアップロード、またはテキストの貼り付けのどちらかを行ってください。")
-        else:
-            bar = st.progress(0, text=f"0/{len(records)}件")
-            try:
-                st.session_state.patent_db = build_patent_database_llm(
-                    records, progress_callback=lambda d, t: bar.progress(d / t, text=f"{d}/{t}件"))
-                st.session_state.search_results = None
-            except Exception as e:  # noqa: BLE001
-                st.error(f"データベース構築中にエラーが発生しました: {e}")
-            bar.empty()
-    if st.session_state.patent_db is not None:
-        st.success(f"✅ {len(st.session_state.patent_db)} 件を登録済みです。")
-    query_text = st.text_area("検索したい請求項テキスト", height=160, key="query_text")
-    c1, c2 = st.columns(2)
-    top_k = c1.slider("粗い絞り込みで残す件数", 3, 30, 10)
-    rerank_k = c2.slider("精密な再評価をする件数（上位から）", 1, 10, 5)
-    if st.button("🔍 検索する", key="search_run"):
-        if st.session_state.patent_db is None:
-            st.warning("先にデータベースを構築してください。")
-        elif query_text.strip():
-            with st.spinner("検索中..."):
-                st.session_state.search_results = {"mode": "db", "results": search_similar_claims_llm(
-                    query_text, st.session_state.patent_db, top_k=top_k, rerank_k=rerank_k)}
-    res = st.session_state.search_results
-    if res and res.get("mode") == "db":
-        for i, r in enumerate(res["results"]):
-            label = f"精密スコア {r['precise_score']:.3f}" if "precise_score" in r else f"粗いスコア {r['fast_score']:.3f}"
-            with st.expander(f"{i + 1}位　【{r['id']}】　{label}"):
-                st.write(r["text"])
-                if "matches" in r:
-                    st.dataframe([{"類似度": round(sim, 2), "クエリ側": " / ".join(ta), "この請求項側": " / ".join(tb)}
-                                  for ta, tb, sim in sorted(r["matches"], key=lambda x: -x[2])],
-                                 use_container_width=True, hide_index=True)
-
-
-# ===========================================================================
-# 📊 特許統計分析
-# ===========================================================================
-
-def _split_multi_value(value):
-    if pd.isna(value):
-        return []
-    s = re.sub(r"[；;、,\n\r]+", "|", str(value).strip())
-    return [x.strip() for x in s.split("|") if x.strip()]
-
-
-def page_stats():
-    import plotly.express as px
-
-    st.title("📊 特許統計分析")
-    st.caption("出願日・FI・出願人から、書誌情報を集計します（SAO抽出とは独立）。")
-    src = st.radio("データ", ["現在のデータセット", "CSVをアップロード／貼り付け"], horizontal=True)
-    df = None
-    if src == "現在のデータセット":
-        need_data()
-        df = pd.DataFrame([{"出願日": p.get("filing_date"), "FI": p["fi"], "出願人/権利者": p["applicant"]}
-                           for p in DATA["patents"]])
-    else:
-        up = st.file_uploader("📁 統計分析用CSV／Excel", type=["csv", "xlsx"], key="stats_csv_upload")
-        txt = st.text_area("またはCSV本文を貼り付け", height=150, key="stats_csv_text",
-                           placeholder="出願日,FI,出願人/権利者\n2022-04-01,H01L 21/00,株式会社A")
-        if st.button("📊 読み込む", type="primary"):
-            try:
-                if up is not None:
-                    st.session_state.stats_df = PC.read_table(up.getvalue(), up.name)
-                elif txt.strip():
-                    st.session_state.stats_df = pd.read_csv(io.StringIO(txt))
-            except Exception as e:  # noqa: BLE001
-                st.error(f"読み込みに失敗しました: {e}")
-        df = st.session_state.stats_df
-    if df is None:
-        return
-    cols = PC.detect_columns(df)
-    if not (cols["date"] and cols["fi"] and cols["applicant"]):
-        st.error("「出願日」「FI」「出願人/権利者」の列が必要です。")
-        return
-    work = pd.DataFrame({"出願年": df[cols["date"]].apply(lambda v: (lambda m: int(m.group(0)) if m else None)(
-        re.search(r"(19|20)\d{2}", str(v)))), "FI": df[cols["fi"]], "出願人": df[cols["applicant"]]}).dropna(subset=["出願年"])
-    if work.empty:
-        st.warning("出願年を読み取れるデータがありません。")
-        return
-    work["出願年"] = work["出願年"].astype(int)
-    work["筆頭FIサブクラス"] = work["FI"].apply(lambda x: (PC.fi_parts(x)[0] or [None])[0])
-    work["筆頭出願人"] = work["出願人"].apply(lambda x: PC.company_name(x))
-    st.success(f"✅ {len(work):,} 件を集計しました。")
-    top_n = st.number_input("ランキング表示件数", 5, 100, 15, step=5)
-    y = work.groupby("出願年").size().rename("件数").reset_index()
-    plot(px.line(y, x="出願年", y="件数", markers=True, title="① 年別出願件数"))
-    c1, c2 = st.columns(2)
-    fi = work.groupby("筆頭FIサブクラス").size().sort_values(ascending=False).head(int(top_n)).rename("件数").reset_index()
-    c1.plotly_chart(px.bar(fi[::-1], x="件数", y="筆頭FIサブクラス", orientation="h", title="② 筆頭FIサブクラス"),
-                    use_container_width=True)
-    ap = work.groupby("筆頭出願人").size().sort_values(ascending=False).head(int(top_n)).rename("件数").reset_index()
-    c2.plotly_chart(px.bar(ap[::-1], x="件数", y="筆頭出願人", orientation="h", title="③ 筆頭出願人"),
-                    use_container_width=True)
-    rows = [{"出願人": PC.company_name(a), "FIサブクラス": f} for _, r in work.iterrows()
-            for a in _split_multi_value(r["出願人"]) for f in PC.fi_parts(r["FI"])[0]]
-    if rows:
-        t = pd.DataFrame(rows).groupby(["出願人", "FIサブクラス"]).size().rename("件数").reset_index()
-        ta = t.groupby("出願人")["件数"].sum().sort_values(ascending=False).head(10).index
-        tf = t.groupby("FIサブクラス")["件数"].sum().sort_values(ascending=False).head(10).index
-        t = t[t["出願人"].isin(ta) & t["FIサブクラス"].isin(tf)]
-        plot(px.scatter(t, x="FIサブクラス", y="出願人", size="件数", color="件数", size_max=40,
-                        title="④ 出願人 × FIサブクラス（バブル）", height=520))
-
-
-# ===========================================================================
-# ✅ 精度検証（自動ヘルスチェック）
-# ===========================================================================
-
-def page_health():
-    st.title("✅ 精度検証（自動ヘルスチェック）")
-    st.caption("人手の正解データがない前提で、既知の不具合パターン（関係が1件も取れない・自己ループ・意味のない語が"
-               "ノードになる・部品が孤立する 等）を自動チェックし、合格率を精度の代理指標として使います。"
-               "件数分のLLM呼び出しが発生します。")
-    up = st.file_uploader("📁 請求項リスト（.xlsx / .csv）", type=["xlsx", "csv"], key="eval_file_upload")
-    limit = st.number_input("検証する件数の上限（0で全件）", min_value=0, value=20, step=10)
-    if st.button("🚀 精度検証を実行する", type="primary"):
-        if up is None:
-            st.warning("ファイルをアップロードしてください。")
-        else:
-            try:
-                df = PC.read_table(up.getvalue(), up.name)
-                cols = PC.detect_columns(df)
-                if not cols["claim"]:
-                    st.error(f"請求項の列が見つかりません。列一覧: {list(df.columns)}")
-                else:
-                    ps = PC.patents_from_table(df, cols, limit=int(limit) or None)
-                    records = [(p["id"], p["text"]) for p in ps]
-                    bar = st.progress(0, text=f"0/{len(records)}件")
-                    results, summary = pp.evaluate_corpus_health(
-                        records, analyze_fn=llm_extract, progress_callback=lambda d, t: bar.progress(d / t, text=f"{d}/{t}件"))
-                    bar.empty()
-                    st.session_state.eval_results, st.session_state.eval_summary = results, summary
-            except Exception as e:  # noqa: BLE001
-                st.error(f"検証中にエラーが発生しました: {e}")
-    summary = st.session_state.eval_summary
-    if summary is None:
-        return
-    m = st.columns(4)
-    m[0].metric("合格率", f"{summary['pass_rate'] * 100:.1f}%")
-    m[1].metric("検証件数", f"{summary['total']}件")
-    m[2].metric("平均構成要素数", f"{summary['avg_components']:.1f}")
-    m[3].metric("平均関係数", f"{summary['avg_relations']:.1f}")
-    rdf = pd.DataFrame(st.session_state.eval_results)
-    checks = [c for c in rdf.columns if c.startswith("check_")]
-    if checks:
-        st.dataframe((rdf[checks].mean().sort_values() * 100).round(1).rename("合格率(%)").reset_index(),
-                     use_container_width=True, hide_index=True)
-    only_failed = st.checkbox("不合格のものだけ表示", value=True)
-    show = rdf[~rdf["passed"]] if only_failed else rdf
-    st.dataframe(show[[c for c in ["id", "text", "passed", "n_components", "n_relations", "error"] + checks
-                       if c in show.columns]], use_container_width=True, hide_index=True)
-
-
-# ===========================================================================
 # 📤 エクスポート
 # ===========================================================================
 
@@ -1513,10 +1356,7 @@ nav = st.navigation({
                    st.Page(page_radar, title="FIレーダー", icon="🧭", url_path="radar"),
                    st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution")],
     "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
-                st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent"),
-                st.Page(page_search, title="まとめて検索", icon="🔦", url_path="search"),
-                st.Page(page_stats, title="特許統計分析", icon="📊", url_path="stats"),
-                st.Page(page_health, title="精度検証", icon="✅", url_path="health")],
+                st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
     "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export")],
 }, expanded=True)
 nav.run()
