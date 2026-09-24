@@ -799,9 +799,15 @@ def page_review():
 @st.cache_data(show_spinner=False, max_entries=4)
 def world_html(_data, uid):
     template = OZ_WORLD_HTML_PATH.read_text(encoding="utf-8")
-    if _data["meta"].get("sample"):
-        return template  # サンプルは研究で作った配置（UMAP）をそのまま使う
+    if _data["meta"].get("sample") and not _data.get("world_edges"):
+        PC.sample_world_edges(_data, template)  # サンプルは研究で作った配置（UMAP）と近傍をそのまま使う
     return PC.oz_world_html(_data, template)
+
+
+def world_axis_names():
+    m = DATA.get("world_method") or ("SVD(50)→UMAP(3)" if DATA["meta"].get("sample") else "")
+    short = "UMAP" if "UMAP" in m else ("t-SNE" if "t-SNE" in m else "次元圧縮")
+    return [f"技術特徴軸{k}（{short}）" for k in (1, 2, 3)]
 
 
 def page_world():
@@ -811,8 +817,12 @@ def page_world():
     st.title("🌍 Patent World（オズの世界）")
     tab1, tab2 = st.tabs(["🌌 オズの世界（技術ランドスケープ）", "🔎 SAOの特徴で色分け"])
     with tab1:
-        st.caption("各特許を「発明の名称＋FI」の近さで3次元空間に配置した技術ランドスケープ。"
-                   "色は出願人、線は近い特許どうし。ドラッグで回転、スクロールでズーム。")
+        ax = world_axis_names()
+        st.caption("各特許を「発明の名称＋FI」の近さで3次元空間に配置した技術ランドスケープ。色は出願人。"
+                   "**点をクリック**すると文献番号・発明の名称・出願人・FI・出願日が表示され、「近い特許を表示」を押すと"
+                   "その特許と近い特許（最大6件）だけを線で結ぶ。ドラッグで回転、スクロールでズーム。")
+        st.caption(f"X軸：{ax[0]}／Y軸：{ax[1]}／Z軸：{ax[2]}。※各軸そのものに固有の技術的意味はなく、"
+                   "特許間の近さを3次元に配置したものです。近い点ほど「発明の名称＋FI」の特徴が類似しています。")
         if OZ_WORLD_HTML_PATH.exists():
             components.html(world_html(DATA, DATA["meta"]["uid"]), height=760, scrolling=False)
         else:
@@ -829,8 +839,11 @@ def page_world():
                             hover_name="発明の名称", hover_data={"特許番号": True, "SAO関係数": True,
                                                               "x": False, "y": False, "z": False}, height=640)
         fig.update_traces(marker=dict(size=4))
-        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+        ax = world_axis_names()
+        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0),
+                          scene=dict(xaxis_title=ax[0], yaxis_title=ax[1], zaxis_title=ax[2]))
         plot(fig)
+        st.caption("配置はオズの世界と同じ。※各軸そのものに固有の技術的意味はなく、近い点ほど「発明の名称＋FI」の特徴が類似している。")
         pid = st.selectbox("詳しく見る特許", [p["id"] for p in DATA["patents"]], format_func=patent_label,
                            key="world_pid")
         show_patent_card(pid)
@@ -1015,18 +1028,23 @@ def page_similarity():
 def page_radar():
     need_data()
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     st.title("🧭 FIレーダー")
     st.caption("出願人（または出願年）ごとに、どのFI（技術分類）の特許をどれだけ持っているかを比べる。"
-               "軸はデータ全体でよく使われているFI、値はそのグループの特許のうちそのFIが付いているものの割合。")
+               "軸はデータ全体でよく使われているFI。")
     if not any(p.get("fi") for p in DATA["patents"]):
         st.info("このデータセットにはFIの列がありません。FIを含む特許リストを読み込むと表示できます。")
         return
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     by = c1.radio("比べるもの", ["出願人", "出願年"], horizontal=True)
     level_name = c2.selectbox("FIの細かさ", list(PC.FI_LEVELS))
-    top_fi = c3.slider("軸にするFIの数", 3, 16, 8)
-    share = c4.radio("値", ["割合（%）", "件数"], horizontal=True) == "割合（%）"
+    top_fi = c3.slider("軸にするFIの数", 3, 12, 8)
+    c4, c5 = st.columns([2, 1])
+    value = c4.radio("値", ["特化係数（全体と比べた偏り）", "割合（%）", "件数"], horizontal=True,
+                     help="特化係数＝そのグループでの割合 ÷ データ全体での割合。1より大きいほど、そのFIに力を入れている。"
+                          "どの出願人も多いFI（H01Lなど）に引っぱられず、違いが見やすい。")
+    layout = c5.radio("表示", ["並べて表示", "重ねて表示"], horizontal=True)
     level = PC.FI_LEVELS[level_name]
     if by == "出願人":
         cands = [c for c, _ in Counter(p["company"] for p in DATA["patents"]).most_common() if c != "不明"]
@@ -1037,23 +1055,63 @@ def page_radar():
     if not groups:
         st.info(f"比べる{by}を選んでください。")
         return
+    share = not value.startswith("件数")
     axes, vals, sizes = PC.fi_radar_data(DATA, by=by, level=level, groups=groups, top_fi=top_fi, share=share)
     if len(axes) < 3:
         st.info("レーダーチャートには3つ以上のFIが必要です。FIの細かさを変えるか、比べるグループを増やしてください。")
         return
-    palette = PC.GROUP_PALETTE
-    fig = go.Figure()
-    for k, g in enumerate(groups):
-        v = vals[g]
-        color = COLORS.get(g) if by == "出願人" and g in COLORS and g != "その他" else palette[k % len(palette)]
-        fig.add_trace(go.Scatterpolar(r=v + v[:1], theta=axes + axes[:1], fill="toself", opacity=0.55,
-                                      name=f"{g}（{sizes[g]}件）", line=dict(color=color)))
-    fig.update_layout(polar=dict(radialaxis=dict(ticksuffix="%" if share else "")), height=580,
-                      margin=dict(l=60, r=60, t=30, b=30))
+    if value.startswith("特化"):
+        n_all = len(DATA["patents"])
+        base = [100 * sum(1 for p in DATA["patents"] if a in PC.fi_codes(p, level)) / n_all for a in axes]
+        vals = {g: [round(v / b, 2) if b else 0 for v, b in zip(vals[g], base)] for g in groups}
+    unit = {"特": "", "割": "%", "件": "件"}[value[0]]
+    vmax = max(max(v) for v in vals.values()) or 1
+    rng = [0, vmax * 1.08]
+
+    def color_of(k, g):
+        return COLORS.get(g) if by == "出願人" and g in COLORS and g != "その他" else PC.GROUP_PALETTE[k % 8]
+
+    def rgba(hexc, a):
+        h = hexc.lstrip("#")
+        return "rgba(%d,%d,%d,%s)" % (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), a)
+
+    if layout == "並べて表示":
+        n = len(groups)
+        cols = min(3, n)
+        rows_n = (n + cols - 1) // cols
+        fig = make_subplots(rows=rows_n, cols=cols, specs=[[{"type": "polar"}] * cols] * rows_n,
+                            subplot_titles=[f"{g}（{sizes[g]}件）" for g in groups],
+                            horizontal_spacing=0.08, vertical_spacing=0.12)
+        for k, g in enumerate(groups):
+            v = vals[g]
+            col = color_of(k, g)
+            fig.add_trace(go.Scatterpolar(r=v + v[:1], theta=axes + axes[:1], fill="toself", name=g, showlegend=False,
+                                          line=dict(color=col, width=2), fillcolor=rgba(col, 0.25),
+                                          marker=dict(size=5), hovertemplate="%{theta}: %{r}" + unit + "<extra></extra>"),
+                          row=k // cols + 1, col=k % cols + 1)
+            if value.startswith("特化"):
+                fig.add_trace(go.Scatterpolar(r=[1] * (len(axes) + 1), theta=axes + axes[:1], mode="lines",
+                                              line=dict(color="rgba(100,116,139,.7)", dash="dot", width=1),
+                                              showlegend=False, hoverinfo="skip"), row=k // cols + 1, col=k % cols + 1)
+        polar = dict(radialaxis=dict(range=rng, tickfont=dict(size=9), ticksuffix=unit),
+                     angularaxis=dict(tickfont=dict(size=11)))
+        fig.update_layout(**{("polar" if i == 0 else f"polar{i + 1}"): polar for i in range(rows_n * cols)},
+                          height=360 * rows_n + 40, margin=dict(l=40, r=40, t=50, b=20))
+    else:
+        fig = go.Figure()
+        for k, g in enumerate(groups):
+            v = vals[g]
+            col = color_of(k, g)
+            fig.add_trace(go.Scatterpolar(r=v + v[:1], theta=axes + axes[:1], mode="lines+markers",
+                                          name=f"{g}（{sizes[g]}件）", line=dict(color=col, width=2.5),
+                                          marker=dict(size=7), hovertemplate="%{theta}: %{r}" + unit + "<extra>" + g + "</extra>"))
+        fig.update_layout(polar=dict(radialaxis=dict(range=rng, ticksuffix=unit), angularaxis=dict(tickfont=dict(size=12))),
+                          height=600, margin=dict(l=60, r=60, t=30, b=30), legend=dict(orientation="h", y=-0.08))
     plot(fig)
+    if value.startswith("特化"):
+        st.caption("点線＝1（データ全体と同じ割合）。外側に出ているFIほど、そのグループが全体より力を入れている技術分類。")
     st.markdown("**実際の値**")
-    st.dataframe(pd.DataFrame({f"{g}（{sizes[g]}件）": vals[g] for g in groups}, index=axes),
-                 use_container_width=True)
+    st.dataframe(pd.DataFrame({f"{g}（{sizes[g]}件）": vals[g] for g in groups}, index=axes), use_container_width=True)
     st.caption("1件の特許に複数のFIが付いている場合は、それぞれに数える。")
 
 
@@ -1072,38 +1130,44 @@ def page_distribution():
         if not any(p.get("fi") for p in DATA["patents"]) or not any(p.get("year") for p in DATA["patents"]):
             st.info("出願日とFIの列があるデータで表示できます。")
         else:
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             level_name = c1.selectbox("FIの細かさ", list(PC.FI_LEVELS)[:2], key="bub_level")
             top_fi = c2.slider("表示するFIの数", 5, 30, 12, key="bub_top")
-            comps = c3.multiselect("出願人で絞り込む", sorted({p["company"] for p in DATA["patents"]}), key="bub_comp")
-            color_by = c4.radio("色", ["平均SAO数", "出願人（最多）"], key="bub_color")
+            groups_all = [g for g in DATA.get("groups", []) if g]
+            comps = c3.multiselect("出願人（色分け）", groups_all, default=groups_all, key="bub_comp")
             level = PC.FI_LEVELS[level_name]
             rows = []
             for p in DATA["patents"]:
-                if not p.get("year") or (comps and p["company"] not in comps):
+                if not p.get("year") or p["group"] not in comps:
                     continue
-                n_sao = len(PC.effective_relations(p, reviews))
                 for f in set(PC.fi_codes(p, level)):
-                    rows.append({"出願年": p["year"], "FI": f, "SAO数": n_sao, "出願人": p["group"]})
+                    rows.append({"出願年": p["year"], "FI": f, "出願人": p["group"],
+                                 "SAO数": len(PC.effective_relations(p, reviews))})
             df = pd.DataFrame(rows)
             if df.empty:
                 st.info("条件に合うデータがありません。")
             else:
                 order = df.groupby("FI").size().sort_values(ascending=False).head(top_fi).index.tolist()
                 df = df[df["FI"].isin(order)]
-                agg = (df.groupby(["出願年", "FI"])
-                       .agg(件数=("SAO数", "size"), 平均SAO数=("SAO数", "mean"),
-                            出願人=("出願人", lambda x: x.value_counts().index[0])).reset_index())
+                agg = (df.groupby(["出願年", "FI", "出願人"])
+                       .agg(件数=("SAO数", "size"), 平均SAO数=("SAO数", "mean")).reset_index())
                 agg["平均SAO数"] = agg["平均SAO数"].round(1)
-                kw = dict(color="平均SAO数", color_continuous_scale="Viridis") if color_by == "平均SAO数" else \
-                    dict(color="出願人", color_discrete_map=COLORS)
-                fig = px.scatter(agg, x="出願年", y="FI", size="件数", size_max=26, height=160 + 42 * len(order),
-                                 category_orders={"FI": order}, hover_data={"件数": True, "平均SAO数": True,
-                                                                             "出願人": True}, **kw)
-                fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(dtick=1))
+                gl = [g for g in comps if g in set(agg["出願人"])]
+                width = 0.8 / max(len(gl), 1)
+                agg["x"] = agg.apply(lambda r: r["出願年"] + (gl.index(r["出願人"]) - (len(gl) - 1) / 2) * width, axis=1)
+                fig = px.scatter(agg, x="x", y="FI", size="件数", size_max=24, color="出願人",
+                                 color_discrete_map=COLORS, category_orders={"FI": order, "出願人": gl},
+                                 height=160 + 44 * len(order),
+                                 hover_data={"x": False, "出願年": True, "件数": True, "平均SAO数": True})
+                years = sorted(agg["出願年"].unique())
+                fig.update_layout(margin=dict(l=10, r=10, t=10, b=10),
+                                  xaxis=dict(title="出願年", tickmode="array", tickvals=years,
+                                             ticktext=[str(y) for y in years]))
+                for y in years[:-1]:
+                    fig.add_vline(x=y + 0.5, line_width=1, line_color="rgba(148,163,184,.35)")
                 plot(fig)
-                st.caption("横軸＝出願年、縦軸＝FI（件数の多い順）、バブルの大きさ＝その年・そのFIの特許の件数。"
-                           "色は、その特許の平均SAO数（請求項の構造の細かさ）か、いちばん多い出願人。"
+                st.caption("横軸＝出願年、縦軸＝FI（件数の多い順）、色＝出願人、バブルの大きさ＝その年・そのFIのその出願人の"
+                           "特許の件数。同じ年に複数の出願人がいるときは、年の枠の中で横に並べている。"
                            "1件の特許に複数のFIがあれば、それぞれに数える。")
     with tab2:
         c1, c2, c3, c4 = st.columns(4)

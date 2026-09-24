@@ -13546,14 +13546,126 @@ def finalize_dataset(corpus):
     return corpus
 
 
+_OZ_CSS = """
+  #sel-panel { right: 16px; bottom: 16px; width: 330px; display: none; line-height: 1.6; max-height: 70vh;
+               overflow: auto; }
+  #sel-panel.show { display: block; }
+  #sel-panel h2 { font-size: 13.5px; margin: 0 0 6px 0; color: var(--ink-primary); }
+  #sel-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12.5px; }
+  #sel-panel dt { color: var(--ink-muted); white-space: nowrap; }
+  #sel-panel dd { margin: 0; color: var(--ink-primary); word-break: break-all; }
+  #sel-panel button { margin-top: 8px; margin-right: 6px; }
+  #sel-panel ol { margin: 6px 0 0 0; padding-left: 20px; font-size: 12.5px; }
+  #sel-panel li { cursor: pointer; color: var(--ink-secondary); }
+  #sel-panel li:hover { color: var(--ink-primary); text-decoration: underline; }
+  #axis-note { left: 16px; top: 44px; font-size: 11.5px; color: var(--ink-muted); background: transparent;
+               border: none; box-shadow: none; padding: 0; pointer-events: none; }
+"""
+
+_OZ_JS = r"""
+  // ==== 追加：軸・クリックで詳細・近い特許だけ線で結ぶ ====
+  edgeLines.visible = false;              // 近傍の線は常時は表示しない
+  var AXIS_NAMES = __AXIS_NAMES__;
+  function makeLabel(text, color) {
+    var cv = document.createElement("canvas"); var ctx = cv.getContext("2d");
+    var fs = 42; ctx.font = fs + "px sans-serif";
+    var w = Math.ceil(ctx.measureText(text).width) + 20; cv.width = w; cv.height = fs + 20;
+    ctx.font = fs + "px sans-serif"; ctx.fillStyle = color; ctx.textBaseline = "middle"; ctx.fillText(text, 10, cv.height / 2);
+    var tex = new THREE.CanvasTexture(cv);
+    var sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false,
+                                                         sizeAttenuation: false }));
+    var h = 0.032; sp.scale.set(h * w / cv.height, h, 1);   // 画面上で一定の大きさ
+    return sp;
+  }
+  // 3本の軸が見えるよう、少し斜めから見下ろす視点にする
+  initialCamPos.set(camDist * 0.62, camDist * 0.42, camDist * 0.72);
+  camera.position.copy(initialCamPos);
+  var axisLen = typicalRadius * 0.95;
+  var axisDefs = [[new THREE.Vector3(1, 0, 0), 0xe57373, "#ef9a9a"], [new THREE.Vector3(0, 1, 0), 0x81c784, "#a5d6a7"],
+                  [new THREE.Vector3(0, 0, 1), 0x64b5f6, "#90caf9"]];
+  axisDefs.forEach(function (d, k) {
+    var g = new THREE.BufferGeometry().setFromPoints([d[0].clone().multiplyScalar(-axisLen), d[0].clone().multiplyScalar(axisLen)]);
+    scene.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: d[1], transparent: true, opacity: 0.45 })));
+    var lab = makeLabel(AXIS_NAMES[k], d[2]); lab.position.copy(d[0].clone().multiplyScalar(axisLen * 1.08)); scene.add(lab);
+  });
+
+  var neighborLines = null, selected = null, showNb = false;
+  var selPanel = document.getElementById("sel-panel");
+  function neighborsOf(i) {
+    var out = [];
+    edges.forEach(function (e) {
+      if (e.source === i) out.push([e.target, e.dist]);
+      else if (e.target === i) out.push([e.source, e.dist]);
+    });
+    out.sort(function (a, b) { return a[1] - b[1]; });
+    return out.slice(0, 6);
+  }
+  function clearNb() {
+    if (neighborLines) { scene.remove(neighborLines); neighborLines.geometry.dispose(); neighborLines = null; }
+    meshes.forEach(function (m) { m.scale.set(1, 1, 1); });
+  }
+  function drawNb(i) {
+    clearNb();
+    meshes[i].scale.set(2.0, 2.0, 2.0);
+    if (!showNb) return;
+    var nb = neighborsOf(i), pts = [];
+    nb.forEach(function (x) {
+      var a = nodes[i], b = nodes[x[0]];
+      pts.push(a.px, a.py, a.pz, b.px, b.py, b.pz);
+      meshes[x[0]].scale.set(1.5, 1.5, 1.5);
+    });
+    var g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pts), 3));
+    neighborLines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xffd54f, transparent: true, opacity: 0.95 }));
+    scene.add(neighborLines);
+  }
+  function row(k, v) { return "<dt>" + k + "</dt><dd>" + escapeHtml(v || "―") + "</dd>"; }
+  function select(i) {
+    selected = i; var n = nodes[i];
+    var html = "<h2>" + escapeHtml(n.title || "(名称不明)") + "</h2><dl>" + row("文献番号", n.id) + row("発明の名称", n.title) +
+      row("出願人", n.applicant) + row("FI", n.fi) + row("出願日", n.date) + "</dl>" +
+      '<button id="btn-nb">' + (showNb ? "近い特許の線を消す" : "近い特許を表示") + '</button><button id="btn-sel-close">閉じる</button>';
+    if (showNb) {
+      html += '<ol>' + neighborsOf(i).map(function (x) {
+        var m = nodes[x[0]];
+        return '<li data-i="' + x[0] + '">' + escapeHtml(m.title || m.id) + '（' + escapeHtml(m.applicant) + '）</li>';
+      }).join("") + "</ol>";
+    }
+    selPanel.innerHTML = html; selPanel.classList.add("show");
+    document.getElementById("btn-nb").addEventListener("click", function () { showNb = !showNb; select(selected); });
+    document.getElementById("btn-sel-close").addEventListener("click", function () {
+      selPanel.classList.remove("show"); selected = null; showNb = false; clearNb();
+    });
+    Array.prototype.forEach.call(selPanel.querySelectorAll("li[data-i]"), function (li) {
+      li.addEventListener("click", function () { select(parseInt(li.getAttribute("data-i"), 10)); });
+    });
+    drawNb(i);
+  }
+  var downPos = null;
+  renderer.domElement.addEventListener("pointerdown", function (ev) { downPos = [ev.clientX, ev.clientY]; });
+  renderer.domElement.addEventListener("pointerup", function (ev) {
+    if (!downPos || Math.abs(ev.clientX - downPos[0]) + Math.abs(ev.clientY - downPos[1]) > 5) return;
+    var rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    var hits = raycaster.intersectObjects(meshes);
+    if (hits.length > 0) { select(hits[0].object.userData.index); }
+  });
+
+"""
+
+
 def oz_world_html(corpus, template):
-    """オズの世界（Three.js）の HTML に、このデータセットの点・エッジ・凡例を差し込む。"""
+    """オズの世界（Three.js）の HTML に、このデータセットの点・エッジ・凡例を差し込む。
+    ・近傍の線は常時は出さず、点をクリックして「近い特許を表示」を押したときだけ、その特許と
+      近い特許（最大6件）を線で結ぶ。
+    ・3本の軸に「技術特徴軸1〜3（次元圧縮の方法）」と名前を付ける。各軸に固有の技術的な意味はない。"""
     ps = corpus["patents"]
     colors = group_colors(corpus)
     keys = {g: "g%d" % i for i, g in enumerate(corpus.get("groups", []))}
     nodes = [{"id": p["id"], "title": p.get("title", ""), "applicant": p.get("applicant", ""), "fi": p.get("fi", ""),
-              "group": keys.get(p.get("group", "その他"), "other"), "x": p.get("x", 0.0), "y": p.get("y", 0.0),
-              "z": p.get("z", 0.0)} for p in ps]
+              "date": p.get("filing_date", ""), "group": keys.get(p.get("group", "その他"), "other"),
+              "x": p.get("x", 0.0), "y": p.get("y", 0.0), "z": p.get("z", 0.0)} for p in ps]
     data = {"nodes": nodes, "edges": corpus.get("world_edges", [])}
     i = template.index("window.__GRAPH_DATA__ = ") + len("window.__GRAPH_DATA__ = ")
     _, end = json.JSONDecoder().raw_decode(template[i:])
@@ -13567,13 +13679,49 @@ def oz_world_html(corpus, template):
                       lambda m: m.group(1) + "\n" + rows + "\n" + m.group(2), html_out, count=1, flags=re.S)
     n_e = len(corpus.get("world_edges", []))
     method = corpus.get("world_method", "")
+    short = "UMAP" if "UMAP" in method else ("t-SNE" if "t-SNE" in method else "SVD")
+    axis_names = ["技術特徴軸%d（%s）" % (k, short) for k in (1, 2, 3)]
     html_out = re.sub(r"(<div id=\"title-bar\" class=\"panel\">\s*<h1>[^<]*</h1>\s*<span>)[^<]*(</span>)",
-                      lambda m: m.group(1) + "発明の名称＋FI・%s・%d件・近傍エッジ%d本" % (method, len(ps), n_e)
+                      lambda m: m.group(1) + "発明の名称＋FI・%s・%d件　点をクリックすると詳細" % (method, len(ps))
                       + m.group(2), html_out, count=1)
     html_out = re.sub(r"<dt>特許件数</dt><dd>[^<]*</dd>", "<dt>特許件数</dt><dd>%d件</dd>" % len(ps), html_out)
-    html_out = re.sub(r"<dt>エッジ数</dt><dd>[^<]*</dd>", "<dt>エッジ数</dt><dd>%d本（各点の近傍）</dd>" % n_e, html_out)
+    html_out = re.sub(r"<dt>エッジ数</dt><dd>[^<]*</dd>", "<dt>近傍の線</dt><dd>%d本（通常は非表示）</dd>" % n_e, html_out)
     html_out = re.sub(r"<dt>次元圧縮</dt><dd>[^<]*</dd>", "<dt>次元圧縮</dt><dd>%s</dd>" % method, html_out)
+    html_out = re.sub(r'(<div id="info-panel" class="panel">.*?)<p>.*?</p>',
+                      lambda m: m.group(1) + "<p>X・Y・Zは技術特徴軸1〜3（%s）。各軸そのものに固有の技術的意味はなく、"
+                      "特許間の近さを3次元に配置したもの。近い点ほど「発明の名称＋FI」の特徴が似ている。"
+                      "線は、次元圧縮の前の特徴空間で近い特許どうしを結ぶ。</p>" % short, html_out, count=1, flags=re.S)
+    for old, new in (("Zoom In", "拡大"), ("Zoom Out", "縮小"), ("Reset View", "視点を戻す"), ("Rotate", "回転"),
+                     ("Expand All", "全ての近傍線"), ("Collapse All", "線を消す"), (">Info<", ">データ概要<"),
+                     ("Node Types", "凡例"), (">Help<", ">操作方法<")):
+        html_out = html_out.replace(old, new, 1)
+    html_out = html_out.replace("<li>点にマウスを合わせる：詳細表示</li>",
+                                "<li>点にマウスを合わせる：名称を表示</li><li>点をクリック：詳細と「近い特許を表示」</li>", 1)
+    html_out = html_out.replace("</style>", _OZ_CSS + "</style>", 1)
+    html_out = html_out.replace('<div id="tooltip"></div>',
+                                '<div id="tooltip"></div>\n<div id="sel-panel" class="panel"></div>\n'
+                                '<div id="axis-note" class="panel">X・Y・Z＝技術特徴軸1〜3（%s）。軸そのものに意味はなく、'
+                                '近い点ほど「発明の名称＋FI」が似ている</div>' % short, 1)
+    anchor = '  renderer.domElement.addEventListener("mousemove", onPointerMove);'
+    html_out = html_out.replace(anchor, anchor + "\n" + _OZ_JS.replace("__AXIS_NAMES__", json.dumps(axis_names,
+                                                                                                   ensure_ascii=False)), 1)
     return html_out
+
+
+def sample_world_edges(corpus, template):
+    """サンプル（532件）用：研究で作ったオズの世界の近傍エッジを、このデータの並び順に付け替える。"""
+    i = template.index("window.__GRAPH_DATA__ = ") + len("window.__GRAPH_DATA__ = ")
+    d, _ = json.JSONDecoder().raw_decode(template[i:])
+    pos = {p["id"]: k for k, p in enumerate(corpus["patents"])}
+    tid = [n["id"] for n in d["nodes"]]
+    out = []
+    for e in d["edges"]:
+        a, b = pos.get(tid[e["source"]]), pos.get(tid[e["target"]])
+        if a is not None and b is not None:
+            out.append({"source": a, "target": b, "dist": e.get("dist", 0.0)})
+    corpus["world_edges"] = out
+    corpus["world_method"] = "SVD(50)→UMAP(3)"
+    return corpus
 
 
 # ---------------------------------------------------------------------------
@@ -14238,7 +14386,7 @@ sao_selector10 = _types.SimpleNamespace(HERE=HERE, SEG_KEYS=SEG_KEYS, build_cand
 sao_selector11 = _types.SimpleNamespace(HERE=HERE, build_candidates=build_candidates11, claim_features=claim_features11, merge_occurrences=merge_occurrences)
 sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE, Selector=Selector12, TRAIN_FILE=TRAIN_FILE12, _is_has=_is_has, _model=_model, build_candidates=build_candidates12, canon=canon, claim_features=claim_features12, cv_folds=cv_folds, select=select12, structural_features=structural_features12)
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, tidy_relations=tidy_relations)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, tidy_relations=tidy_relations)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
 
 
