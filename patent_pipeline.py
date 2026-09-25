@@ -9991,6 +9991,15 @@ def _load_pipeline(pipeline_dir=None):
     return pp
 
 
+_NON_COMPONENT_WORDS = {
+    "複数", "多数", "一対", "互い", "それぞれ", "各々", "夫々", "いくつか", "幾つか", "全て", "すべて", "双方",
+    "少なくとも一つ", "少なくとも１つ", "少なくとも1つ", "一つ", "１つ", "1つ",
+}
+
+
+_GA_NEXT_RE = re.compile(r"(、|，|及び|および|又は|または|並びに|ならびに)")
+
+
 def tag_components(text, pp):
     """
     日本語クレームの構成要素をGiNZAで検出し、《C1》のようなタグに
@@ -10051,13 +10060,24 @@ def tag_components(text, pp):
                 and doc[c["end"] + 1].pos_ == "VERB"
                 and doc[c["end"] + 1].text.startswith("在す")):
             continue
+        # 「複数の多穴管」の「複数」、「互いに」の「互い」のような数量・指示の語は、構成要素ではない。
+        # タグにすると「《C1》の《C2》」となり、LLM が「複数」を1つの部品として扱ってしまう
+        # （「複数｜の｜多穴管」のような関係や、「複数」と「多穴管」が別々のノードになる）ため、タグにしない。
+        if c["text"] in _NON_COMPONENT_WORDS:
+            continue
         # 「（ａ）」「（ｂ）」の工程ラベル除外は、extract_patent_components_general
         # 側（patent_pipeline.py）で一元的に対応済み（_is_paren_step_label）。
         # ここでは重複対応しない。
         start_char = doc[c["start"]].idx
         end_tok = doc[c["end"]]
         end_char = end_tok.idx + len(end_tok.text)
-        spans.append((start_char, end_char, c["text"]))
+        comp_text = c["text"]
+        # 「しょうが及び落花生」の「しょうが」は「しょう＋が」と切られることがある。「が」の直後が「及び」や読点なら、
+        # その「が」は助詞ではなく名前の一部なので、名前に含める
+        if text[end_char:end_char + 1] == "が" and _GA_NEXT_RE.match(text, end_char + 1):
+            end_char += 1
+            comp_text += "が"
+        spans.append((start_char, end_char, comp_text))
 
     spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
 
@@ -13837,8 +13857,177 @@ def step_candidates(pp, text, title, nodes):
 
 
 # ===========================================================================
+# 【統合】comp_first.py
+# 名前の付け替え: NOUNISH → NOUNISH_cf
+# ===========================================================================
+"""
+comp_first.py
+==============
+構成要素を先に確定してから、GiNZA の規則で関係を取り出す（構成要素は分割しない）。
+
+  1. LLM に、請求項の構成要素の名前を本文の表記のまま書き出させる
+  2. 新森ら（2004）の「名詞まとまり」の考え方で、名前の境界を確かめる
+     （本文にそのまま出てきて、末尾が名詞まとまりの末尾に一致するものだけを使う。LLM が文の途中で切った名前や、
+       本文に無い言い換えを除く）
+  3. 確かめた名前の範囲を、GiNZA の解析結果の中で1語に結合し（spaCy の retokenize）、その語を構成要素として、
+     いつもの GiNZA の規則（係り受けの規則・「有する」木の整理など）で関係を取り出す
+
+532件で、正解データの構成要素の名前をそのまま与えた場合（LLM が完璧に取り出せた場合の上限）、GiNZA の規則の F1 は
+42.3% → 48.0% になった。一方、名詞まとまりの規則だけで名前を決めると 41.1% に下がったため、規則は名前を決める役ではなく、
+LLM の名前の境界を確かめる役にしている。
+"""
+import hashlib
+import re
+
+COMPONENT_SYSTEM = """あなたは日本の特許請求項の構造を分析する専門家です。
+請求項の本文から、構成要素（装置の部品・部材、材料、手段、方法の工程など、関係の主語や目的語になるもの）の名前を
+すべて書き出してください。
+
+きまり：
+- 名前は本文に書かれている表記のまま書く（言い換えない・要約しない）
+- 名前の前の「前記」「該」「複数の」「一対の」「少なくとも一つの」などは付けない
+- 「第１の電極」「第１電極」のような番号付きの名前は、番号も含めて1つの名前にする
+- 「Xの上面」「Xの第１面」「Xの一端」のように、ある部品の部位を表す名前は、そのまま1つの名前にする
+- 「〜する工程」「〜する段階」は、「原料を加熱する工程」のように、工程の内容を含めた名前にする
+- 請求項の題名（最後の名詞句。例：「半導体装置」「飲料の製造方法」）も含める
+- 同じものは1回だけ書く
+
+出力は、名前を1行に1つずつ書くだけにする。番号や記号、説明は書かない。
+
+【例】
+【請求項】
+基台と、前記基台に固定された支柱と、前記支柱に回転可能に取り付けられたアームと、前記アームの先端に設けられた複数の光源とを備え、前記光源は、前記基台の上面に向けて光を照射する照明装置。
+【構成要素】
+基台
+支柱
+アーム
+アームの先端
+光源
+基台の上面
+光
+照明装置"""
+
+NOUNISH_cf = {"NOUN", "PROPN", "NUM", "SYM"}
+BARE_STEPS = {"段階", "工程", "ステップ"}
+
+
+def _nounish(t):
+    return t.pos_ in NOUNISH_cf or t.tag_.startswith("接頭辞") or t.tag_.startswith("接尾辞-名詞")
+
+
+def parse_components(out, clean_node=lambda x: x):
+    names = []
+    for line in str(out or "").splitlines():
+        x = re.sub(r"^\s*(?:[-・*●○]|\d+[.)．）])\s*", "", line).strip().strip("「」『』\"'")
+        if not x or x.startswith("【") or len(x) > 60 or "、" in x:
+            continue
+        x = clean_node(x)
+        if x and x not in names:
+            names.append(x)
+    return names
+
+
+def extract_components_llm(ts, text, model=None, host=None, cache=None, clean_node=lambda x: x):
+    """1. LLM に構成要素の名前を書き出させる（結果は cache に保存）。"""
+    user = f"【請求項】\n{text.strip()}\n【構成要素】"
+    key = "CMP:" + hashlib.sha1((COMPONENT_SYSTEM + "\n" + user + "\n" + str(model)).encode("utf-8")).hexdigest()
+    if cache is not None and key in cache:
+        out = cache[key]
+    else:
+        kw = {} if model is None else {"model": model}
+        out = ts._ollama_chat(COMPONENT_SYSTEM, user, host=host, **kw)
+        if cache is not None:
+            cache[key] = out
+    return parse_components(out, clean_node), out
+
+
+def _pattern(name):
+    # 本文では「前記Xの前記Y」のように「の」の後に「前記」が入ることがあるので、それを許す
+    return re.escape(name).replace("の", "の(?:前記|該|上記|当該)?")
+
+
+def guard_names(doc, text, names):
+    """2. 名前の境界の確認（新森らの「名詞まとまり」）。本文にそのまま出てきて、末尾が名詞まとまりの末尾に
+    一致する（次の語が名詞・記号でない）名前だけを残す。"""
+    keep = []
+    for nm in dict.fromkeys(names):
+        if not nm or nm in BARE_STEPS:
+            continue
+        for m in re.finditer(_pattern(nm), text):
+            sp = doc.char_span(m.start(), m.end(), alignment_mode="strict")
+            if sp is None:
+                continue
+            e = sp.end - 1
+            nxt = doc[e + 1] if e + 1 < len(doc) else None
+            if nxt is not None and _nounish(nxt):
+                continue
+            if not (_nounish(doc[e]) or doc[e].text == "が" or sp.text.endswith(("工程", "段階", "ステップ"))):
+                continue
+            keep.append(nm)
+            break
+    return keep
+
+
+def forced_relations(pp, text, names):
+    """3. 名前の範囲を1語に結合してから、GiNZA の規則で関係を取り出す（analyze_claim_ginza_only と同じ規則）。"""
+    text = pp._clean_claim_text(text)
+    doc = pp.nlp(text)
+    spans = []
+    for nm in sorted(set(names), key=len, reverse=True):
+        for m in re.finditer(_pattern(nm), text):
+            spans.append((m.start(), m.end(), nm))
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    chosen, last = [], -1
+    for a, b, nm in spans:
+        if a < last:
+            continue
+        sp = doc.char_span(a, b, alignment_mode="expand")
+        if sp is None or (chosen and sp.start < chosen[-1][0].end):
+            continue
+        chosen.append((sp, nm))
+        last = b
+    offsets = [(sp.start_char, sp.end_char, nm) for sp, nm in chosen]
+    with doc.retokenize() as r:
+        for sp, _ in chosen:
+            if len(sp) > 1:
+                r.merge(sp)
+    names_at = {}
+    for a, b, nm in offsets:
+        t = doc.char_span(a, b, alignment_mode="expand")
+        if t is not None and len(t) == 1:
+            names_at[t.start] = nm
+    comps = [{"text": nm, "start": i, "end": i} for i, nm in names_at.items()]
+    for c in pp.extract_patent_components_general(doc):
+        if not any(c["start"] <= i <= c["end"] for i in names_at):
+            comps.append(c)
+    comps.sort(key=lambda c: c["start"])
+    rw = pp.extract_relation_words_general(doc)
+    rel = pp.combine_all_relations(
+        pp.extract_positional_relations(doc, comps, rw) + pp.extract_has_location_relations(doc, comps)
+        + pp.extract_installation_relations(doc, comps) + pp.extract_boundary_relations(doc, comps),
+        pp.extract_direct_relations(doc, comps) + pp.extract_contact_relations(doc, comps)
+        + pp.extract_capability_relations(doc, comps) + pp.extract_composition_relations(doc, comps)
+        + pp.extract_attribute_relations(doc, comps) + pp.extract_numeric_threshold_relations(doc, comps)
+        + pp.extract_copula_relations(doc, comps) + pp.extract_comparison_relations(doc, comps),
+        pp.extract_has_relations(doc, comps))
+    rel = pp._simplify_hierarchy(rel, doc, comps)
+    rel = pp._merge_surface_location_nodes(rel)
+    rel = pp._add_genitive_provenance_relations(rel)
+    rel = pp._merge_partitive_nodes(rel, doc, comps)
+    return rel
+
+
+def llm_component_relations(ts, pp, text, model=None, host=None, cache=None, clean_node=lambda x: x):
+    """1〜3 をまとめて実行する。戻り値：(関係のリスト, 使った名前, LLM が出した名前, LLM の生の出力)"""
+    names, raw = extract_components_llm(ts, text, model=model, host=host, cache=cache, clean_node=clean_node)
+    clean = pp._clean_claim_text(text)
+    kept = guard_names(pp.nlp(clean), clean, names)
+    return forced_relations(pp, text, kept), kept, names, raw
+
+
+# ===========================================================================
 # 【統合】llm_select.py
-# 名前の付け替え: analyze_claim → analyze_claim_ls
+# 名前の付け替え: BARE_STEPS → BARE_STEPS_ls, analyze_claim → analyze_claim_ls
 # ===========================================================================
 """
 llm_select.py
@@ -13853,9 +14042,10 @@ llm_select.py
   ② LLMの直接抽出：タグ付きの請求項を LLM に入れて、SAOをそのまま出させる（方式B/D）
      with_translate=True なら、タグ付きの請求項を LLM で英訳し、英語の文の規則で関係を取り出して日本語に戻した
      候補も加える（方式C：英訳経由）
-  ③ LLMによる確認と追加：GiNZAの規則（G）の結果を土台（【A】）にし、LLM には請求項の本文と例題を見せて、
-     【A】の明らかな誤りの削除と、残りの候補を「2つの構成要素の組」ごとにまとめた【B】からの追加をさせる
-     （例題は532件に含まれない作例3件。LLMが外れても、規則だけの結果が下限になるようにしている）
+  ③ LLMによる追加：GiNZAの規則（G）の結果はそのまま採用し（【抽出済み】として LLM にも見せる）、LLM には
+     請求項の本文と例題を見せて、残りの候補を「2つの構成要素の組」ごとにまとめた【候補】から、本文に書かれている
+     関係を追加させる（例題は532件に含まれない作例3件）。規則の結果の削除は LLM にさせない
+     （qwen3.5:9b で試したところ、正しい関係までほぼすべて削除したため）。votes=2 なら2回聞いて一致したものだけ追加
   ④ ルールによる整理：同じ組に採用が複数あるときは1件だけ残し、残りは「要確認」に回す
 
 どこにも学習データ（正解データで学習したモデル）を使わないので、分野によらず同じ仕組みで動く。
@@ -13863,19 +14053,19 @@ llm_select.py
 ②も失敗したとき（Ollama が起動していない等）は、①のうち GiNZA の規則（G）の結果を採用にする（規則だけの方法）。
 
 判定：
-  採用   … 【A】のうち削除されなかったもの＋【B】から追加されたもの（④で整理した後）
-  要確認 … 【A】のうち LLM が削除したもの／2つ以上の系統（規則・LLM・英訳）が出したが追加されなかった候補／
-           ④で外した別表現（取りこぼしを防ぐため、人が確認できるように表に残す）
+  採用   … GiNZAの規則の結果＋LLM が【候補】から追加したもの（④で整理した後）
+  要確認 … 2つ以上の系統（規則・LLM）が出したが追加されなかった候補／④で外した別表現
+           （取りこぼしを防ぐため、人が確認できるように表に残す）
   除外   … それ以外
 「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの：
-  採用＋2系統以上 1.0 ／ 採用＋1系統 0.8 ／ 採用されなかった2系統以上 0.5 ／ LLMが削除した規則の結果 0.3 ／
-  それ以外 0.1
+  採用＋2系統以上 1.0 ／ 採用＋1系統 0.8 ／ 採用されなかった2系統以上 0.5 ／ それ以外 0.1
 """
 import hashlib
 import re
 
 pass  # （統合済み）import claim_segmenter as CS
 pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import comp_first as CF
 pass  # （統合済み）import sao_selector13 as S13
 pass  # （統合済み）import struct_extra as SE
 
@@ -13884,43 +14074,39 @@ SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する�
 
 与えられるもの：
 【請求項】本文
-【A】規則で抽出済みの関係（番号付き）。基本的には正しいものとして扱う
-【B】追加の候補。「2つの構成要素の組」ごとに番号が付き、その下に言い方の候補が a, b, c… で並ぶ
+【抽出済み】規則ですでに抽出した関係（参考。これには答えない）
+【候補】まだ抽出されていない関係の候補。「2つの構成要素の組」ごとに番号が付き、その下に言い方の候補が a, b, c… で並ぶ
 
 やること：
-1. 【A】のうち、明らかに誤っているもの（本文に書かれていない、主語と目的語が逆、相手を取り違えている、
-   構成要素の名前が壊れている）の番号を「削除」に書く。迷うものは削除しない
-2. 【B】のうち、本文に書かれている組を選び、本文に最も合う言い方を「追加」に書く（「3a」のように番号と記号。
-   記号を省くと a とみなす）。【A】に同じ関係が正しく入っている組は選ばない。
-   構造をできるだけ漏らさず拾うことが目的なので、本文に根拠がある組は、迷ったら選ぶ
+【候補】のうち、請求項の本文に書かれている組だけを選び、本文に最も合う言い方を書く（「3a」のように番号と記号）。
+- 【抽出済み】に同じ内容がすでにある組は選ばない
+- 本文に書かれていない組、主語と目的語が逆の言い方、相手を取り違えた組は選ばない
+- 本文にはっきり書かれていれば選ぶ。書かれていなければ選ばない
 
 判断の基準：
 - 「AとBとを備えるX」は X｜備える｜A と X｜備える｜B（全体が主語、部品が目的語。関係は本文の動詞を使う）
 - 「Bに固定されたA」「AはBに固定される」は、どちらも A｜固定される｜B（修飾される側・述語の主題が主語）
 - 「A、B及びCを含むX」のような列挙は、要素ごとに X｜含む｜A、X｜含む｜B、X｜含む｜C
 - 「〜する混合工程と、…を含む方法」は 方法｜含む｜混合工程、工程の中身は 混合工程｜混合する｜材料
-- 「Xの一部」「Xの外側」は X と同じ構成要素として扱う。「Xの上面」「Xの第１面」などの部位は、
-  X｜有する｜Xの上面 の関係も書く
+- 「Xの上面」「Xの第１面」などの部位は、X｜有する｜Xの上面 の関係も書く
 
-出力は次の2行だけ。説明は書かない。該当が無ければ「なし」と書く。
-削除: 番号をカンマ区切り
+出力は次の1行だけ。説明は書かない。選ぶものが無ければ「追加: なし」と書く。
 追加: 番号と記号をカンマ区切り
 
 【例1】
 【請求項】
 基台と、前記基台に固定された支柱と、前記支柱に回転可能に取り付けられたアームと、前記アームの先端に設けられた光源とを備える照明装置。
-【A】
-1. 照明装置｜備える｜基台
-2. 照明装置｜備える｜支柱
-3. 基台｜固定される｜支柱
-4. 照明装置｜備える｜光源
-5. 照明装置｜備える｜先端
-【B】
+【抽出済み】
+・照明装置｜備える｜基台
+・照明装置｜備える｜支柱
+・照明装置｜備える｜光源
+【候補】
 1. 照明装置 と アーム
    a) 照明装置｜備える｜アーム
    b) アーム｜備える｜照明装置
 2. 支柱 と 基台
-   a) 支柱｜固定される｜基台
+   a) 基台｜固定される｜支柱
+   b) 支柱｜固定される｜基台
 3. アーム と 支柱
    a) 支柱｜取り付けられる｜アーム
    b) アーム｜取り付けられる｜支柱
@@ -13930,19 +14116,19 @@ SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する�
    a) アーム｜有する｜アームの先端
 6. 光源 と 支柱
    a) 光源｜設けられる｜支柱
+7. 照明装置 と 先端
+   a) 照明装置｜備える｜先端
 答え：
-削除: 3,5
-追加: 1a,2a,3b,4a,5a
+追加: 1a,2b,3b,4a,5a
 
 【例2】
 【請求項】
 原料を水に浸漬する浸漬工程と、浸漬された前記原料を加熱する加熱工程と、加熱された前記原料を粉砕する粉砕工程と、を含む飲料の製造方法。
-【A】
-1. 飲料の製造方法｜含む｜浸漬工程
-2. 飲料の製造方法｜含む｜加熱工程
-3. 浸漬工程｜浸漬する｜原料
-4. 原料｜含む｜水
-【B】
+【抽出済み】
+・飲料の製造方法｜含む｜浸漬工程
+・飲料の製造方法｜含む｜加熱工程
+・浸漬工程｜浸漬する｜原料
+【候補】
 1. 飲料の製造方法 と 粉砕工程
    a) 飲料の製造方法｜含む｜粉砕工程
    b) 粉砕工程｜含む｜飲料の製造方法
@@ -13952,20 +14138,20 @@ SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する�
    a) 粉砕工程｜粉砕する｜原料
 4. 加熱工程 と 粉砕工程
    a) 加熱工程｜含む｜粉砕工程
+5. 原料 と 水
+   a) 原料｜含む｜水
 答え：
-削除: 4
 追加: 1a,2a,3a
 
 【例3】
 【請求項】
 導体層と、前記導体層を覆う絶縁膜と、を有し、前記導体層は、銅、アルミニウム及びニッケルを含み、前記絶縁膜の一部は、前記導体層の上面に接する配線基板。
-【A】
-1. 配線基板｜有する｜導体層
-2. 配線基板｜有する｜絶縁膜
-3. 絶縁膜｜覆う｜導体層
-4. 導体層｜含む｜ニッケル
-5. 配線基板｜有する｜ニッケル
-【B】
+【抽出済み】
+・配線基板｜有する｜導体層
+・配線基板｜有する｜絶縁膜
+・絶縁膜｜覆う｜導体層
+・導体層｜含む｜ニッケル
+【候補】
 1. 導体層 と 銅
    a) 導体層｜含む｜銅
 2. 導体層 と アルミニウム
@@ -13977,8 +14163,9 @@ SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する�
    a) 導体層｜有する｜導体層の上面
 5. 銅 と ニッケル
    a) 銅｜含む｜ニッケル
+6. 配線基板 と ニッケル
+   a) 配線基板｜有する｜ニッケル
 答え：
-削除: 5
 追加: 1a,2a,3b,4a"""
 
 LLM_SRCS = ("E1:llm_direct", "LLMraw")
@@ -14036,8 +14223,127 @@ def translate_relations(ts, pp, text, model=None, host=None, cache=None):
     return out
 
 
+# 構成要素の名前の前に付く数量の言葉（「複数の多穴管」→「多穴管」）。正解データでも名前に含めない
+_QUANT_PREFIX_RE = re.compile(r"^(前記|該|上記|当該|複数の|多数の|一対の|いくつかの|幾つかの|全ての|すべての|双方の|"
+                              r"任意の|それぞれの|各々の|少なくとも[0-9０-９一二三四五六七八九十]+つの|"
+                              r"[0-9０-９一二三四五六七八九十]+つの|[0-9０-９]+個の)")
+# 構成要素になり得ない語（数量・指示の語、動詞の切れ端）。これが主語・目的語になっている候補は捨てる
+NON_NODES = {"複数", "多数", "一対", "互い", "それぞれ", "各々", "夫々", "いくつか", "幾つか", "全て", "すべて", "双方",
+             "こと", "もの", "場合", "状態", "備え", "有し", "含み", "具備し", "設け", "一つ", "１つ", "1つ"}
+
+
+def clean_node(x):
+    """「前記複数の多穴管」→「多穴管」のように、名前の前の数量・指示の言葉を外す（残りが空になるなら外さない）。"""
+    prev = None
+    while prev != x:
+        prev = x
+        m = _QUANT_PREFIX_RE.match(x)
+        if m and len(x) > len(m.group(0)):
+            x = x[len(m.group(0)):]
+    return x
+
+
+def normalize_candidates(cands):
+    """全候補の主語・目的語に clean_node をかけ、同じになった候補は出どころをまとめて1つにする。
+    数量・指示の語や動詞の切れ端が主語・目的語になった候補と、自分自身への関係は捨てる。"""
+    out, index = [], {}
+    for c in cands:
+        s, t = clean_node(c["source"]), clean_node(c["target"])
+        if s == t or s in NON_NODES or t in NON_NODES:
+            continue
+        key = (s, c["relation"], t)
+        if key in index:
+            for x in c["srcs"]:
+                if x not in index[key]["srcs"]:
+                    index[key]["srcs"].append(x)
+            continue
+        d = dict(c, source=s, target=t, srcs=list(c["srcs"]))
+        index[key] = d
+        out.append(d)
+    return out
+
+
+_HAS_RELS = {"有する", "備える", "含む", "の", "具備する", "構成される", "からなる", "有し", "備え", "含み"}
+
+
+def grounded(pp, c, text_n):
+    """候補の主語・目的語が本文に出てくる名前で、関係の漢字の語幹も本文にある（「有する」系は除く）か。
+    532件では、正解に当たる候補はすべてこれを満たし、満たさない候補はすべて誤りだった（誤りの約4%）。"""
+    n = pp._normalize_node_text_lenient
+    if n(c["source"]) not in text_n or n(c["target"]) not in text_n:
+        return False
+    stem = re.match(r"[一-龥々]+", c["relation"])
+    return c["relation"] in _HAS_RELS or not stem or stem.group(0)[:2] in text_n
+
+
+_GA_FIX_RE = r"が(?=、|，|及び|および|又は|または|並びに|ならびに)"
+BARE_STEPS_ls = {"段階", "工程", "ステップ"}
+
+
+def structure_fixes(pp, text, info):
+    """分野によらない構造の整理（学習なしの規則）。532件（半導体）ではF1がほぼ変わらない（±0.3pt）ことを確認済みで、
+    主に半導体以外の請求項（方法の請求項・長い列挙）での崩れを防ぐためのもの。
+    1. 「しょう」→「しょうが」：本文で「〜が及び」「〜が、」と続く名前は「が」まで含める
+    2. 読点「、」を含む名前（列挙が1つにくっついたもの）の候補は捨てる（正解データでは約2万個中1個だけ）
+    3. 方法の請求項で工程の名前（「原材料を容器に入れる段階」）が取り出せたときは、
+       ・名前がただの「段階」「工程」「ステップ」の候補を捨てる（どの工程か分からないため。正解データでは0個）
+       ・工程の候補（題名｜含む｜工程、工程｜動詞｜対象）を、規則の結果（土台）に加える
+       ・題名が工程以外の部品を「有する」とする候補は捨てる（方法は工程を含むもので、部品は工程の中で使われる）
+    4. 題名の言い方の揺れ（「製造方法」「乳化剤の製造方法」「冷凍食品の乳化剤の製造方法」）を、本文にある一番長い
+       言い方にそろえる
+    5. 題名の名前の中だけで閉じた候補（冷凍食品｜の｜冷凍食品の乳化剤、冷凍食品｜の｜冷凍食品の乳化剤の製造方法）は
+       捨てる（題名は請求項全体の主語で、その名前の一部は別の構成要素ではない）"""
+    cands = info["cands"]
+    clean = pp._clean_claim_text(text)
+    # 1
+    fixes = {}
+    for c in cands:
+        for x in (c["source"], c["target"]):
+            if x not in fixes and re.search(re.escape(x) + _GA_FIX_RE, clean) and (x + "が") in clean:
+                fixes[x] = x + "が"
+    # 2
+    cands = [c for c in cands if not any(p in c["source"] + c["target"] for p in ("、", "，"))]
+    # 3
+    steps = [c for c in cands if "ST:工程" in c["srcs"]]
+    if steps:
+        step_names = {c["target"] for c in steps if c["relation"] in ("含む", "備える", "有する")} | \
+                     {c["source"] for c in steps if c["relation"] not in ("含む", "備える", "有する")}
+        cands = [c for c in cands if c["source"] not in BARE_STEPS_ls and c["target"] not in BARE_STEPS_ls]
+        cands = [c for c in cands if not (any(x in ("G:has", "GF:has") for x in c["srcs"]) and c["source"].endswith("方法")
+                                          and c["target"] not in step_names)]
+    # 4
+    title = info.get("title")
+    if title:
+        nodes = {c["source"] for c in cands} | {c["target"] for c in cands}
+        # 「冷凍食品の乳化剤の製造方法であって、…製造方法。」のように、冒頭で題名を長く書いている場合も拾う
+        m = re.match(r"^\s*(?:前記)?([^、。，\s]{0,40}?" + re.escape(title) + r")(?:であって|において|に於いて)", clean)
+        extra = {m.group(1)} if m else set()
+        extra |= {x for x in (info.get("components_used") or []) if x.endswith(title)}
+        variants = [x for x in nodes | {title} | extra if (x.endswith(title) or (len(x) >= 2 and title.endswith(x)))
+                    and x in clean]
+        if variants:
+            full = max(variants, key=len)
+            for x in variants:
+                if x != full:
+                    fixes[x] = full
+            info["title"] = full
+    if fixes:
+        for c in cands:
+            c["source"], c["target"] = fixes.get(c["source"], c["source"]), fixes.get(c["target"], c["target"])
+        cands = normalize_candidates(cands)
+    # 5. 題名の中の「Xの」（「冷凍食品の乳化剤の製造方法」の「冷凍食品」）が、題名の親になる候補は捨てる
+    #    （題名は請求項全体の主語で、その名前の一部は別の構成要素ではない）
+    title = info.get("title")
+    if title:
+        inner = {x for x in {c["source"] for c in cands} | {c["target"] for c in cands} if (x + "の") in title}
+        inner.add(title)
+        cands = [c for c in cands if not (c["source"] in inner and c["target"] in inner)]
+    return cands
+
+
 def build_rule_and_llm_candidates(ts, pp, text, llm_cache=None, claim_id=None, model=None, host=None,
-                                  llm_output=None, pool="standard", with_translate=False, translate_cache=None):
+                                  llm_output=None, pool="standard", with_translate=False, translate_cache=None,
+                                  components="ginza", component_cache=None):
     """① GiNZAの規則と ② LLMの直接抽出（と、指定すれば英訳経由の抽出）の候補を集める（出どころを srcs に残す）。
     pool="wide" では、係り受け（DEP）・区間の主役（SEG）・題名（TITLE）・同一ノードの結合（MRG）の規則の候補も加える。
     llm_output="" を渡すと LLM を呼ばない（①だけ）。"""
@@ -14052,12 +14358,25 @@ def build_rule_and_llm_candidates(ts, pp, text, llm_cache=None, claim_id=None, m
     # 文の構造の規則（列挙の展開と、方法の請求項の工程）
     try:
         n = pp._normalize_node_text_lenient
-        _add(info, index, coord_expansions(pp._clean_claim_text(text), info["cands"], n), lambda d: "ST:列挙")
+        # 列挙の展開は、GiNZAの規則（全体・区間ごと）が出した候補からだけ広げる（区間の主役の組などから広げると、
+        # 「段階｜ホタテ｜エビ」のような意味の無い候補が大量にできるため）
+        seeds = [c for c in info["cands"] if any(x.startswith(("G:", "GS:")) for x in c["srcs"])]
+        _add(info, index, coord_expansions(pp._clean_claim_text(text), seeds, n), lambda d: "ST:列挙")
         nodes = {c["source"] for c in info["cands"]} | {c["target"] for c in info["cands"]}
         steps = step_candidates(pp, text, info.get("title"), nodes)
         _add(info, index, [d for d in steps if d["rank"] == 0], lambda d: "ST:工程")
     except Exception:  # noqa: BLE001
         pass
+    # 構成要素を LLM で先に取り出し、GiNZA はそれを分割せずに規則で関係を取る（comp_first.py）。その結果（GF）を土台にする
+    info["component_error"], info["components_used"] = None, []
+    if components == "llm" and llm_output != "":
+        try:
+            rels, used, _, _ = llm_component_relations(ts, pp, text, model=model, host=host, cache=component_cache,
+                                                           clean_node=clean_node)
+            _add(info, index, rels, lambda r: "GF:" + r.get("type", "?"))
+            info["components_used"] = used
+        except Exception as exc:  # noqa: BLE001
+            info["component_error"] = str(exc)
     info["translate_error"] = None
     if with_translate and llm_output != "":
         try:
@@ -14065,14 +14384,27 @@ def build_rule_and_llm_candidates(ts, pp, text, llm_cache=None, claim_id=None, m
                  lambda d: "EN:translate")
         except Exception as exc:  # noqa: BLE001
             info["translate_error"] = str(exc)
-    info["cands"] = [c for c in info["cands"] if c["source"] != c["target"]]
+    info["cands"] = normalize_candidates(info["cands"])
+    info["cands"] = structure_fixes(pp, text, info)
+    # 土台（規則で抽出済みとして採用する関係）：構成要素を LLM で固定した GiNZA の規則（GF）が取れていればそれ、
+    # 無ければ通常の GiNZA の規則（G）。どちらも、方法の請求項の工程の規則（ST:工程）を加える
+    use_gf = components == "llm" and any(x.startswith("GF:") for c in info["cands"] for x in c["srcs"])
+    info["base_kind"] = "GF" if use_gf else "G"
+    for c in info["cands"]:
+        c["base"] = any(x.startswith("GF:" if use_gf else "G:") or x == "ST:工程" for x in c["srcs"])
+    # 本文に根拠の無い候補（名前や動詞が本文に出てこない）は、LLM に見せる前に外す（GiNZAの規則Gの結果は残す）
+    text_n = pp._normalize_node_text_lenient(pp._clean_claim_text(text).replace("前記", ""))
+    info["cands"] = [c for c in info["cands"] if is_base(c) or grounded(pp, c, text_n)]
     info["pool"] = pool
     return info
 
 
 def is_base(c):
-    """土台にする「規則で抽出済みの関係」：GiNZAの係り受けの規則（G）が出した候補。"""
-    return any(x.startswith("G:") for x in c["srcs"])
+    """土台にする「規則で抽出済みの関係」：GiNZAの係り受けの規則（G。構成要素をLLMで固定したときは GF）と、
+    方法の請求項の工程の規則（ST:工程）が出した候補。"""
+    if "base" in c:
+        return c["base"]
+    return any(x.startswith("G:") or x == "ST:工程" for x in c["srcs"])
 
 
 def group_pairs(pp, cands, idx=None):
@@ -14094,13 +14426,13 @@ def group_pairs(pp, cands, idx=None):
 def select_prompt(text, cands, groups=None, base=None):
     if groups is None:
         groups = [[i] for i in range(len(cands)) if not base or i not in base]
-    lines = ["【A】"]
-    for k, i in enumerate(base or [], 1):
+    lines = ["【抽出済み】"]
+    for i in base or []:
         c = cands[i]
-        lines.append(f"{k}. {c['source']}｜{c['relation']}｜{c['target']}")
+        lines.append(f"・{c['source']}｜{c['relation']}｜{c['target']}")
     if not base:
         lines.append("なし")
-    lines.append("【B】")
+    lines.append("【候補】")
     for k, g in enumerate(groups, 1):
         a, b = cands[g[0]]["source"], cands[g[0]]["target"]
         lines.append(f"{k}. {a} と {b}")
@@ -14159,25 +14491,30 @@ def _chat_cached(ts, system, user, model, host, cache):
     return out
 
 
-def select_with_llm(ts, text, cands, model=None, host=None, cache=None, pp=None):
-    """③ 規則の結果（【A】）を土台に、LLM に「明らかな誤りの削除」と「【B】からの追加」をさせる。
-    【B】の組が多いときは MAX_PAIRS_PER_CALL ずつに分けて呼ぶ（【A】は毎回見せるが、削除は1回目の答えだけ使う）。
-    戻り値：(採用する候補の番号（0始まり）の集合, LLMの出力をつないだ文字列, {"deleted": [...], "added": [...]})"""
+def select_with_llm(ts, text, cands, model=None, host=None, cache=None, pp=None, votes=1):
+    """③ 規則の結果（【抽出済み】）はそのまま採用し、LLM には【候補】から本文に書かれている関係を追加させる。
+    （規則の結果の削除も LLM に任せていたが、qwen3.5:9b では正しい関係までほぼすべて削除してしまったため、
+    削除はさせない。規則の誤りは、人が確認画面で外す）
+    【候補】の組が多いときは MAX_PAIRS_PER_CALL ずつに分けて呼ぶ。
+    votes=2 なら、組の並びを逆にしてもう一度聞き、2回とも選ばれたものだけを追加する（精度重視・時間は約2倍）。
+    戻り値：(採用する候補の番号（0始まり）の集合, LLMの出力をつないだ文字列, {"deleted": [], "added": [...]})"""
     base = [i for i, c in enumerate(cands) if is_base(c)]
     rest = [i for i in range(len(cands)) if i not in set(base)]
     groups = group_pairs(pp, cands, rest) if pp is not None else [[i] for i in rest]
-    deleted, added, outs = set(), set(), []
-    chunks = [groups[s0:s0 + MAX_PAIRS_PER_CALL] for s0 in range(0, len(groups), MAX_PAIRS_PER_CALL)] or [[]]
-    for ci, part in enumerate(chunks):
-        out = _chat_cached(ts, SELECT_SYSTEM, select_prompt(text, cands, part, base), model, host, cache)
-        outs.append(out)
-        dels, adds = parse_answer(out, len(base), part)
-        if ci == 0:
-            deleted = {base[k] for k in dels}
-        for k, v in adds:
-            added.add(part[k][v])
-    selected = (set(base) - deleted) | added
-    return selected, " ／ ".join(str(o) for o in outs), {"deleted": sorted(deleted), "added": sorted(added)}
+    outs, per_pass = [], []
+    for p in range(max(1, votes)):
+        order = groups if p == 0 else list(reversed(groups))
+        chunks = [order[s0:s0 + MAX_PAIRS_PER_CALL] for s0 in range(0, len(order), MAX_PAIRS_PER_CALL)]
+        added = set()
+        for part in chunks:
+            out = _chat_cached(ts, SELECT_SYSTEM, select_prompt(text, cands, part, base), model, host, cache)
+            outs.append(out)
+            _, adds = parse_answer(out, 0, part)
+            for k, v in adds:
+                added.add(part[k][v])
+        per_pass.append(added)
+    added = set.intersection(*per_pass) if per_pass else set()
+    return set(base) | added, " ／ ".join(str(o) for o in outs), {"deleted": [], "added": sorted(added)}
 
 
 def judge(cands, selected, llm_ok=True, mode=None, deleted=()):
@@ -14232,20 +14569,22 @@ def tidy(pp, cands, judged):
 
 
 def analyze_claim_ls(ts, pp, text, llm_cache=None, select_cache=None, claim_id=None, model=None, host=None,
-                  pool="standard", with_translate=False, translate_cache=None):
+                  pool="standard", with_translate=False, translate_cache=None, votes=1, components="ginza"):
     """①②③④をまとめて実行する。戻り値：(候補, 判定, LLMの選別の生の出力 または エラー)
     info["mode"] に、実際に使えた段階（"llm"／"both"／"rules"）を入れる。"""
     try:
         info = build_rule_and_llm_candidates(ts, pp, text, llm_cache=llm_cache, claim_id=claim_id,
                                              model=model, host=host, pool=pool, with_translate=with_translate,
-                                             translate_cache=translate_cache)
+                                             translate_cache=translate_cache, components=components,
+                                             component_cache=select_cache)
     except Exception as exc:  # noqa: BLE001  LLM を呼べない → ①の規則だけで決める
         info = build_rule_and_llm_candidates(ts, pp, text, model=model, host=host, llm_output="", pool=pool)
         info["mode"] = "rules"
         return info, judge(info["cands"], set(), mode="rules"), f"LLMを呼べませんでした（GiNZAの規則だけで判定）: {exc}"
     cands = info["cands"]
     try:
-        selected, raw, ops = select_with_llm(ts, text, cands, model=model, host=host, cache=select_cache, pp=pp)
+        selected, raw, ops = select_with_llm(ts, text, cands, model=model, host=host, cache=select_cache, pp=pp,
+                                             votes=votes)
         info["mode"] = "llm"
     except Exception as exc:  # noqa: BLE001
         selected, raw, info["mode"] = set(), f"選別のLLMを呼べませんでした: {exc}", "both"
@@ -14253,6 +14592,62 @@ def analyze_claim_ls(ts, pp, text, llm_cache=None, select_cache=None, claim_id=N
     info["n_base"] = sum(is_base(c) for c in cands)
     info["n_deleted"], info["n_added"] = len(ops["deleted"]), len(ops["added"])
     return info, tidy(pp, cands, judge(cands, selected, mode=info["mode"], deleted=ops["deleted"])), raw
+
+
+# =====================================================================================================
+# 【最終方式】A2：構成要素を LLM で先に取り出して固定し、GiNZA の規則で関係を取り出す（学習なし）
+# =====================================================================================================
+def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None):
+    """最終方式（A2）。LLM の呼び出しは構成要素の書き出しの1回だけ。
+      1. LLM が構成要素の名前を本文の表記のまま書き出す（comp_first.COMPONENT_SYSTEM）
+      2. 新森ら（2004）の「名詞まとまり」の考え方で、名前の境界を確かめる
+      3. 確かめた名前を GiNZA の解析結果の中で1語に固定し、GiNZA の規則で関係を取り出す
+      4. 分野によらない構造の整理（数量の言葉を外す・題名の揺れをそろえる・方法の工程など。structure_fixes）
+    判定：採用＝3と4の結果（方法の請求項の工程の規則を含む）／要確認＝通常の GiNZA の規則（構成要素を固定しない）だけが
+    出した関係（取りこぼしを人が拾えるように表に残す）／除外＝それ以外。
+    LLM を呼べないときは、通常の GiNZA の規則の結果を採用にする（mode="rules"）。
+    戻り値：(info, 判定, LLM の出力 または エラー)"""
+    info = build_rule_and_llm_candidates(ts, pp, text, model=model, host=host, llm_output="", pool="standard")
+    raw = ""
+    info["mode"], info["components_used"], info["component_error"] = "rules", [], None
+    try:
+        rels, used, _, raw = llm_component_relations(ts, pp, text, model=model, host=host, cache=cache,
+                                                        clean_node=clean_node)
+        index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+        _add(info, index, rels, lambda r: "GF:" + r.get("type", "?"))
+        # 列挙「A、B及びCから構成されるX」の展開：GiNZA は最後の要素 C としか結ばないことが多いので、LLM が構成要素として
+        # 書き出した名前どうしに限って、他の要素にも同じ関係を広げる（ST:列挙A2。土台に加える）
+        usedset = set(used)
+        seeds = [c for c in info["cands"] if any(x.startswith("GF:") for x in c["srcs"])]
+        exp = [d for d in coord_expansions(pp._clean_claim_text(text), seeds, pp._normalize_node_text_lenient)
+               if d["source"] in usedset and d["target"] in usedset]
+        _add(info, index, exp, lambda d: "ST:列挙A2")
+        info["cands"] = structure_fixes(pp, text, dict(info, cands=normalize_candidates(info["cands"])))
+        info["components_used"], info["mode"] = used, "llm"
+    except Exception as exc:  # noqa: BLE001
+        info["component_error"] = raw = f"LLMを呼べませんでした（通常のGiNZAの規則で判定）: {exc}"
+    use_gf = info["mode"] == "llm" and any(x.startswith("GF:") for c in info["cands"] for x in c["srcs"])
+    info["base_kind"] = "GF" if use_gf else "G"
+    judged = []
+    for c in info["cands"]:
+        g = any(x.startswith("G:") for x in c["srcs"])
+        gf = any(x.startswith("GF:") for x in c["srcs"])
+        st_ = "ST:工程" in c["srcs"] or (use_gf and "ST:列挙A2" in c["srcs"])
+        base = (gf if use_gf else g) or st_
+        c["base"] = base
+        if base:
+            both = gf and g
+            judged.append({"selected": True, "score": 1.0 if both or not use_gf else 0.8, "status": "採用",
+                           "basis": ("構成要素を固定したGiNZAの規則" + ("（通常の規則とも一致）" if both else "")) if use_gf
+                           else ("方法の工程の規則" if st_ and not g else "GiNZAの規則")})
+            if "ST:列挙A2" in c["srcs"] and not gf:
+                judged[-1]["basis"] = "列挙の展開（LLMの構成要素どうし）"
+        elif g and use_gf:
+            judged.append({"selected": False, "score": 0.5, "status": "要確認",
+                           "basis": "通常のGiNZAの規則だけが出した関係"})
+        else:
+            judged.append({"selected": False, "score": 0.1, "status": "除外", "basis": "その他の規則の候補"})
+    return info, tidy(pp, info["cands"], judged), raw
 
 
 # ===========================================================================
@@ -14431,7 +14826,8 @@ _ORIGIN = [("LLM", ("LLMraw", "E1:llm_direct")),
                         "E1:ginza_has_fallback_conflict", "E1:claim_title_ginza_conflict")),
            ("GiNZA", ("G",)), ("分割GiNZA", ("GS",)), ("ノード結合", ("MRG",)), ("係り受け", ("DEP",)),
            ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",)), ("区間内の名詞句", ("NP",)),
-           ("文の構造の規則", ("ST",)), ("英訳経由", ("EN",))]
+           ("文の構造の規則", ("ST",)), ("英訳経由", ("EN",)),
+           ("構成要素を固定したGiNZA", ("GF",))]
 
 
 def origin_label(srcs):
@@ -14770,17 +15166,17 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-25f"
+PIPELINE_VERSION = "2026-09-25k"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
     "stats": {"採用": {"精度": 0.801}, "要確認": {"精度": 0.3034}, "除外": {"精度": 0.0224},
               "正解の所在": {"採用": 0.3799, "要確認": 0.1907, "除外": 0.2288, "候補なし": 0.2005}},
 }
-METHOD_NAME = "学習なし（GiNZAの規則＋LLMの抽出 → LLMによる確認と追加 → ルールで整理）"
-METHOD_SCORE = ("学習データを使わない方法（Recall重視）。精度は、ローカルのOllamaで評価コマンド（--method llm-select）を"
-                "実行して測る。参考（532件・トリプル完全一致）：GiNZAの規則だけ F1 42.3%、LLMの直接抽出だけ 24.9%。"
-                "候補に正解が含まれる割合（Recallの上限）は、標準 55.5%／広め 約71%")
+METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
+METHOD_SCORE = ("学習データを使わない最終方式。LLMの呼び出しは1件あたり1回（構成要素の書き出し）。"
+                "参考（532件・トリプル完全一致）：通常のGiNZAの規則 F1 42.3%。構成要素が正しく取れた場合の上限 47.6%"
+                "（正解データの構成要素を与えた場合）。精度はローカルのOllamaで評価コマンドを実行して測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
                       "分野を丸ごと隠しても F1 の低下は0〜2ポイント")
@@ -15721,8 +16117,9 @@ def main_eval():
                              "アプリの「正解データとして書き出す」で作った他分野の請求項を指定できる")
     parser.add_argument("--gold-file", default=None,
                         help="正解SAOのJSON（既定: data-dir の gold_sao_532_merged.json）")
-    parser.add_argument("--method", default="model", choices=["model", "llm-select"],
-                        help="model: 学習済み選別モデル（実験14）／llm-select: 学習なし（GiNZAの規則＋LLMの直接抽出→LLMによる選別）")
+    parser.add_argument("--method", default="a2", choices=["a2", "model", "llm-select"],
+                        help="a2（既定・最終方式）: 構成要素をLLMで固定したGiNZAの規則／model: 学習済み選別モデル（実験14・比較用）／"
+                             "llm-select: 学習なしの試作（GiNZAの規則＋LLMの抽出→LLMによる追加）")
     parser.add_argument("--pool", default="wide", choices=["standard", "wide"],
                         help="--method llm-select の候補の範囲。standard: GiNZAの規則＋LLM／wide（既定）: Recall重視で、"
                              "係り受け・区間の主役・題名・同一ノードの結合の規則の候補も加える")
@@ -15730,6 +16127,11 @@ def main_eval():
                         help="--method llm-select で、英訳経由の抽出（方式C）の候補も加える（LLMの呼び出しが増える）")
     parser.add_argument("--translate-cache", default="translate_cache.json",
                         help="--with-translate の英訳経由の抽出結果を保存・再利用するファイル")
+    parser.add_argument("--components", default="ginza", choices=["ginza", "llm"],
+                        help="--method llm-select の土台。ginza: 通常のGiNZAの規則／llm: 構成要素をLLMで先に取り出し、"
+                             "GiNZAはそれを分割せずに規則で関係を取る（LLMの呼び出しが1件あたり1回増える）")
+    parser.add_argument("--votes", type=int, default=1, choices=[1, 2],
+                        help="--method llm-select の③で、LLMに2回聞いて一致したものだけ追加するなら 2（精度重視・時間は約2倍）")
     parser.add_argument("--sample", type=int, default=0,
                         help="全体から等間隔にN件を選んで評価する（予備実験用。例：--sample 50）")
     parser.add_argument("--select-cache", default="select_cache.json",
@@ -15963,6 +16365,12 @@ def main_eval():
     if not args.external and base532.exists():
         folds = cv_folds({c["id"]: c["text"] for c in json.load(open(base532, encoding="utf-8"))})
         fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
+    if args.method == "a2":
+        pass  # （統合済み）import llm_select
+        fold_of = {}
+        select_cache = _load_llm_cache(args.select_cache) or {}
+        ls_modes = {}
+        print(f"最終方式（A2：構成要素をLLMで固定したGiNZAの規則）で評価します。LLMの出力の保存先: {args.select_cache}")
     if args.method == "llm-select":
         pass  # （統合済み）import llm_select
         fold_of = {}
@@ -15970,7 +16378,7 @@ def main_eval():
         translate_cache = (_load_llm_cache(args.translate_cache) or {}) if args.with_translate else None
         ls_modes = {}
         print(f"学習なしの方法（GiNZAの規則＋LLMの抽出→LLMによる選別→ルールで整理）で評価します。"
-              f"候補の範囲: {args.pool}／英訳経由の候補: {'あり' if args.with_translate else 'なし'}／"
+              f"候補の範囲: {args.pool}／土台: {args.components}／確認の回数: {args.votes}／"
               f"選別の出力の保存先: {args.select_cache}")
     if args.method == "model" and any(c["id"] in fold_of for c in claims):
         import numpy as _np
@@ -15992,12 +16400,28 @@ def main_eval():
         ls_variants = None
         try:
             extra = {}
-            if args.method == "llm-select":
+            if args.method == "a2":
+                info, judged, _raw = analyze_claim_a2(ts, pp, c["text"], cache=select_cache,
+                                                                 model=args.model, host=args.host)
+                ls_modes[info.get("mode")] = ls_modes.get(info.get("mode"), 0) + 1
+                if info.get("mode") != "llm":
+                    print(f"  注意: {cid} は {str(_raw)[:120]}")
+                predicted = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"],
+                              "type": "a2"} for cc, j in zip(info["cands"], judged) if j["selected"]]
+                ls_variants = {
+                    "A 通常のGiNZAの規則": [cc for cc in info["cands"] if any(x.startswith("G:") for x in cc["srcs"])],
+                    "A2 最終方式（構成要素をLLMで固定）": predicted,
+                }
+                _save_llm_cache(args.select_cache, select_cache)
+            elif args.method == "llm-select":
                 info, judged, _raw = analyze_claim_ls(ts, pp, c["text"], llm_cache=llm_cache,
                                                               select_cache=select_cache, claim_id=cid,
                                                               model=args.model, host=args.host, pool=args.pool,
                                                               with_translate=args.with_translate,
-                                                              translate_cache=translate_cache)
+                                                              translate_cache=translate_cache, votes=args.votes,
+                                                              components=args.components)
+                if info.get("component_error"):
+                    print(f"  注意: {cid} の構成要素の取り出しに失敗: {info['component_error'][:120]}")
                 if info.get("translate_error"):
                     print(f"  注意: {cid} の英訳経由の抽出に失敗: {info['translate_error'][:120]}")
                 ls_modes[info.get("mode")] = ls_modes.get(info.get("mode"), 0) + 1
@@ -16012,10 +16436,13 @@ def main_eval():
                     "B LLMの直接抽出（タグ付き日本語）": [cc for cc in _cs
                                                   if "LLM" in families(cc["srcs"])],
                 }
+                if args.components == "llm":
+                    ls_variants["A2 構成要素をLLMで固定したGiNZAの規則"] = [
+                        cc for cc in _cs if any(x.startswith("GF:") for x in cc["srcs"]) or "ST:工程" in cc["srcs"]]
                 if args.with_translate:
                     ls_variants["C 英訳経由（タグ付き→英訳）"] = [cc for cc in _cs
                                                           if "英訳" in families(cc["srcs"])]
-                ls_variants["D 学習なし方式（本体：確認・追加＋整理）"] = predicted
+                ls_variants["D 学習なし方式（本体：規則＋LLMの追加＋整理）"] = predicted
                 ls_variants["参考：候補すべて（Recallの上限）"] = _cs
                 _save_llm_cache(args.select_cache, select_cache)
                 if translate_cache is not None:
@@ -16042,7 +16469,7 @@ def main_eval():
                                       for lv in LOOSE_LEVELS}
             # 構造評価（ノードの同一視の規則を正解と抽出の両方にかけてから、部分一致で比べる）
             metrics["構造評価"] = structure_counts(pp, predicted, gold)
-            if args.method == "llm-select" and ls_variants:
+            if args.method in ("llm-select", "a2") and ls_variants:
                 metrics["方式の比較"] = {
                     name: dict(structure_counts(pp, pv, gold),
                                exact=evaluate_triples_exact(pp, pv, gold)["正解数"],
@@ -16146,6 +16573,12 @@ def main_eval():
     agg = _aggregate(per_claim)
 
     print("\n=== 集計 ===")
+    if args.method == "a2":
+        print(f"構成要素をLLMで取り出せた件数: {ls_modes.get('llm', 0)}／LLMを呼べず通常のGiNZAの規則で代用: "
+              f"{ls_modes.get('rules', 0)}")
+        if ls_modes.get("rules"):
+            print("  ※ LLMを呼べなかった請求項があります。この結果は最終方式の正しい評価ではありません。"
+                  "Ollama を起動して（ollama serve）もう一度実行してください（--resume で続きから）。")
     if args.method == "llm-select":
         print(f"LLMによる選別が使えた件数: {ls_modes.get('llm', 0)}／③が失敗し規則で代用: {ls_modes.get('both', 0)}"
               f"／GiNZAの規則だけ: {ls_modes.get('rules', 0)}")
@@ -16193,7 +16626,11 @@ def main_eval():
                 sP, sR, sF = prf_counts(t["struct"], t["n_pred"], t["n_gold"])
                 print(f"{name:<34}{t['n_pred_raw'] / len(rows):>8.1f}{100 * eP:>10.1f}{100 * eR:>7.1f}{100 * eF:>7.1f}"
                       f"{100 * sP:>9.1f}{100 * sR:>7.1f}{100 * sF:>7.1f}")
-            print("（A・B・C は選別の前の各方式の出力そのもの。D は規則の結果を土台に、LLM が誤りを削除し全系統の候補から追加し、ルールで整理したもの）")
+            if args.method == "llm-select":
+                print("（A・B・C は選別の前の各方式の出力そのもの。D は規則の結果に、LLM が候補から選んだ関係を追加し、"
+                      "ルールで整理したもの）")
+            else:
+                print("（A は構成要素を固定しない通常のGiNZAの規則、A2 は構成要素をLLMで固定したGiNZAの規則＋構造の整理）")
 
     # 【(type, 関係語)ごとのPrecision表】claim_title_ginza / ginza_has_fallback /
     # attribute（＝GiNZA由来のフォールバックで、LLMの自由な言い換えと違って
@@ -16234,7 +16671,8 @@ sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FI
 node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=LEAD, MAX_NODES=MAX_NODES, NOUNISH=NOUNISH, OWNER_LABELS=OWNER_LABELS, QTY_RE=QTY_RE, _chains=_chains, _coord_partner=_coord_partner, _units=_units, keep_pair=keep_pair, node_pair_candidates=node_pair_candidates, pairs_in_segment=pairs_in_segment, segment_nodes=segment_nodes)
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
 struct_extra = _types.SimpleNamespace(CONJ=CONJ, HAS_STEMS=HAS_STEMS, LEAD_RE=LEAD_RE, NOT_ITEM_RE=NOT_ITEM_RE, STEP_END_RE=STEP_END_RE, _clean=_clean, _np_left=_np_left, _span_text=_span_text, coord_expansions=coord_expansions, doc_text=doc_text, find_lists=find_lists, step_candidates=step_candidates)
-llm_select = _types.SimpleNamespace(LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, POOLS=POOLS, SELECT_SYSTEM=SELECT_SYSTEM, _ITEM_RE=_ITEM_RE, _add=_add, _chat_cached=_chat_cached, _family=_family, analyze_claim=analyze_claim_ls, build_rule_and_llm_candidates=build_rule_and_llm_candidates, families=families, group_pairs=group_pairs, is_base=is_base, judge=judge, parse_answer=parse_answer, parse_selection=parse_selection, select_prompt=select_prompt, select_with_llm=select_with_llm, tidy=tidy, translate_relations=translate_relations)
+comp_first = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS, COMPONENT_SYSTEM=COMPONENT_SYSTEM, NOUNISH=NOUNISH_cf, _nounish=_nounish, _pattern=_pattern, extract_components_llm=extract_components_llm, forced_relations=forced_relations, guard_names=guard_names, llm_component_relations=llm_component_relations, parse_components=parse_components)
+llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, SELECT_SYSTEM=SELECT_SYSTEM, _GA_FIX_RE=_GA_FIX_RE, _HAS_RELS=_HAS_RELS, _ITEM_RE=_ITEM_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _add=_add, _chat_cached=_chat_cached, _family=_family, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, clean_node=clean_node, families=families, grounded=grounded, group_pairs=group_pairs, is_base=is_base, judge=judge, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, tidy=tidy, translate_relations=translate_relations)
 platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, ts=ts)
 

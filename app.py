@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-25f"
+NEED_PIPELINE = "2026-09-25k"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -249,49 +249,37 @@ def duplicate_flags(gpp, info, keys):
             for c in info["cands"]]
 
 
-METHODS = ["学習なし：GiNZA規則＋LLM抽出 → LLMが確認・追加 → ルールで整理", "比較用：学習済み選別モデル（実験14）"]
+METHODS = ["最終方式（学習なし）：LLMで構成要素を固定 → GiNZAの規則", "比較用：学習済み選別モデル（実験14）"]
 if "_select_cache" not in st.session_state:
     st.session_state["_select_cache"] = {}
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
-def analyze_llm(text, model, host, pool="wide", with_translate=False):
-    """学習データを使わない解析：GiNZAの規則＋LLMの抽出の候補を、もう一度LLMに見せて選ばせ、ルールで整理する。"""
+def analyze_llm(text, model, host):
+    """最終方式（A2・学習なし）：LLMで構成要素を先に取り出して固定し、GiNZAの規則で関係を取り出す。"""
     gpp = load_pipeline()
     t0 = time.time()
-    info, judged, raw = pp.llm_select.analyze_claim(ts, gpp, text, select_cache=st.session_state["_select_cache"],
-                                                   model=model, host=host, pool=pool, with_translate=with_translate,
-                                                   translate_cache=st.session_state.setdefault("_translate_cache", {}))
+    info, judged, raw = pp.llm_select.analyze_claim_a2(ts, gpp, text, cache=st.session_state["_select_cache"],
+                                                      model=model, host=host)
     cands = []
     for c, j in zip(info["cands"], judged):
         cands.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
                       "prob": j["score"], "selected": j["selected"], "status": j["status"],
-                      "origin": (PC.origin_label(c.get("srcs", [])) or "") + "／" + j["basis"],
-                      "srcs": list(c.get("srcs", []))})
+                      "origin": j["basis"], "srcs": list(c.get("srcs", []))})
     cands.sort(key=lambda r: -r["prob"])
     cands = tidy_candidates(cands)
-    fams = [pp.llm_select.families(c["srcs"]) for c in info["cands"]]
-    n_rule = sum("規則" in f for f in fams)
-    n_llm = sum("LLM" in f for f in fams)
-    n_en = sum("英訳" in f for f in fams)
     mode = info.get("mode", "llm")
-    n_sel = sum(j["selected"] for j in judged)
-    steps = [("前処理・構成要素の抽出（GiNZA）", f"構成要素 {len(info['tags'])} 個／形式：{info.get('format', '―')}"),
-             ("① GiNZAの規則による抽出" + ("（広め）" if info.get("pool") == "wide" else ""), f"候補 {n_rule} 件"),
-             ("② LLMの直接抽出", f"候補 {n_llm} 件" if mode != "rules" else "LLMを呼べませんでした")]
-    if with_translate:
-        steps.append(("②' 英訳経由の抽出", f"候補 {n_en} 件" if not info.get("translate_error")
-                      else "英訳でエラー：" + str(info["translate_error"])[:60]))
-    steps += [
-             ("候補の統合（重複をまとめる）", f"候補 {len(info['cands'])} 件"),
-             ("③ LLMによる確認と追加",
-              f"規則の結果 {info.get('n_base', 0)} 件から {info.get('n_deleted', 0)} 件を削除、"
-              f"{info.get('n_added', 0)} 件を追加" if mode == "llm" else
-              f"LLMを呼べなかったため、GiNZAの規則の結果 {n_sel} 件を採用"),
-             ("④ ルールによる整理", "同じ組の重複を1件にまとめ、採用 %d 件／要確認 %d 件"
-              % (sum(j["status"] == "採用" for j in judged), sum(j["status"] == "要確認" for j in judged)))]
-    bands = {"accept": 0.8, "threshold": 0.8, "review_low": 0.5, "method": "llm_select"}
-    return {"tags": list(info["tags"]), "title": info.get("title"), "format": info.get("format", ""),
+    used = info.get("components_used") or []
+    steps = [("前処理（GiNZA：形態素・係り受け解析）", f"形式：{info.get('format', '―')}"),
+             ("① 構成要素の取り出し（LLM）", f"{len(used)} 個" if mode == "llm" else "LLMを呼べませんでした"),
+             ("② 境界の確認（名詞まとまり）", "本文の名詞のまとまりに合う名前だけを使用" if mode == "llm" else "―"),
+             ("③ GiNZAの規則による関係の抽出", "構成要素を1語に固定して解析" if info.get("base_kind") == "GF"
+              else "通常のGiNZAの規則（構成要素の固定なし）"),
+             ("④ 構造の整理", "数量の言葉・題名の揺れ・方法の工程などを整理"),
+             ("判定", "採用 %d 件／要確認 %d 件" % (sum(j["status"] == "採用" for j in judged),
+                                          sum(j["status"] == "要確認" for j in judged)))]
+    bands = {"accept": 0.8, "threshold": 0.8, "review_low": 0.5, "method": "a2"}
+    return {"tags": list(used) or list(info["tags"]), "title": info.get("title"), "format": info.get("format", ""),
             "cands": cands, "steps": steps, "bands": bands, "elapsed": time.time() - t0, "raw": str(raw)[:2000],
             "mode": mode}
 
@@ -332,7 +320,7 @@ def analyze(text, model, host):
 def run_analyze(text):
     host = (ollama_host or "").strip() or None
     if extract_method == METHODS[0]:
-        return analyze_llm(text, model_name, host, pool_choice, use_translate)
+        return analyze_llm(text, model_name, host)
     return analyze(text, model_name, host)
 
 
@@ -416,7 +404,7 @@ def editor_config():
         "確率": st.column_config.ProgressColumn(
             "確からしさ", min_value=0.0, max_value=1.0, format="%.2f",
             help="学習なしの方法では、判定の根拠を数値にした目安（採用＋2系統以上 1.0／採用＋1系統 0.8／採用されなかった"
-                 "2系統以上 0.5／LLMが削除した規則の結果 0.3／それ以外 0.1。LLMを呼べないときは GiNZAの規則の結果 0.6）。比較用の学習済み選別モデルでは、"
+                 "2系統以上 0.5／それ以外 0.1。LLMを呼べないときは GiNZAの規則の結果 0.6）。比較用の学習済み選別モデルでは、"
                  "モデルが見積もった「正しい見込み」（確率）。"),
         "判定": st.column_config.TextColumn("AIの判定", disabled=True),
         "抽出元": st.column_config.TextColumn("抽出元", disabled=True),
@@ -458,18 +446,10 @@ with st.sidebar:
         ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
     st.markdown("### 🧪 抽出方法")
     extract_method = st.radio("抽出方法", METHODS, key="extract_method", label_visibility="collapsed",
-                              help="学習なし：GiNZAの規則とLLMの抽出で候補を広めに出し、請求項と候補をもう一度LLMに見せて"
-                                   "選ばせ、ルールで整理する（学習データを使わない）。比較用：532件で学習した選別モデル（実験14）。")
+                              help="最終方式（学習なし）：LLMで構成要素の名前を取り出し、新森らの「名詞まとまり」で境界を確かめ、"
+                                   "GiNZAの解析でその名前を1語に固定してから、GiNZAの規則で関係を取り出す。"
+                                   "比較用：532件で学習した選別モデル（実験14）。")
     st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
-    pool_choice, use_translate = "wide", False
-    if extract_method == METHODS[0]:
-        pool_choice = st.radio("候補の範囲", ["wide", "standard"], format_func=lambda k: {
-            "wide": "広め（Recall重視・既定）", "standard": "標準（速い）"}[k], key="pool_choice",
-            help="広め：GiNZAの係り受け・区間の主役・題名・同一ノードの結合の規則の候補も加えて、取りこぼしを減らす"
-                 "（532件で、候補に正解が含まれる割合 55.5% → 約71%）。LLMの選別の呼び出しは1件あたり2〜3回に増える。")
-        use_translate = st.checkbox("英訳経由の候補も加える（方式C・時間がかかる）", key="use_translate",
-                                    help="タグ付きの請求項をLLMで英訳し、英語の文の規則で取り出した関係も候補に加える。"
-                                         "LLMの呼び出しが1件あたり数回増える。予備実験で効果を確かめてから使う。")
 
 
 # ===========================================================================
@@ -776,19 +756,16 @@ def analyze_body():
 
     st.markdown("#### ② AIの判定")
     status_badges(Counter(c["status"] for c in res["cands"]))
-    if res["bands"].get("method") == "llm_select":
+    if res["bands"].get("method") == "a2":
         if res.get("mode") == "rules":
-            st.warning("LLM（Ollama）を呼べなかったため、GiNZAの規則だけで判定しました。Ollamaを起動して"
-                       "（ollama serve／ollama pull qwen3.5:9b）解析し直すと、②LLMの直接抽出と③LLMの選別が使われます。")
-        elif res.get("mode") == "both":
-            st.warning("③でLLMを呼べなかったため、GiNZAの規則の結果をそのまま採用にしました。")
-        st.caption("採用：GiNZAの規則の結果のうち③でLLMが削除しなかった関係と、LLMが追加した関係（④で同じ組の重複を"
-                   "整理した後）／要確認：LLMが削除した規則の結果、2つ以上の系統（GiNZAの規則・LLMの直接抽出・英訳経由）が"
-                   "出したが追加されなかった関係、④で外した別表現（取りこぼしを防ぐため表に残します。正しければ「採用する」に"
-                   "チェック）／除外：それ以外（表では非表示。下の「全候補」で見られます）。「確からしさ（目安）」は学習した"
-                   "確率ではなく、判定の根拠を数値にしたもの（採用＋2系統以上 1.0／採用＋1系統 0.8／採用されなかった2系統以上 "
-                   "0.5／LLMが削除した規則の結果 0.3／それ以外 0.1）。")
-        with st.expander("③ LLMの出力（そのまま）"):
+            st.warning("LLM（Ollama）を呼べなかったため、構成要素を固定しない通常のGiNZAの規則で判定しました。Ollamaを起動して"
+                       "（ollama serve／ollama pull qwen3.5:9b）解析し直すと、LLMで構成要素を固定した最終方式で解析されます。")
+        st.caption("採用：LLMで取り出して境界を確かめた構成要素を1語に固定し、GiNZAの規則で取り出した関係（方法の請求項の"
+                   "工程を含む）／要確認：構成要素を固定しない通常のGiNZAの規則だけが出した関係（取りこぼしを防ぐため表に"
+                   "残します。正しければ「採用する」にチェック）／除外：それ以外（表では非表示。下の「全候補」で見られます）。"
+                   "「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの（採用で通常の規則とも一致 1.0／"
+                   "採用 0.8／要確認 0.5／除外 0.1）。")
+        with st.expander("LLMが書き出した構成要素（そのまま）"):
             st.code(res.get("raw", ""))
     else:
         st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
@@ -829,7 +806,7 @@ def analyze_body():
     with st.expander("請求項の本文（構成要素を図と同じ色でマーク）"):
         st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(res['text'], colors)}</div>",
                     unsafe_allow_html=True)
-    _pl = "確からしさ" if res["bands"].get("method") == "llm_select" else "確率"
+    _pl = "確からしさ" if res["bands"].get("method") in ("llm_select", "a2") else "確率"
     with st.expander(f"除外した候補も含めた全候補（{_pl}の順）"):
         st.dataframe(pd.DataFrame([{k: c[k] for k in ("status", "prob", "source", "relation", "target", "origin")}
                                    for c in res["cands"]]).rename(columns={
