@@ -9,7 +9,8 @@
 任意の特許リスト（J-PlatPat などから出力した CSV／Excel）を読み込み、請求項から
 SAO（主語―関係―目的語）構造を取り出して、人が確認・修正しながら分析する
 「人とAIの協働型」の特許分析ツール。抽出方法は、532件の正解データで最も精度の
-高かった実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）に固定している。
+標準は学習データを使わない方法（GiNZAの規則＋LLMの直接抽出 → LLMによる選別）。比較用に、532件で学習した
+選別モデル（実験14）にも切り替えられる（sao_selector14_train.npz があるときだけ）。
 
 ページ構成（サイドバーのナビゲーション）
   データ
@@ -69,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-25"
+NEED_PIPELINE = "2026-09-25c"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -248,6 +249,43 @@ def duplicate_flags(gpp, info, keys):
             for c in info["cands"]]
 
 
+METHODS = ["学習なし：GiNZA規則＋LLM抽出 → LLMが選別", "比較用：学習済み選別モデル（実験14）"]
+if "_select_cache" not in st.session_state:
+    st.session_state["_select_cache"] = {}
+
+
+@st.cache_data(show_spinner=False, max_entries=2000)
+def analyze_llm(text, model, host):
+    """学習データを使わない解析：GiNZAの規則＋LLMの直接抽出の候補を、もう一度LLMに見せて選ばせる。"""
+    gpp = load_pipeline()
+    t0 = time.time()
+    info, judged, raw = pp.llm_select.analyze_claim(ts, gpp, text, select_cache=st.session_state["_select_cache"],
+                                                   model=model, host=host)
+    cands = []
+    for c, j in zip(info["cands"], judged):
+        cands.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
+                      "prob": j["score"], "selected": j["selected"], "status": j["status"],
+                      "origin": (PC.origin_label(c.get("srcs", [])) or "") + "／" + j["basis"],
+                      "srcs": list(c.get("srcs", []))})
+    cands.sort(key=lambda r: -r["prob"])
+    cands = tidy_candidates(cands)
+    n_rule = sum(1 for c in info["cands"] if any(not s.startswith(("E1:llm_direct", "LLMraw")) for s in c["srcs"]))
+    n_llm = sum(1 for c in info["cands"] if any(s.startswith(("E1:llm_direct", "LLMraw")) for s in c["srcs"]))
+    mode = info.get("mode", "llm")
+    n_sel = sum(j["selected"] for j in judged)
+    steps = [("前処理・構成要素の抽出（GiNZA）", f"構成要素 {len(info['tags'])} 個／形式：{info.get('format', '―')}"),
+             ("① GiNZAの規則による抽出", f"候補 {n_rule} 件"),
+             ("② LLMの直接抽出", f"候補 {n_llm} 件" if mode != "rules" else "LLMを呼べませんでした"),
+             ("候補の統合（重複をまとめる）", f"候補 {len(info['cands'])} 件"),
+             ("③ LLMによる選別", f"選ばれた関係 {n_sel} 件" if mode == "llm" else
+              f"LLMを呼べなかったため、①②の両方が出した {n_sel} 件を採用" if mode == "both" else
+              f"LLMを呼べなかったため、GiNZAの規則の結果 {n_sel} 件を採用")]
+    bands = {"accept": 0.8, "threshold": 0.8, "review_low": 0.5, "method": "llm_select"}
+    return {"tags": list(info["tags"]), "title": info.get("title"), "format": info.get("format", ""),
+            "cands": cands, "steps": steps, "bands": bands, "elapsed": time.time() - t0, "raw": str(raw)[:2000],
+            "mode": mode}
+
+
 @st.cache_data(show_spinner=False, max_entries=2000)
 def analyze(text, model, host):
     """1件の請求項を解析し、処理の各段階と全候補の判定を返す。"""
@@ -282,7 +320,10 @@ def analyze(text, model, host):
 
 
 def run_analyze(text):
-    return analyze(text, model_name, (ollama_host or "").strip() or None)
+    host = (ollama_host or "").strip() or None
+    if extract_method == METHODS[0]:
+        return analyze_llm(text, model_name, host)
+    return analyze(text, model_name, host)
 
 
 def llm_extract(text):
@@ -324,7 +365,7 @@ def sao_graph(relations, key="main", colors=None):
     view = c4.radio("表示", ["図と構造", "構造だけを大きく"], key=f"g_view_{key}", horizontal=True)
     focus = None if focus == ALL else focus
     legend = ("<div style='font-size:.8rem;opacity:.8;margin:2px 0 6px'>色＝構成要素（同じ部品は同じ色。請求項の本文の"
-              "マークとも同じ色）／上から下へ：上位概念（主語）→ 関係 → 下位概念（目的語）</div>")
+              "マークとも同じ色）／矢印の向き：主語 → 関係 → 目的語</div>")
     if view == "構造だけを大きく":
         st.markdown(legend, unsafe_allow_html=True)
         st.markdown("<div style='border:1px solid rgba(148,163,184,.5);border-radius:10px;padding:14px 18px'>"
@@ -363,9 +404,10 @@ def editor_config():
     return {
         "採用する": st.column_config.CheckboxColumn("採用する", help="チェックした関係だけが確定されます"),
         "確率": st.column_config.ProgressColumn(
-            "確率", min_value=0.0, max_value=1.0, format="%.2f",
-            help="AI（選別モデル）が見積もった「この関係が正しい見込み」（0〜1）。1に近いほど確か。"
-                 "正解データ532件で確かめると、0.57以上で選ばれた「採用」は約8割が正しかった。"),
+            "確からしさ", min_value=0.0, max_value=1.0, format="%.2f",
+            help="学習なしの方法では、判定の根拠を数値にした目安（LLMが選んだ＋規則とLLMの両方が出した 1.0／LLMが選んだ 0.8／"
+                 "選ばれなかったが規則とLLMの両方が出した 0.5／それ以外 0.1。LLMを呼べないときは GiNZAの規則の結果 0.6）。比較用の学習済み選別モデルでは、"
+                 "モデルが見積もった「正しい見込み」（確率）。"),
         "判定": st.column_config.TextColumn("AIの判定", disabled=True),
         "抽出元": st.column_config.TextColumn("抽出元", disabled=True),
     }
@@ -404,7 +446,11 @@ with st.sidebar:
         st.info("💻 ローカルモード：このPCのOllamaに接続します", icon="💻")
         model_name = st.text_input("Ollamaモデル名", value=ts.DEFAULT_MODEL)
         ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
-    st.caption(f"抽出方法：{PC.METHOD_NAME}。{PC.METHOD_SCORE}。")
+    st.markdown("### 🧪 抽出方法")
+    extract_method = st.radio("抽出方法", METHODS, key="extract_method", label_visibility="collapsed",
+                              help="学習なし：GiNZAの規則とLLMの直接抽出で候補を出し、請求項と候補をもう一度LLMに見せて"
+                                   "正しいものを選ばせる（学習データを使わない）。比較用：532件で学習した選別モデル（実験14）。")
+    st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
 
 
 # ===========================================================================
@@ -427,7 +473,7 @@ def page_data():
             "J-PlatPat などから出力した **CSV／Excel** を読み込みます。文献番号・発明の名称・出願人・FI・出願日の列は"
             "自動で見つけます。**J-PlatPat の CSV には請求項が入っていない**ので、その場合は書誌情報だけで読み込み、"
             "あとから「📝 請求項を追加」で請求項を足して解析します（書誌情報だけでも Patent World・FIレーダー・"
-            "技術分布は使えます）。請求項の列がある表なら、読み込みと同時に実験14の方法で解析します。")
+            "技術分布は使えます）。請求項の列がある表なら、読み込みと同時に、サイドバーで選んだ抽出方法で解析します。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
         pasted = st.text_area("または、請求項を「-----」で区切って貼り付け（書誌情報なしで解析）", height=120,
                               key="ds_paste")
@@ -510,9 +556,10 @@ def page_data():
 def analyze_dataset_patents(pids):
     """読み込み済みのデータセットの特許（請求項あり・未解析）を解析し、その場で結果を入れる。"""
     try:
-        with st.spinner("選別モデルを準備中…"):
+        with st.spinner("解析の準備中…"):
             load_pipeline()
-            load_selector()
+            if extract_method != METHODS[0]:
+                load_selector()
     except Exception as exc:  # noqa: BLE001
         st.error("解析の準備に失敗しました。")
         st.exception(exc)
@@ -603,9 +650,10 @@ def run_ingest(ing):
         finish_ingest(ing)
         return
     try:
-        with st.spinner("選別モデルを準備中…"):
+        with st.spinner("解析の準備中…"):
             load_pipeline()
-            load_selector()
+            if extract_method != METHODS[0]:
+                load_selector()
     except Exception as exc:  # noqa: BLE001
         st.error("解析の準備に失敗しました。")
         st.exception(exc)
@@ -661,7 +709,7 @@ def finish_ingest(ing, partial=False):
 # ===========================================================================
 
 def analyze_body():
-    st.caption(f"請求項を1件、{PC.METHOD_NAME}で解析し、処理の各段階とAIの判定（採用／要確認／除外）を表示します。"
+    st.caption(f"請求項を1件、{PC.METHOD_NAME if extract_method == METHODS[0] else PC.MODEL_METHOD_NAME}で解析し、処理の各段階とAIの判定（採用／要確認／除外）を表示します。"
                "結果は表で修正してから確定できます。")
     col1, col2 = st.columns([3, 1])
     with col2:
@@ -709,9 +757,21 @@ def analyze_body():
 
     st.markdown("#### ② AIの判定")
     status_badges(Counter(c["status"] for c in res["cands"]))
-    st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
-               f"採用：確率 {res['bands']['accept']:.2f} 以上で選ばれた関係（正解データでは約8割が正しい）／"
-               f"要確認：選ばれたがそれ未満、または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外（表では非表示）")
+    if res["bands"].get("method") == "llm_select":
+        if res.get("mode") == "rules":
+            st.warning("LLM（Ollama）を呼べなかったため、GiNZAの規則だけで判定しました。Ollamaを起動して"
+                       "（ollama serve／ollama pull qwen2.5:7b）解析し直すと、②LLMの直接抽出と③LLMの選別が使われます。")
+        elif res.get("mode") == "both":
+            st.warning("③の選別でLLMを呼べなかったため、①GiNZAの規則と②LLMの直接抽出の両方が出した関係を採用にしました。")
+        st.caption("採用：③でLLMが選んだ関係／要確認：選ばれなかったが、①GiNZAの規則と②LLMの直接抽出の両方が出した関係／"
+                   "除外：それ以外（表では非表示）。「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの"
+                   "（選ばれた＋①②の両方 1.0／選ばれた＋片方 0.8／選ばれなかった＋両方 0.5／それ以外 0.1）。")
+        with st.expander("③ LLMの選別の出力（そのまま）"):
+            st.code(res.get("raw", ""))
+    else:
+        st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
+                   f"採用：確率 {res['bands']['accept']:.2f} 以上で選ばれた関係（正解データでは約8割が正しい）／"
+                   f"要確認：選ばれたがそれ未満、または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外（表では非表示）")
 
     st.markdown("#### ③ 確認・修正")
     st.caption("「採用する」のチェックを付け外しし、主語・関係・目的語は直接書き換えられます。表の一番下の行から関係を追加できます。")
@@ -747,10 +807,11 @@ def analyze_body():
     with st.expander("請求項の本文（構成要素を図と同じ色でマーク）"):
         st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(res['text'], colors)}</div>",
                     unsafe_allow_html=True)
-    with st.expander("除外した候補も含めた全候補（確率順）"):
+    _pl = "確からしさ" if res["bands"].get("method") == "llm_select" else "確率"
+    with st.expander(f"除外した候補も含めた全候補（{_pl}の順）"):
         st.dataframe(pd.DataFrame([{k: c[k] for k in ("status", "prob", "source", "relation", "target", "origin")}
                                    for c in res["cands"]]).rename(columns={
-            "status": "判定", "prob": "確率", "source": "主語", "relation": "関係", "target": "目的語", "origin": "抽出元"}),
+            "status": "判定", "prob": _pl, "source": "主語", "relation": "関係", "target": "目的語", "origin": "抽出元"}),
             hide_index=True, use_container_width=True)
 
 

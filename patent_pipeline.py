@@ -11899,7 +11899,7 @@ def _tree_levels(rels):
     return names, level
 
 
-def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, show_labels=True, show_roles=True,
+def relations_to_tree_dot(relations, direction="TB", focus=None, groups=None, show_labels=True, show_roles=False,
                           show_cross=False, colors=None):
     """階層図：一番上に主語（上位概念）、その下に「関係」を挟んで目的語（下位概念）を並べる木の形の図。
     同じ主語・同じ関係の目的語はまとめて枝分かれさせる。階層を上に戻る関係や、同じ階層どうしの関係は、
@@ -13539,6 +13539,372 @@ def analyze_claim_selected14(ts, pp, selector, text, threshold=None, max_per_pai
 
 
 # ===========================================================================
+# 【統合】struct_extra.py
+# ===========================================================================
+"""
+struct_extra.py
+================
+【実験15】分野によらない2つの文の構造の規則で、候補を足す。
+
+(1) 並列の展開（COORD）
+    「A、B、C及びDから構成されるX」「A、B及びCを含み」のような列挙では、係り受け解析が並列を
+    取り違えやすく（「しょうが」を「しょう＋が」と切る等）、最後の要素Dとの組しか候補に出ないことが多い。
+    本文の「、」と「及び・および・並びに・又は・または」から列挙を見つけ、既にある候補 (X, r, D)・(D, r, X)
+    の D を、列挙の他の要素に置き換えた候補を足す。正解データの作成基準でも、並列は要素ごとに
+    別の三つ組にしている。
+
+(2) 方法の請求項の工程（STEP）
+    「〜を〜する工程と、」「〜段階と、」「〜ステップと、」で終わる区間を1つの工程とみなし、
+    ・工程の名前：「混合工程」のような名詞ならそのまま、「原材料を容器に入れる段階」のような動詞句なら、
+      目的語（なければ斜格の名詞）から「工程」までを名前にする（前置きの修飾と「前記」は除く）
+    ・（題名, 含む／備える／有する, 工程）…題名は「Xの製造方法」のような長い名前も候補にする
+    ・（工程, 動詞, 動詞の項の名詞）…「原材料を容器に入れる段階」→（…段階, 入れる, 原材料）（…段階, 入れる, 容器）
+    を候補にする。どれを採るかは選別モデルが判断する。
+"""
+import re
+
+pass  # （統合済み）import claim_segmenter as CS
+pass  # （統合済み）import dep_pairs as D
+
+CONJ = r"(?:及び|および|並びに|ならびに|又は|または)"
+LEAD_RE = re.compile(r"^(前記|該|上記|当該|複数の|少なくとも一つの|少なくとも１つの)+")
+NOT_ITEM_RE = re.compile(r"(を|に|で|は|から|より|する|した|され|れる|れた|て|であって|において|備え|有し|含み)$|[をにで]")
+STEP_END_RE = re.compile(r"(工程|段階|ステップ)。?$")
+HAS_STEMS = [("含み", "含む"), ("含む", "含む"), ("備え", "備える"), ("有し", "有する"), ("有する", "有する"),
+             ("具備", "具備する")]
+
+
+def _clean(x):
+    x = LEAD_RE.sub("", x.strip())
+    return x.replace("前記", "").replace("当該", "")
+
+
+def find_lists(text, known):
+    """本文中の列挙を見つけて [[要素, ...], ...] を返す。known: 既知のノード名（最後の要素の切り出しに使う）。"""
+    out = []
+    known_sorted = sorted({k for k in known if k}, key=len, reverse=True)
+    for m in re.finditer(CONJ, text):
+        left, right = text[:m.start()], text[m.end():]
+        # 最後の要素：既知のノード名で一番長く一致するもの。無ければ助詞の手前まで
+        r = LEAD_RE.sub("", right)
+        last = next((k for k in known_sorted if r.startswith(k)), None)
+        if last is None:
+            mm = re.match(r"^([^、。，\s]{1,25}?)(?=から|を|に|が|は|で|と|の|、|。|より)", r)
+            last = mm.group(1) if mm else None
+        if not last:
+            continue
+        pieces = left.split("、")
+        items = []
+        for k in range(len(pieces) - 1, -1, -1):
+            pc = _clean(pieces[k].split("\n")[-1])
+            if k < len(pieces) - 1 and (not pc or len(pc) > 25 or NOT_ITEM_RE.search(pc)):
+                break
+            if k == len(pieces) - 1:
+                # 接続詞の直前の要素（「しょうが」のように末尾が助詞に見える語もそのまま使う）
+                if not pc or len(pc) > 25 or re.search(r"[をにで]$|する$|れる$|した$", pc):
+                    items = []
+                    break
+            items.append(pc)
+            if len(items) >= 30:
+                break
+        items = list(reversed(items))
+        if items:
+            out.append(items + [_clean(last)])
+    return out
+
+
+def coord_expansions(text, cands, n):
+    """既にある候補の一方の端が列挙の要素なら、他の要素に置き換えた候補を作る。"""
+    known = {c["source"] for c in cands} | {c["target"] for c in cands}
+    lists = find_lists(text, known)
+    out = []
+    for items in lists:
+        norm_items = [n(x) for x in items]
+        pos = {x: i for i, x in enumerate(norm_items)}
+        last = len(items) - 1
+        for c in cands:
+            other = {"source": n(c["target"]), "target": n(c["source"])}
+            for side in ("source", "target"):
+                v = n(c[side])
+                # 係り受け解析は列挙の最後（か最初）の要素だけを相手と結ぶことが多いので、その候補だけを広げる
+                if v not in pos or pos[v] not in (0, last) or other[side] in pos:
+                    continue
+                for j, it in enumerate(items):
+                    if n(it) == v:
+                        continue
+                    d = {"source": c["source"], "relation": c["relation"], "target": c["target"]}
+                    d[side] = it
+                    out.append(dict(d, side=side, n_items=len(items), pos=j, from_pos=pos[v]))
+    return out
+
+
+def _span_text(doc, i0, i1):
+    return "".join(t.text for t in doc[i0:i1 + 1])
+
+
+def _np_left(tok, stop):
+    """名詞句の左端（連体修飾の節・「前記」は含めない）。"""
+    left = tok.i
+    for c in tok.children:
+        if c.i < tok.i and c.dep_ in ("compound", "nmod", "nummod", "case") and c.i > stop:
+            if c.dep_ == "nmod":
+                left = min(left, _np_left(c, stop))
+            else:
+                left = min(left, c.i)
+    while left < tok.i and doc_text(tok.doc[left]) in ("前記", "該", "上記", "当該"):
+        left += 1
+    return left
+
+
+def doc_text(t):
+    return t.text
+
+
+def step_candidates(pp, text, title, nodes):
+    """方法の請求項の工程の候補（題名→工程、工程→動詞の項）。"""
+    clean = pp._clean_claim_text(text)
+    verbs = [v for stem, v in HAS_STEMS if stem in clean] or ["含む"]
+    titles = [title] if title else []
+    titles += [x for x in nodes if title and x != title and x.endswith(title) and x in clean]
+    out = []
+    steps = []
+    with _enzai(pp, True):
+        for seg in split_claim(pp, text):
+            sent = to_sentence(seg)
+            if sent is None or not STEP_END_RE.search(sent):
+                continue
+            try:
+                doc = pp.nlp(pp._clean_claim_text(sent))
+            except Exception:  # noqa: BLE001
+                continue
+            toks = [t for t in doc if t.text not in ("。",)]
+            if not toks:
+                continue
+            root = toks[-1]
+            if root.text not in ("工程", "段階", "ステップ"):
+                continue
+            names = []
+            prev = doc[root.i - 1] if root.i > 0 else None
+            if prev is not None and prev.pos_ in ("NOUN", "PROPN") and prev.dep_ == "compound":
+                i0 = prev.i
+                while i0 > 0 and doc[i0 - 1].dep_ == "compound" and doc[i0 - 1].head.i >= prev.i:
+                    i0 -= 1
+                names.append(_clean(_span_text(doc, i0, root.i)))
+            acl = [c for c in root.children if c.dep_ in ("acl", "advcl") and c.pos_ in ("VERB", "AUX", "NOUN", "ADJ")]
+            verb = max(acl, key=lambda c: c.i) if acl else None
+            args = []
+            if verb is not None:
+                vs = [verb] + [c for c in verb.children if c.dep_ in ("advcl", "conj") and c.pos_ in ("VERB", "NOUN")]
+                for v in vs:
+                    for c in v.children:
+                        if c.dep_ in ("obj", "obl", "nsubj", "iobj"):
+                            args.append((v, c))
+                objs = [c for v, c in args if v is verb and c.dep_ == "obj"] or [c for v, c in args if c.dep_ == "obj"]
+                first = min(objs, key=lambda c: c.i) if objs else (min((c for _, c in args), key=lambda c: c.i)
+                                                                   if args else None)
+                if first is not None:
+                    l1 = _np_left(first, -1)
+                    names.append(_clean(_span_text(doc, l1, root.i)))
+                    names.append(_clean(_span_text(doc, first.i, root.i)))
+            names.append(_clean(_span_text(doc, 0, root.i)))
+            names = [x for x in dict.fromkeys(names) if 2 <= len(x) <= 60]
+            if not names:
+                continue
+            steps.append(names)
+            for rank, nm in enumerate(names):
+                for tt in titles:
+                    for v in verbs:
+                        out.append({"source": tt, "relation": v, "target": nm, "kind": 0, "rank": rank,
+                                    "n_names": len(names)})
+                for v, a in args:
+                    lab, _ = _label(pp, v)
+                    if not lab or len(lab) > 12:
+                        continue
+                    l = _np_left(a, -1)
+                    for an in dict.fromkeys([_clean(_span_text(doc, l, a.i)), _clean(a.text)]):
+                        if an and an != nm:
+                            out.append({"source": nm, "relation": lab, "target": an, "kind": 1, "rank": rank,
+                                        "n_names": len(names)})
+    for d in out:
+        d["n_steps"] = len(steps)
+    return out
+
+
+# ===========================================================================
+# 【統合】llm_select.py
+# 名前の付け替え: analyze_claim → analyze_claim_ls
+# ===========================================================================
+"""
+llm_select.py
+==============
+学習済みモデルを使わないSAO抽出（GiNZAの規則＋LLMの直接抽出 → LLMによる選別）。
+
+  ① GiNZAの規則による抽出：請求項全体の係り受け解析の規則（G）と、手がかり句で分けた区間ごとの解析（GS）、
+     文の構造の規則（ST：列挙「A、B及びC」を要素ごとに広げる／方法の請求項の「〜段階と、」を工程として取り出す）
+  ② LLMの直接抽出：タグ付きの請求項を LLM（qwen2.5 など）に入れて、SAOをそのまま出させる
+  ③ LLMによる選別：請求項の本文と、①②の候補一覧（番号付き）をもう一度 LLM に見せ、請求項に書かれている
+     正しい関係の番号だけを答えさせる
+
+どこにも学習データ（正解データで学習したモデル）を使わないので、分野によらず同じ仕組みで動く。
+③の LLM の呼び出しに失敗したときは、①と②の両方が出した候補を採用にする。
+②も失敗したとき（Ollama が起動していない等）は、①のうち GiNZA の規則（G）の結果を採用にする（規則だけの方法）。
+
+判定：
+  採用   … ③で LLM が選んだ候補
+  要確認 … ③で選ばれなかったが、①と②の両方が出した候補
+  除外   … それ以外
+「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの：
+  選ばれた＋①②の両方 1.0 ／ 選ばれた＋片方 0.8 ／ 選ばれなかった＋両方 0.5 ／ 選ばれなかった＋片方 0.1
+"""
+import hashlib
+import re
+
+pass  # （統合済み）import claim_segmenter as CS
+pass  # （統合済み）import sao_selector as S
+pass  # （統合済み）import struct_extra as SE
+
+SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する専門家です。
+請求項の本文と、機械が抽出した「主語｜関係｜目的語」の候補の一覧が与えられます。
+候補のうち、請求項の本文に書かれている内容として正しいものの番号だけを選んでください。
+
+判断の基準：
+- 主語と目的語は、請求項に出てくる構成要素（部品・材料・工程など）であること
+- 「AとBとを備えるX」は X｜備える｜A と X｜備える｜B が正しい（全体が主語、部品が目的語）
+- 「Bに接続されたA」「AはBに接続される」はどちらも A｜接続される｜B が正しい（修飾される側・述語の主題が主語）
+- 「A、B及びCから構成されるX」のような列挙は、要素ごとの関係がそれぞれ正しい
+- 「〜する工程（段階）と、を含む方法」は、方法｜含む｜工程 が正しい
+- 本文に書かれていない関係、主語と目的語が逆の関係、関係の相手を取り違えたものは選ばない
+- 同じ内容の候補が複数あるときは、本文の表現に最も近いものを1つだけ選ぶ
+
+出力は、選んだ番号をカンマ区切りで1行だけ書いてください（例：1,3,4,8）。説明は書かないでください。"""
+
+
+def _family(src):
+    if src in ("E1:llm_direct", "LLMraw"):
+        return "LLM"
+    return "規則"
+
+
+def build_rule_and_llm_candidates(ts, pp, text, llm_cache=None, claim_id=None, model=None, host=None,
+                                  llm_output=None):
+    """① GiNZAの規則（全体と区間ごと）と ② LLMの直接抽出の候補を集める（どちらから出たかを srcs に残す）。
+    llm_output="" を渡すと LLM を呼ばない（①だけ）。"""
+    info = build_candidates9(ts, pp, text, llm_output=llm_output, llm_cache=llm_cache, claim_id=claim_id,
+                              model=model, host=host)
+    index = {(c["source"], c["relation"], c["target"]): c for c in info["cands"]}
+    try:
+        seg = segment_relations(pp, text, distribute_each=True, merge_enzai=True)
+    except Exception:  # noqa: BLE001
+        seg = []
+    for r in seg:
+        rel = r["relation"].translate(SIMP)
+        key = (r["source"], rel, r["target"])
+        c = index.get(key)
+        if c is None:
+            c = {"source": key[0], "relation": rel, "target": key[2], "srcs": [], "type": r.get("type", "GS")}
+            info["cands"].append(c)
+            index[key] = c
+        tag = "GS:" + r.get("seg_type", r.get("type", "?"))
+        if tag not in c["srcs"]:
+            c["srcs"].append(tag)
+    # 文の構造の規則（列挙の展開と、方法の請求項の工程）
+    def _add(items, tag):
+        for d in items:
+            rel = d["relation"].translate(SIMP)
+            key = (d["source"], rel, d["target"])
+            c = index.get(key)
+            if c is None:
+                c = {"source": key[0], "relation": rel, "target": key[2], "srcs": [], "type": tag}
+                info["cands"].append(c)
+                index[key] = c
+            if tag not in c["srcs"]:
+                c["srcs"].append(tag)
+    try:
+        n = pp._normalize_node_text_lenient
+        _add(coord_expansions(pp._clean_claim_text(text), info["cands"], n), "ST:列挙")
+        nodes = {c["source"] for c in info["cands"]} | {c["target"] for c in info["cands"]}
+        steps = step_candidates(pp, text, info.get("title"), nodes)
+        _add([d for d in steps if d["rank"] == 0], "ST:工程")  # 工程の名前は一番短い言い方だけにする
+    except Exception:  # noqa: BLE001
+        pass
+    info["cands"] = [c for c in info["cands"] if c["source"] != c["target"]]
+    return info
+
+
+def select_prompt(text, cands):
+    lines = []
+    for i, c in enumerate(cands, 1):
+        fams = {_family(s) for s in c["srcs"]}
+        lines.append(f"{i}. {c['source']}｜{c['relation']}｜{c['target']}")
+    return f"【請求項】\n{text.strip()}\n\n【候補】\n" + "\n".join(lines)
+
+
+def parse_selection(out, n):
+    nums = []
+    for m in re.finditer(r"\d+", str(out or "")):
+        k = int(m.group(0))
+        if 1 <= k <= n and k not in nums:
+            nums.append(k)
+    return nums
+
+
+def select_with_llm(ts, text, cands, model=None, host=None, cache=None):
+    """③ 請求項と候補一覧を LLM に見せて、正しい候補の番号を選ばせる。戻り値は選ばれた候補の番号（0始まり）の集合。"""
+    user = select_prompt(text, cands)
+    key = hashlib.sha1((SELECT_SYSTEM + "\n" + user + "\n" + str(model)).encode("utf-8")).hexdigest()
+    if cache is not None and key in cache:
+        out = cache[key]
+    else:
+        kw = {} if model is None else {"model": model}
+        out = ts._ollama_chat(SELECT_SYSTEM, user, host=host, **kw)
+        if cache is not None:
+            cache[key] = out
+    return {k - 1 for k in parse_selection(out, len(cands))}, out
+
+
+def judge(cands, selected, llm_ok=True, mode=None):
+    """候補ごとの判定（採用・要確認・除外）と確からしさ（目安）。
+    mode: "llm"（③の選別を使う）／"both"（③が失敗：①②の一致を採用）／"rules"（②③が失敗：GiNZAの規則Gを採用）"""
+    mode = mode or ("llm" if llm_ok else "both")
+    out = []
+    for i, c in enumerate(cands):
+        fams = {_family(s) for s in c["srcs"]}
+        both = len(fams) >= 2
+        if mode == "rules":
+            sel = any(s.startswith("G:") for s in c["srcs"])
+            out.append({"selected": sel, "score": 0.6 if sel else 0.1, "status": "採用" if sel else "除外",
+                        "basis": "GiNZAの規則の結果（LLMなし）" if sel else "規則の候補（LLMなし）"})
+            continue
+        sel = (i in selected) if mode == "llm" else both
+        score = (1.0 if both else 0.8) if sel else (0.5 if both else 0.1)
+        status = "採用" if sel else ("要確認" if both else "除外")
+        out.append({"selected": sel, "score": score, "status": status,
+                    "basis": ("LLMが選別" if sel and mode == "llm" else "規則とLLMが一致" if sel else
+                              "規則とLLMが一致（選別で外れた）" if both else
+                              ("規則のみ" if "規則" in fams else "LLMのみ"))})
+    return out
+
+
+def analyze_claim_ls(ts, pp, text, llm_cache=None, select_cache=None, claim_id=None, model=None, host=None):
+    """①②③をまとめて実行する。戻り値：(候補, 判定, LLMの選別の生の出力 または エラー)
+    info["mode"] に、実際に使えた段階（"llm"／"both"／"rules"）を入れる。"""
+    try:
+        info = build_rule_and_llm_candidates(ts, pp, text, llm_cache=llm_cache, claim_id=claim_id,
+                                             model=model, host=host)
+    except Exception as exc:  # noqa: BLE001  LLM を呼べない → ①の規則だけで決める
+        info = build_rule_and_llm_candidates(ts, pp, text, model=model, host=host, llm_output="")
+        info["mode"] = "rules"
+        return info, judge(info["cands"], set(), mode="rules"), f"LLMを呼べませんでした（GiNZAの規則だけで判定）: {exc}"
+    cands = info["cands"]
+    try:
+        selected, raw = select_with_llm(ts, text, cands, model=model, host=host, cache=select_cache)
+        info["mode"] = "llm"
+    except Exception as exc:  # noqa: BLE001
+        selected, raw, info["mode"] = set(), f"選別のLLMを呼べませんでした: {exc}", "both"
+    return info, judge(cands, selected, mode=info["mode"]), raw
+
+
+# ===========================================================================
 # 【統合】platform_core.py
 # 名前の付け替え: structural_features → claim_structure_features
 # ===========================================================================
@@ -13713,7 +14079,8 @@ _ORIGIN = [("LLM", ("LLMraw", "E1:llm_direct")),
            ("GiNZA補完", ("E1:claim_title_ginza", "E1:ginza_has_fallback", "E1:attribute",
                         "E1:ginza_has_fallback_conflict", "E1:claim_title_ginza_conflict")),
            ("GiNZA", ("G",)), ("分割GiNZA", ("GS",)), ("ノード結合", ("MRG",)), ("係り受け", ("DEP",)),
-           ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",)), ("区間内の名詞句", ("NP",))]
+           ("持ち主つき", ("OWN",)), ("区間の主役", ("SEG",)), ("題名", ("TITLE",)), ("区間内の名詞句", ("NP",)),
+           ("文の構造の規則", ("ST",))]
 
 
 def origin_label(srcs):
@@ -14052,16 +14419,19 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-25"
+PIPELINE_VERSION = "2026-09-25c"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
     "stats": {"採用": {"精度": 0.801}, "要確認": {"精度": 0.3034}, "除外": {"精度": 0.0224},
               "正解の所在": {"採用": 0.3799, "要確認": 0.1907, "除外": 0.2288, "候補なし": 0.2005}},
 }
-METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
-METHOD_SCORE = ("532件の正解データで、トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
-                "補助指標：ノードの表記ゆれを許すと F1 62.9%、関係名を問わないと F1 58.4%")
+METHOD_NAME = "学習なし（GiNZAの規則＋LLMの直接抽出 → LLMによる選別）"
+METHOD_SCORE = ("学習データを使わない方法。精度は、ローカルのOllamaで評価コマンド（--method llm-select）を実行して測る。"
+                "参考（532件・トリプル完全一致）：GiNZAの規則だけ F1 40.6%、LLMの直接抽出だけ 24.2%")
+MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
+MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
+                      "分野を丸ごと隠しても F1 の低下は0〜2ポイント")
 
 GROUP_PALETTE = ["#3987e5", "#d95926", "#199e70", "#9b59d0", "#e0a100", "#2bb3c0", "#e0457b", "#7a8b2c"]
 OTHER_COLOR = "#8a8880"
@@ -14218,7 +14588,7 @@ def apply_analysis(patent, cands):
 
 
 def new_dataset(name, patents, bands=None):
-    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "sao_selector14", "n": len(patents)},
+    return {"meta": {"name": name, "method": METHOD_NAME, "method_key": "llm_select", "n": len(patents)},
             "bands": dict(bands or DEFAULT_BANDS), "patents": patents}
 
 
@@ -14999,6 +15369,10 @@ def main_eval():
                              "アプリの「正解データとして書き出す」で作った他分野の請求項を指定できる")
     parser.add_argument("--gold-file", default=None,
                         help="正解SAOのJSON（既定: data-dir の gold_sao_532_merged.json）")
+    parser.add_argument("--method", default="model", choices=["model", "llm-select"],
+                        help="model: 学習済み選別モデル（実験14）／llm-select: 学習なし（GiNZAの規則＋LLMの直接抽出→LLMによる選別）")
+    parser.add_argument("--select-cache", default="select_cache.json",
+                        help="--method llm-select の選別のLLMの出力を保存・再利用するファイル")
     parser.add_argument("--retrain", action="store_true",
                         help="--claims-file / --gold-file の正解データを532件の学習データに足した、新しい学習データ"
                              "（--out に .npz の名前を指定。既定 sao_selector14_train_plus.npz）を作る")
@@ -15223,7 +15597,13 @@ def main_eval():
     if not args.external and base532.exists():
         folds = cv_folds({c["id"]: c["text"] for c in json.load(open(base532, encoding="utf-8"))})
         fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
-    if any(c["id"] in fold_of for c in claims):
+    if args.method == "llm-select":
+        pass  # （統合済み）import llm_select
+        fold_of = {}
+        select_cache = _load_llm_cache(args.select_cache) or {}
+        ls_modes = {}
+        print(f"学習なしの方法（GiNZAの規則＋LLMの直接抽出→LLMによる選別）で評価します。選別の出力の保存先: {args.select_cache}")
+    if args.method == "model" and any(c["id"] in fold_of for c in claims):
         import numpy as _np
         _train = _np.load(TRAIN_FILE14, allow_pickle=False)
         fold_threshold = [float(t) for t in _train["fold_thresholds"]]
@@ -15232,7 +15612,7 @@ def main_eval():
         fold_selector = [Selector14(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
         print(f"  分割ごとのしきい値: {fold_threshold}")
     selector_all = None
-    if any(c["id"] not in fold_of for c in claims):
+    if args.method == "model" and any(c["id"] not in fold_of for c in claims):
         print("学習に使っていない請求項は、532件すべてで学習した選別モデルで評価します…")
         selector_all = Selector14()
     if args.eval_mode in ("node", "exact"):
@@ -15242,16 +15622,27 @@ def main_eval():
         cid = c["id"]
         try:
             extra = {}
-            if cid in fold_of:
+            if args.method == "llm-select":
+                info, judged, _raw = analyze_claim_ls(ts, pp, c["text"], llm_cache=llm_cache,
+                                                              select_cache=select_cache, claim_id=cid,
+                                                              model=args.model, host=args.host)
+                ls_modes[info.get("mode")] = ls_modes.get(info.get("mode"), 0) + 1
+                if info.get("mode") != "llm":
+                    print(f"  注意: {cid} は {_raw[:120]}")
+                predicted = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"],
+                              "type": "llm_select"} for cc, j in zip(info["cands"], judged) if j["selected"]]
+                _save_llm_cache(args.select_cache, select_cache)
+            elif cid in fold_of:
                 selector = fold_selector[fold_of[cid]]
                 thr = fold_threshold[fold_of[cid]]
                 if selector.fold_max_per_pair:
                     extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
             else:
                 selector, thr = selector_all, selector_all.threshold
-            _, predicted = analyze_claim_selected14(
-                ts, pp, selector, c["text"], threshold=thr,
-                llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
+            if args.method == "model":
+                _, predicted = analyze_claim_selected14(
+                    ts, pp, selector, c["text"], threshold=thr,
+                    llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
         except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
             print(f"[{cid}] エラーのためスキップ: {e}")
             continue
@@ -15355,6 +15746,12 @@ def main_eval():
     agg = _aggregate(per_claim)
 
     print("\n=== 集計 ===")
+    if args.method == "llm-select":
+        print(f"LLMによる選別が使えた件数: {ls_modes.get('llm', 0)}／①②の一致で代用: {ls_modes.get('both', 0)}"
+              f"／GiNZAの規則だけ: {ls_modes.get('rules', 0)}")
+        if ls_modes.get("both") or ls_modes.get("rules"):
+            print("  ※ LLMを呼べなかった請求項があります。この結果は「学習なし（LLMによる選別）」の正しい評価では"
+                  "ありません。Ollama を起動して（ollama serve）もう一度実行してください。")
     print(f"件数: {len(per_claim)}（今回の実行で処理: {n_done_this_run}件）  "
           f"所要時間（今回の実行分）: {elapsed:.1f}秒  評価方法: {args.eval_mode}"
           + ("" if args.eval_mode in ("strict", "exact")
@@ -15413,7 +15810,9 @@ sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE,
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
 node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=LEAD, MAX_NODES=MAX_NODES, NOUNISH=NOUNISH, OWNER_LABELS=OWNER_LABELS, QTY_RE=QTY_RE, _chains=_chains, _coord_partner=_coord_partner, _units=_units, keep_pair=keep_pair, node_pair_candidates=node_pair_candidates, pairs_in_segment=pairs_in_segment, segment_nodes=segment_nodes)
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
+struct_extra = _types.SimpleNamespace(CONJ=CONJ, HAS_STEMS=HAS_STEMS, LEAD_RE=LEAD_RE, NOT_ITEM_RE=NOT_ITEM_RE, STEP_END_RE=STEP_END_RE, _clean=_clean, _np_left=_np_left, _span_text=_span_text, coord_expansions=coord_expansions, doc_text=doc_text, find_lists=find_lists, step_candidates=step_candidates)
+llm_select = _types.SimpleNamespace(SELECT_SYSTEM=SELECT_SYSTEM, _family=_family, analyze_claim=analyze_claim_ls, build_rule_and_llm_candidates=build_rule_and_llm_candidates, judge=judge, parse_selection=parse_selection, select_prompt=select_prompt, select_with_llm=select_with_llm)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, ts=ts)
 
 
