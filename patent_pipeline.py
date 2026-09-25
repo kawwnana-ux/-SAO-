@@ -14157,11 +14157,15 @@ def make_patent(pid, text, title="", applicant="", fi="", date="", url=""):
 
 
 def patents_from_table(df, cols, limit=None):
-    """表（DataFrame）と列の対応から、解析前の特許レコードのリストを作る。"""
+    """表（DataFrame）と列の対応から、解析前の特許レコードのリストを作る。
+    請求項の列が無い・空の行も読み込む（J-PlatPat の CSV には請求項が入っていないため）。
+    その特許は text が空のままで、あとから請求項を追加して解析する。"""
     out, seen = [], set()
     for i, row in df.iterrows():
         text = row.get(cols["claim"]) if cols.get("claim") else None
-        if text is None or (isinstance(text, float) and math.isnan(text)) or not str(text).strip():
+        if text is None or (isinstance(text, float) and math.isnan(text)):
+            text = ""
+        if not str(text).strip() and not any(cols.get(k) for k in ("id", "title")):
             continue
 
         def g(k):
@@ -14177,6 +14181,27 @@ def patents_from_table(df, cols, limit=None):
         out.append(make_patent(pid, text, g("title"), g("applicant"), g("fi") or g("ipc"), g("date"), g("url")))
         if limit and len(out) >= limit:
             break
+    return out
+
+
+def norm_pid(x):
+    """文献番号の照合用（全角・半角、空白、ハイフンの種類の違いをそろえる）。"""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", str(x or "")).strip()
+    t = re.sub(r"\s+", "", t)
+    return re.sub(r"[‐‑‒–—―−ー－]", "-", t)
+
+
+def claims_from_table(df, id_col, claim_col):
+    """「文献番号」と「請求項」の列を持つ表から {正規化した文献番号: 請求項1} を作る。"""
+    out = {}
+    for _, row in df.iterrows():
+        pid, text = row.get(id_col), row.get(claim_col)
+        if pid is None or text is None or (isinstance(text, float) and math.isnan(text)):
+            continue
+        t = first_claim(text)
+        if t:
+            out[norm_pid(pid)] = t
     return out
 
 
@@ -14222,7 +14247,10 @@ def _embed(X, dim, seed=0):
     k = max(1, min(50, n - 1, X.shape[1] - 1))
     Z = TruncatedSVD(k, random_state=seed).fit_transform(X) if n > 2 and X.shape[1] > 2 else X.toarray()
     Zn = Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-9)
-    if n >= 12:
+    if Zn.shape[1] < dim:
+        # 特徴が少なすぎる（例：どの特許にもまだSAOが無い）ときは足りない次元を0で埋める
+        Zn = np.hstack([Zn, np.zeros((n, dim - Zn.shape[1]))])
+    if n >= 12 and np.linalg.matrix_rank(Zn) >= 2:
         from sklearn.manifold import TSNE
 
         Y = TSNE(dim, perplexity=max(2.0, min(30.0, (n - 1) / 3.0)), init="pca", random_state=seed,
@@ -14231,6 +14259,8 @@ def _embed(X, dim, seed=0):
     else:
         Y = np.zeros((n, dim))
         Y[:, :min(dim, Zn.shape[1])] = Zn[:, :dim]
+        # 全部同じ点に重なるときは、少しずつずらして見えるようにする
+        Y += np.random.default_rng(seed).normal(0, 0.02, Y.shape)
         method = "SVD(%d)" % dim
     return Y, Zn, method
 
@@ -14885,6 +14915,74 @@ def _save(out_path, per_claim, args, elapsed, done):
         )
 
 
+def retrain_with_extra(args, pp):
+    """【学習データの追加】他分野などの正解データ（--claims-file / --gold-file）の候補と正解ラベルを、
+    532件の学習データ（sao_selector14_train.npz）に足した新しい学習データを作る。
+    ・候補と特徴量は、アプリと同じ実験14の方法で作る（LLMの出力は --llm-cache に保存・再利用）
+    ・ラベルはトリプル完全一致（主指標と同じ）
+    ・2段目の構造特徴に使う1段目の確率は、532件だけで学習したモデルで求める（追加した請求項を
+      学習に使っていないモデルの確率なので、532件側の交差検証の確率と同じ扱いになる）
+    できたファイルを sao_selector14_train.npz に置き換えると、アプリの選別モデルが追加分も学習する。"""
+    import numpy as np
+    pass  # （統合済み）import node_match_eval
+    pass  # （統合済み）import sao_selector
+    pass  # （統合済み）import sao_selector12
+    pass  # （統合済み）import sao_selector14
+
+    with open(args.claims_file, encoding="utf-8") as f:
+        claims = json.load(f)
+    with open(args.gold_file, encoding="utf-8") as f:
+        gold_all = json.load(f)
+    base = np.load(TRAIN_FILE14, allow_pickle=False)
+    X1b, Yb, idsb, X2b = base["X1"], base["Y"], base["ids"], base["X2"]
+    old = set(idsb.tolist())
+    X1f = X1b.astype(np.float64).copy()
+    X1f[:, KEPT_INDEX] = 0.0
+    print(f"532件の学習データ: 候補 {len(Yb):,} 件。1段目のモデルを学習しています…")
+    m1 = _model().fit(X1f, Yb)
+    llm_cache = _load_llm_cache(args.llm_cache)
+    n = pp._normalize_node_text_lenient
+    add_X1, add_X2, add_Y, add_ids = [], [], [], []
+    for k, c in enumerate(claims):
+        cid = c["id"]
+        if cid in old or cid not in gold_all or not c.get("text"):
+            continue
+        try:
+            info = build_candidates14(ts, pp, c["text"], llm_cache=llm_cache, claim_id=cid,
+                                                   model=args.model, host=args.host)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{cid}] 候補を作れなかったためスキップ: {e}")
+            continue
+        if not info["cands"]:
+            continue
+        x1 = claim_features14(pp, info)
+        x1[:, KEPT_INDEX] = 0.0
+        p1 = m1.predict_proba(x1)[:, 1]
+        x2 = structural_features(pp, info, p1)
+        G = [(n(g["source"]), g["relation"], n(g["target"])) for g in gold_all[cid]]
+        y = [int(any(n(cc["source"]) == gs and n(cc["target"]) == gt and rel_match(pp, cc["relation"], gr)
+                     for gs, gr, gt in G)) for cc in info["cands"]]
+        add_X1.append(x1.astype(X1b.dtype))
+        add_X2.append(x2.astype(X2b.dtype))
+        add_Y.append(np.array(y, dtype=Yb.dtype))
+        add_ids.append(np.array([cid] * len(y)))
+        print(f"  {k + 1}/{len(claims)} {cid}: 候補 {len(y)} 件（正解 {sum(y)} 件）", flush=True)
+        _save_llm_cache(args.llm_cache, llm_cache)
+    if not add_Y:
+        print("追加できる請求項がありませんでした（532件と同じ番号・正解なし・請求項なしは除きます）。")
+        return
+    save = {k: base[k] for k in base.files if not k.startswith("X2_fold")}
+    save["X1"] = np.vstack([X1b] + add_X1)
+    save["X2"] = np.vstack([X2b] + add_X2)
+    save["Y"] = np.concatenate([Yb] + add_Y)
+    ids_all = np.concatenate([idsb.astype(str)] + add_ids)
+    save["ids"] = ids_all.astype("<U%d" % max(13, max(len(x) for x in ids_all)))
+    out = args.out if args.out.endswith(".npz") else "sao_selector14_train_plus.npz"
+    np.savez_compressed(out, **save)
+    print(f"保存しました: {out}（追加した請求項 {len(add_Y)} 件・候補 {sum(len(y) for y in add_Y):,} 件）。"
+          "アプリで使うときは sao_selector14_train.npz という名前に置き換えてください。")
+
+
 def main_eval():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -14896,6 +14994,17 @@ def main_eval():
         help="claims_532_for_gold.json / gold_sao_532_merged.json が置いてあるディレクトリ",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--claims-file", default=None,
+                        help="評価する請求項のJSON（既定: data-dir の claims_532_for_gold.json）。"
+                             "アプリの「正解データとして書き出す」で作った他分野の請求項を指定できる")
+    parser.add_argument("--gold-file", default=None,
+                        help="正解SAOのJSON（既定: data-dir の gold_sao_532_merged.json）")
+    parser.add_argument("--retrain", action="store_true",
+                        help="--claims-file / --gold-file の正解データを532件の学習データに足した、新しい学習データ"
+                             "（--out に .npz の名前を指定。既定 sao_selector14_train_plus.npz）を作る")
+    parser.add_argument("--external", action="store_true",
+                        help="532件すべてで学習した1つの選別モデルで評価する（他分野など、学習に使っていない"
+                             "請求項の評価用）。指定しない場合、532件の請求項は交差検証の分割モデルで評価する")
     parser.add_argument("--host", default=None)
     parser.add_argument(
         "--mode", default="selected12", choices=["selected12"],
@@ -15050,10 +15159,13 @@ def main_eval():
     sys.path.insert(0, args.pipeline_dir)
     pp = sys.modules[__name__]  # 統合後はこのファイル自身
 
+    if args.retrain:
+        retrain_with_extra(args, pp)
+        return
     data_dir = _pathlib.Path(args.data_dir)
-    with open(data_dir / "claims_532_for_gold.json", encoding="utf-8") as f:
+    with open(args.claims_file or (data_dir / "claims_532_for_gold.json"), encoding="utf-8") as f:
         claims = json.load(f)
-    with open(data_dir / "gold_sao_532_merged.json", encoding="utf-8") as f:
+    with open(args.gold_file or (data_dir / "gold_sao_532_merged.json"), encoding="utf-8") as f:
         gold_all = json.load(f)
 
     if args.format:
@@ -15106,28 +15218,39 @@ def main_eval():
     # 除いた請求項だけで学習した選別モデルを使う（評価する請求項を学習に使わない）
     pass  # （統合済み）import sao_selector
     pass  # （統合済み）import sao_selector14
-    folds = cv_folds({c["id"]: c["text"] for c in json.load(
-        open(data_dir / "claims_532_for_gold.json", encoding="utf-8"))})
-    fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
-    import numpy as _np
-    _train = _np.load(TRAIN_FILE14, allow_pickle=False)
-    fold_threshold = [float(t) for t in _train["fold_thresholds"]]
-    print("交差検証の5分割ごとに選別モデルを学習しています…")
-    # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
-    fold_selector = [Selector14(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
-    print(f"  分割ごとのしきい値: {fold_threshold}")
+    base532 = data_dir / "claims_532_for_gold.json"
+    fold_of, fold_selector, fold_threshold = {}, [], []
+    if not args.external and base532.exists():
+        folds = cv_folds({c["id"]: c["text"] for c in json.load(open(base532, encoding="utf-8"))})
+        fold_of = {cid: k for k, f in enumerate(folds) for cid in f}
+    if any(c["id"] in fold_of for c in claims):
+        import numpy as _np
+        _train = _np.load(TRAIN_FILE14, allow_pickle=False)
+        fold_threshold = [float(t) for t in _train["fold_thresholds"]]
+        print("交差検証の5分割ごとに選別モデルを学習しています…")
+        # 2段目の構造特徴は、その分割の学習用請求項だけで作ったもの（X2_fold{k}）を使う
+        fold_selector = [Selector14(exclude_ids=set(f), fold=k) for k, f in enumerate(folds)]
+        print(f"  分割ごとのしきい値: {fold_threshold}")
+    selector_all = None
+    if any(c["id"] not in fold_of for c in claims):
+        print("学習に使っていない請求項は、532件すべてで学習した選別モデルで評価します…")
+        selector_all = Selector14()
     if args.eval_mode in ("node", "exact"):
         pass  # （統合済み）import node_match_eval
 
     for c in targets:
         cid = c["id"]
         try:
-            selector = fold_selector[fold_of[cid]]
             extra = {}
-            if selector.fold_max_per_pair:
-                extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
+            if cid in fold_of:
+                selector = fold_selector[fold_of[cid]]
+                thr = fold_threshold[fold_of[cid]]
+                if selector.fold_max_per_pair:
+                    extra["max_per_pair"] = selector.fold_max_per_pair[fold_of[cid]]
+            else:
+                selector, thr = selector_all, selector_all.threshold
             _, predicted = analyze_claim_selected14(
-                ts, pp, selector, c["text"], threshold=fold_threshold[fold_of[cid]],
+                ts, pp, selector, c["text"], threshold=thr,
                 llm_cache=llm_cache, claim_id=cid, model=args.model, host=args.host, **extra)
         except Exception as e:  # noqa: BLE001 -- 1件の失敗で全体を止めない
             print(f"[{cid}] エラーのためスキップ: {e}")
@@ -15290,8 +15413,8 @@ sao_selector12 = _types.SimpleNamespace(CASE_KEYS=CASE_KEYS, HAS=HAS, HERE=HERE,
 sao_selector13 = _types.SimpleNamespace(HERE=HERE, Selector=Selector13, TRAIN_FILE=TRAIN_FILE13, add_segment_candidates=add_segment_candidates, analyze_claim_selected=analyze_claim_selected13, build_candidates=build_candidates13, canon=canon13, claim_features=claim_features13, cv_folds=cv_folds, select=select13, structural_features=structural_features13)
 node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=LEAD, MAX_NODES=MAX_NODES, NOUNISH=NOUNISH, OWNER_LABELS=OWNER_LABELS, QTY_RE=QTY_RE, _chains=_chains, _coord_partner=_coord_partner, _units=_units, keep_pair=keep_pair, node_pair_candidates=node_pair_candidates, pairs_in_segment=pairs_in_segment, segment_nodes=segment_nodes)
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
-eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, ts=ts)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
+eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, ts=ts)
 
 
 if __name__ == "__main__":

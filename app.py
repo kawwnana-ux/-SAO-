@@ -413,15 +413,21 @@ with st.sidebar:
 
 def page_data():
     st.title("📥 データの読み込み")
+    if st.session_state.get("_ingest_msg"):
+        st.success(st.session_state.pop("_ingest_msg"))
     if DATA:
         st.info(f"現在のデータ：**{DATA['meta'].get('name')}**（{len(DATA['patents']):,} 件）", icon="📂")
-    tab1, tab2 = st.tabs(["📄 特許リストを読み込んで解析", "💾 解析済みデータを開く"])
+    # タブ（st.tabs）は再実行のたびに最初のタブへ戻ることがあるので、選択を覚えるラジオボタンで切り替える
+    SECS = ["📄 特許リストを読み込む", "📝 請求項を追加", "💾 解析済みデータを開く"]
+    sec = st.radio("操作", SECS, horizontal=True, key="data_section", label_visibility="collapsed")
+    st.divider()
 
-    with tab1:
+    if sec == SECS[0]:
         st.markdown(
-            "J-PlatPat などから出力した **CSV／Excel** を読み込み、各特許の請求項を実験14の方法で一括解析します。"
-            "請求項の列は必須、それ以外（文献番号・発明の名称・出願人・FI・出願日）はあれば使います。"
-            "請求項の欄に【請求項１】【請求項２】…と複数入っている場合は、請求項1だけを解析します。")
+            "J-PlatPat などから出力した **CSV／Excel** を読み込みます。文献番号・発明の名称・出願人・FI・出願日の列は"
+            "自動で見つけます。**J-PlatPat の CSV には請求項が入っていない**ので、その場合は書誌情報だけで読み込み、"
+            "あとから「📝 請求項を追加」で請求項を足して解析します（書誌情報だけでも Patent World・FIレーダー・"
+            "技術分布は使えます）。請求項の列がある表なら、読み込みと同時に実験14の方法で解析します。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
         pasted = st.text_area("または、請求項を「-----」で区切って貼り付け（書誌情報なしで解析）", height=120,
                               key="ds_paste")
@@ -436,40 +442,52 @@ def page_data():
         if df is not None:
             st.caption(f"{len(df):,} 行を読み込みました。列の対応を確認してください。")
             det = PC.detect_columns(df)
-            labels = {"claim": "請求項（必須）", "id": "文献番号", "title": "発明の名称", "applicant": "出願人",
-                      "fi": "FI", "date": "出願日", "url": "URL"}
+            labels = {"id": "文献番号", "title": "発明の名称", "applicant": "出願人", "fi": "FI", "date": "出願日",
+                      "url": "URL", "claim": "請求項（任意）"}
             opts = ["（なし）"] + list(df.columns)
             cols = {}
             grid = st.columns(4)
             for i, (k, lab) in enumerate(labels.items()):
                 cur = det.get(k)
-                cols[k] = grid[i % 4].selectbox(lab, opts, index=opts.index(cur) if cur in opts else 0, key=f"col_{k}")
+                cols[k] = grid[i % 4].selectbox(lab, opts, index=opts.index(cur) if cur in opts else 0,
+                                                key=f"col_{k}_{up.name if up is not None else 'paste'}_{len(df.columns)}")
                 cols[k] = None if cols[k] == "（なし）" else cols[k]
             cols["ipc"] = det.get("ipc")
             st.dataframe(df.head(5), use_container_width=True, hide_index=True)
             c1, c2 = st.columns([2, 1])
             name = c1.text_input("データセットの名前", value=Path(up.name).stem if up is not None else "貼り付けた請求項")
-            limit = c2.number_input("解析する件数の上限（0で全件）", min_value=0, value=0, step=10)
-            st.caption("1件あたり数秒〜1分ほどかかります（LLMの呼び出しを含む）。途中で止まっても、"
-                       "同じボタンでもう一度押すと続きから解析します（解析済みの請求項は再計算しません）。"
-                       + ("公開デモ（OpenRouter無料枠）は1日あたりの回数に制限があるため、少ない件数で試してください。"
-                          if BACKEND == "cloud" else ""))
-            if st.button("🚀 解析を開始（または続きから）", type="primary", disabled=not cols["claim"]):
-                ing = st.session_state.ingest
-                if not ing or ing.get("name") != name or ing.get("n_rows") != len(df):
-                    ing = {"name": name, "n_rows": len(df),
-                           "patents": PC.patents_from_table(df, cols, limit=int(limit) or None), "errors": {}}
-                    st.session_state.ingest = ing
-                run_ingest(ing)
+            limit = c2.number_input("読み込む件数の上限（0で全件）", min_value=0, value=0, step=10)
+            if not cols["claim"]:
+                st.info("請求項の列がありません。書誌情報（文献番号・発明の名称・出願人・FI・出願日）だけで読み込みます。"
+                        "LLMは使わないので、すぐに終わります。", icon="ℹ️")
+                if st.button("📂 書誌情報だけで読み込む", type="primary", disabled=not (cols["id"] or cols["title"])):
+                    ps = PC.patents_from_table(df, cols, limit=int(limit) or None)
+                    finish_ingest({"name": name, "patents": ps, "errors": {}})
+            else:
+                st.caption("請求項のある行は1件あたり数秒〜1分ほどかかります（LLMの呼び出しを含む）。途中で止まっても、"
+                           "同じボタンでもう一度押すと続きから解析します（解析済みの請求項は再計算しません）。"
+                           + ("公開デモ（OpenRouter無料枠）は1日あたりの回数に制限があるため、少ない件数で試してください。"
+                              if BACKEND == "cloud" else ""))
+                if st.button("🚀 読み込んで解析を開始（または続きから）", type="primary"):
+                    ing = st.session_state.ingest
+                    if not ing or ing.get("name") != name or ing.get("n_rows") != len(df):
+                        ing = {"name": name, "n_rows": len(df),
+                               "patents": PC.patents_from_table(df, cols, limit=int(limit) or None), "errors": {}}
+                        st.session_state.ingest = ing
+                    run_ingest(ing)
         ing = st.session_state.ingest
-        if ing and not all(p["analyzed"] for p in ing["patents"]):
+        if ing and not all(p["analyzed"] or not p["text"] for p in ing["patents"]):
             done = sum(p["analyzed"] for p in ing["patents"])
-            st.warning(f"「{ing['name']}」は {done}/{len(ing['patents'])} 件まで解析済みです。"
-                       "上のボタンで続きから解析するか、ここまでの結果で分析を始められます。")
-            if st.button("ここまでの結果で分析を始める", disabled=done == 0):
+            todo = sum(bool(p["text"]) for p in ing["patents"])
+            st.warning(f"「{ing['name']}」は、請求項のある {todo} 件のうち {done} 件まで解析済みです。"
+                       "上のボタンで続きから解析するか、ここまでの結果で分析を始められます（残りはあとで解析できます）。")
+            if st.button("ここまでの結果で分析を始める"):
                 finish_ingest(ing, partial=True)
 
-    with tab2:
+    if sec == SECS[1]:
+        add_claims_tab()
+
+    if sec == SECS[2]:
         st.markdown("以前にこのアプリで解析して保存したデータ（エクスポートページの「解析済みデータ（JSON）」）を開きます。"
                     "LLMを呼ばずにすぐ分析を始められます。")
         upj = st.file_uploader("解析済みデータ（.json）", type=["json"], key="ds_json")
@@ -489,8 +507,98 @@ def page_data():
 
 
 
+def analyze_dataset_patents(pids):
+    """読み込み済みのデータセットの特許（請求項あり・未解析）を解析し、その場で結果を入れる。"""
+    try:
+        with st.spinner("選別モデルを準備中…"):
+            load_pipeline()
+            load_selector()
+    except Exception as exc:  # noqa: BLE001
+        st.error("解析の準備に失敗しました。")
+        st.exception(exc)
+        return
+    bar = st.progress(0.0, text="解析中…")
+    ok, errors = 0, {}
+    for k, pid in enumerate(pids):
+        p = PATENTS[pid]
+        bar.progress(k / len(pids), text=f"{k}/{len(pids)} 件　{pid}　{(p['title'] or '')[:30]}")
+        try:
+            PC.apply_analysis(p, run_analyze(p["text"])["cands"])
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            errors[pid] = str(exc)[:200]
+            if k >= 2 and ok == 0:
+                bar.empty()
+                st.error("最初の3件が続けて失敗したため止めました。" + llm_error_message())
+                st.code(str(exc)[:500])
+                return
+    bar.progress(1.0, text=f"{len(pids)}/{len(pids)} 件")
+    with st.spinner("類似性マップの配置を計算し直しています…"):
+        PC.layout_map(DATA, st.session_state.reviews)
+    st.session_state["_claims_msg"] = (f"{ok} 件を解析しました。" + (f"{len(errors)} 件は失敗しました（もう一度押すと再試行）。"
+                                                                    if errors else ""))
+    st.rerun()
+
+
+def add_claims_tab():
+    if not DATA or not DATA.get("patents"):
+        st.info("先に「📄 特許リストを読み込む」で特許リストを読み込んでください。")
+        return
+    if st.session_state.get("_claims_msg"):
+        st.success(st.session_state.pop("_claims_msg"))
+    ps = DATA["patents"]
+    no_text = [p for p in ps if not p.get("text")]
+    ready = [p for p in ps if p.get("text") and not p.get("analyzed", True)]
+    st.markdown(f"読み込んだ {len(ps):,} 件のうち、**請求項が未登録 {len(no_text):,} 件**、"
+                f"**請求項あり・未解析 {len(ready):,} 件**、解析済み {sum(p.get('analyzed', True) and bool(p.get('text')) for p in ps):,} 件。")
+    st.markdown("##### ① 請求項の表をまとめて読み込む")
+    st.caption("「文献番号」と「請求項」の2列がある CSV／Excel を読み込むと、文献番号が一致する特許に請求項を入れます"
+               "（【請求項１】【請求項２】…が続けて入っている場合は請求項1だけを使います）。")
+    upc = st.file_uploader("請求項の表（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="claims_upload")
+    if upc is not None:
+        try:
+            cdf = PC.read_table(upc.getvalue(), upc.name)
+            det = PC.detect_columns(cdf)
+            opts = list(cdf.columns)
+            a, b = st.columns(2)
+            idc = a.selectbox("文献番号の列", opts, index=opts.index(det["id"]) if det.get("id") in opts else 0)
+            clc = b.selectbox("請求項の列", opts, index=opts.index(det["claim"]) if det.get("claim") in opts
+                              else min(1, len(opts) - 1))
+            if st.button("この表の請求項を登録する"):
+                table = PC.claims_from_table(cdf, idc, clc)
+                hit = 0
+                for p in ps:
+                    t = table.get(PC.norm_pid(p["id"]))
+                    if t and t != p.get("text"):
+                        p["text"], p["relations"], p["n_rejected"], p["analyzed"] = t, [], 0, False
+                        st.session_state.reviews.pop(p["id"], None)
+                        hit += 1
+                st.session_state["_claims_msg"] = f"{hit} 件の特許に請求項を登録しました（表の {len(table)} 件中）。"
+                st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"読み込めませんでした: {e}")
+    st.markdown("##### ② 1件ずつ貼り付ける")
+    st.caption("公報（J-PlatPat など）の【請求項１】をコピーして貼り付けます。")
+    if no_text:
+        pid = st.selectbox("請求項が未登録の特許", [p["id"] for p in no_text], format_func=patent_label, key="claim_pid")
+        p = PATENTS[pid]
+        if p.get("url"):
+            st.markdown(f"[公報を開く]({p['url']})")
+        t = st.text_area("請求項1の本文", height=160, key=f"claim_text_{pid}")
+        if st.button("この特許の請求項として登録", disabled=not t.strip()):
+            p["text"], p["analyzed"] = PC.first_claim(t), False
+            st.session_state["_claims_msg"] = f"{pid} に請求項を登録しました。"
+            st.rerun()
+    else:
+        st.caption("請求項が未登録の特許はありません。")
+    st.markdown("##### ③ 登録した請求項を解析する")
+    st.caption("1件あたり数秒〜1分ほどかかります（LLMの呼び出しを含む）。")
+    if st.button(f"🚀 請求項あり・未解析の {len(ready)} 件を解析する", type="primary", disabled=not ready):
+        analyze_dataset_patents([p["id"] for p in ready])
+
+
 def run_ingest(ing):
-    todo = [p for p in ing["patents"] if not p["analyzed"]]
+    todo = [p for p in ing["patents"] if not p["analyzed"] and p["text"]]
     if not todo:
         finish_ingest(ing)
         return
@@ -528,9 +636,10 @@ def run_ingest(ing):
 
 
 def finish_ingest(ing, partial=False):
-    ps = [p for p in ing["patents"] if p["analyzed"]]
+    # 請求項が無い・まだ解析していない特許も、書誌情報の分析に使えるので含める
+    ps = ing["patents"]
     if not ps:
-        st.error("解析できた特許がありません。")
+        st.error("読み込める特許がありません。")
         return
     data = PC.new_dataset(ing["name"], [json.loads(json.dumps(p)) for p in ps])
     with st.spinner("Patent World・類似性マップの配置を計算中…"):
@@ -538,9 +647,13 @@ def finish_ingest(ing, partial=False):
     set_dataset(data)
     if not partial:
         st.session_state.ingest = None
-    st.success(f"「{ing['name']}」（{len(ps)}件）の解析が終わりました。「解析と確認」や各分析ページで見られます。"
-               "エクスポートページから解析済みデータ（JSON）を保存しておくと、次回はすぐ開けます。")
-    st.balloons()
+    n_an = sum(p["analyzed"] for p in ps)
+    # 画面の上のほうは読み込み前のデータで描かれているので、読み込み後に描き直す
+    st.session_state["_ingest_msg"] = (
+        f"「{ing['name']}」（{len(ps)}件、うち解析済み {n_an} 件）を読み込みました。"
+        + ("請求項のない特許は、上の「📝 請求項を追加」から請求項を足して解析できます。" if n_an < len(ps) else "")
+        + "エクスポートページから解析済みデータ（JSON）を保存しておくと、次回はすぐ開けます。")
+    st.rerun()
 
 
 # ===========================================================================
@@ -553,8 +666,13 @@ def analyze_body():
     col1, col2 = st.columns([3, 1])
     with col2:
         opts = ["（使わない）"] + ([p["id"] for p in DATA["patents"]] if DATA else [])
-        pick = st.selectbox("データセットから読み込む（任意）", opts,
-                            format_func=lambda x: x if x == "（使わない）" else patent_label(x))
+        pick = st.selectbox("データセットの特許（任意）", opts,
+                            format_func=lambda x: x if x == "（使わない）" else
+                            patent_label(x) + ("" if PATENTS[x].get("text") else "（請求項なし）"),
+                            help="請求項が未登録の特許を選んだ場合は、公報の請求項1を貼り付けて解析し、「確定して保存」で"
+                                 "その特許に登録できます。")
+        if pick != "（使わない）" and PATENTS[pick].get("url"):
+            st.markdown(f"[公報を開く]({PATENTS[pick]['url']})")
     with col1:
         default = PATENTS[pick]["text"] if pick != "（使わない）" else SAMPLE_CLAIM
         text = st.text_area("特許請求項テキスト", value=default, height=220, key=f"an_text_{pick}")
@@ -611,6 +729,11 @@ def analyze_body():
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("✅ 確定して保存", type="primary"):
         if res.get("pick") in PATENTS:
+            pt = PATENTS[res["pick"]]
+            if PC.first_claim(res["text"]) != pt.get("text") or not pt.get("analyzed", True):
+                # 請求項が未登録だった特許（J-PlatPat の CSV など）は、ここで貼り付けた請求項と解析結果を登録する
+                pt["text"] = PC.first_claim(res["text"])
+                PC.apply_analysis(pt, res["cands"])
             st.session_state.reviews[res["pick"]] = PC.table_to_review(edited)
             st.success(f"{res['pick']} の確認結果として保存しました（分析ページに反映されます）。")
         else:
@@ -638,16 +761,23 @@ def review_body():
     reviews = st.session_state.reviews
     st.caption("読み込んだ特許ごとに、AIの判定を確認・修正して確定します。確定した内容は、ネットワーク・類似性マップなど"
                "すべての分析に反映されます（エクスポートページで保存・読み込みできます）。")
+    n_wait = sum(1 for p in DATA["patents"] if not (p.get("text") and p.get("analyzed", True)))
+    if n_wait:
+        st.info(f"請求項が未登録または未解析の特許が {n_wait} 件あります（ここには出ません）。"
+                "「データの読み込み」の「📝 請求項を追加」で請求項を登録して解析するか、"
+                "上の「請求項を貼り付けて解析する」で1件ずつ解析できます。", icon="📝")
     f1, f2, f3 = st.columns([2, 2, 1])
     comp = f1.multiselect("出願人で絞り込む", sorted({p["company"] for p in DATA["patents"]}))
     order = f2.selectbox("並び順", ["要確認が多い順", "特許番号順", "採用が少ない順"])
     only_open = f3.checkbox("未確認のみ", value=True)
-    ps = [p for p in DATA["patents"] if (not comp or p["company"] in comp) and (not only_open or p["id"] not in reviews)]
+    ps = [p for p in DATA["patents"] if p.get("text") and p.get("analyzed", True)
+          and (not comp or p["company"] in comp) and (not only_open or p["id"] not in reviews)]
     key = {"要確認が多い順": lambda p: -sum(r["status"] == PC.STATUS_REVIEW for r in p["relations"]),
            "特許番号順": lambda p: p["id"],
            "採用が少ない順": lambda p: sum(r["status"] == PC.STATUS_ACCEPT for r in p["relations"])}[order]
     ps = sorted(ps, key=key)
-    st.progress(len(reviews) / len(DATA["patents"]), text=f"確認済み {len(reviews)} / {len(DATA['patents'])} 件")
+    n_an = max(1, sum(1 for p in DATA["patents"] if p.get("text") and p.get("analyzed", True)))
+    st.progress(min(1.0, len(reviews) / n_an), text=f"確認済み {len(reviews)} / {n_an} 件（解析済みの特許のうち）")
     if not ps:
         st.info("条件に合う未確認の特許はありません。")
         return
@@ -1324,6 +1454,27 @@ def page_export():
         st.caption("人手確認済みの特許は確認結果、それ以外はAIが選んだSAO")
         st.download_button("⬇️ CSVをダウンロード", PC.relations_csv(DATA, reviews), file_name="patent_sao.csv",
                            mime="text/csv")
+    st.divider()
+    st.markdown("#### 正解データとして書き出す（研究用：他分野での精度の検証・学習データの追加）")
+    done = [p for p in DATA["patents"] if p["id"] in reviews and p.get("text")]
+    st.caption("人手確認で確定した特許だけを、本研究の正解データと同じ形式（請求項のJSONと正解SAOのJSON）で書き出します。"
+               "他分野の特許で作れば、`python patent_pipeline.py --eval-mode exact --external --claims-file 請求項.json "
+               "--gold-file 正解.json --limit 0` で、半導体532件で学習したモデルの精度を測れます。"
+               "※AIの結果を直して作った正解は、AIの出力に引きずられて甘くなりやすいので、評価に使う分は請求項を読んで"
+               "一から確認してください。")
+    if done:
+        claims_json = [{"id": p["id"], "company": p.get("company", ""), "title": p.get("title", ""),
+                        "fi": p.get("fi", ""), "field": (p.get("fi_sub") or [""])[0], "text": p["text"]} for p in done]
+        gold_json = {p["id"]: [{"source": r["source"], "relation": r["relation"], "target": r["target"]}
+                               for r in reviews[p["id"]] if r.get("keep", True)] for p in done}
+        g1, g2 = st.columns(2)
+        g1.download_button(f"⬇️ 請求項（{len(done)}件）", json.dumps(claims_json, ensure_ascii=False, indent=1).encode("utf-8"),
+                           file_name="claims_for_gold.json", mime="application/json")
+        g2.download_button(f"⬇️ 正解SAO（{sum(len(v) for v in gold_json.values())}件）",
+                           json.dumps(gold_json, ensure_ascii=False, indent=1).encode("utf-8"),
+                           file_name="gold_sao.json", mime="application/json")
+    else:
+        st.info("人手確認で確定した特許がまだありません（「解析と確認」で確定すると書き出せます）。")
     st.divider()
     st.markdown("#### 人手確認の保存と読み込み")
     st.caption("確認結果はブラウザを閉じると消えます。作業を続けるときは保存したCSVを読み込んでください。")
