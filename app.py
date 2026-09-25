@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-25e"
+NEED_PIPELINE = "2026-09-25f"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -249,7 +249,7 @@ def duplicate_flags(gpp, info, keys):
             for c in info["cands"]]
 
 
-METHODS = ["学習なし：GiNZA規則＋LLM抽出 → LLMが選別 → ルールで整理", "比較用：学習済み選別モデル（実験14）"]
+METHODS = ["学習なし：GiNZA規則＋LLM抽出 → LLMが確認・追加 → ルールで整理", "比較用：学習済み選別モデル（実験14）"]
 if "_select_cache" not in st.session_state:
     st.session_state["_select_cache"] = {}
 
@@ -284,8 +284,9 @@ def analyze_llm(text, model, host, pool="wide", with_translate=False):
                       else "英訳でエラー：" + str(info["translate_error"])[:60]))
     steps += [
              ("候補の統合（重複をまとめる）", f"候補 {len(info['cands'])} 件"),
-             ("③ LLMによる選別", f"選ばれた関係 {n_sel} 件" if mode == "llm" else
-              f"LLMを呼べなかったため、①②の両方が出した {n_sel} 件を採用" if mode == "both" else
+             ("③ LLMによる確認と追加",
+              f"規則の結果 {info.get('n_base', 0)} 件から {info.get('n_deleted', 0)} 件を削除、"
+              f"{info.get('n_added', 0)} 件を追加" if mode == "llm" else
               f"LLMを呼べなかったため、GiNZAの規則の結果 {n_sel} 件を採用"),
              ("④ ルールによる整理", "同じ組の重複を1件にまとめ、採用 %d 件／要確認 %d 件"
               % (sum(j["status"] == "採用" for j in judged), sum(j["status"] == "要確認" for j in judged)))]
@@ -414,8 +415,8 @@ def editor_config():
         "採用する": st.column_config.CheckboxColumn("採用する", help="チェックした関係だけが確定されます"),
         "確率": st.column_config.ProgressColumn(
             "確からしさ", min_value=0.0, max_value=1.0, format="%.2f",
-            help="学習なしの方法では、判定の根拠を数値にした目安（LLMが選んだ＋規則とLLMの両方が出した 1.0／LLMが選んだ 0.8／"
-                 "選ばれなかったが規則とLLMの両方が出した 0.5／選ばれなかったGiNZAの規則 0.3／それ以外 0.1。LLMを呼べないときは GiNZAの規則の結果 0.6）。比較用の学習済み選別モデルでは、"
+            help="学習なしの方法では、判定の根拠を数値にした目安（採用＋2系統以上 1.0／採用＋1系統 0.8／採用されなかった"
+                 "2系統以上 0.5／LLMが削除した規則の結果 0.3／それ以外 0.1。LLMを呼べないときは GiNZAの規則の結果 0.6）。比較用の学習済み選別モデルでは、"
                  "モデルが見積もった「正しい見込み」（確率）。"),
         "判定": st.column_config.TextColumn("AIの判定", disabled=True),
         "抽出元": st.column_config.TextColumn("抽出元", disabled=True),
@@ -780,14 +781,14 @@ def analyze_body():
             st.warning("LLM（Ollama）を呼べなかったため、GiNZAの規則だけで判定しました。Ollamaを起動して"
                        "（ollama serve／ollama pull qwen3.5:9b）解析し直すと、②LLMの直接抽出と③LLMの選別が使われます。")
         elif res.get("mode") == "both":
-            st.warning("③の選別でLLMを呼べなかったため、①GiNZAの規則と②LLMの直接抽出の両方が出した関係を採用にしました。")
-        st.caption("採用：③でLLMが選んだ関係（④で同じ組の重複を整理した後）／要確認：選ばれなかったが、2つ以上の系統"
-                   "（GiNZAの規則・LLMの直接抽出・英訳経由）が出した関係、GiNZAの規則が出した関係、④で外した別表現"
-                   "（取りこぼしを防ぐため表に残します。正しければ「採用する」にチェック）／除外：それ以外（表では非表示。"
-                   "下の「全候補」で見られます）。「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの"
-                   "（選ばれた＋2系統以上 1.0／選ばれた＋1系統 0.8／選ばれなかった＋2系統以上 0.5／"
-                   "選ばれなかったGiNZAの規則 0.3／それ以外 0.1）。")
-        with st.expander("③ LLMの選別の出力（そのまま）"):
+            st.warning("③でLLMを呼べなかったため、GiNZAの規則の結果をそのまま採用にしました。")
+        st.caption("採用：GiNZAの規則の結果のうち③でLLMが削除しなかった関係と、LLMが追加した関係（④で同じ組の重複を"
+                   "整理した後）／要確認：LLMが削除した規則の結果、2つ以上の系統（GiNZAの規則・LLMの直接抽出・英訳経由）が"
+                   "出したが追加されなかった関係、④で外した別表現（取りこぼしを防ぐため表に残します。正しければ「採用する」に"
+                   "チェック）／除外：それ以外（表では非表示。下の「全候補」で見られます）。「確からしさ（目安）」は学習した"
+                   "確率ではなく、判定の根拠を数値にしたもの（採用＋2系統以上 1.0／採用＋1系統 0.8／採用されなかった2系統以上 "
+                   "0.5／LLMが削除した規則の結果 0.3／それ以外 0.1）。")
+        with st.expander("③ LLMの出力（そのまま）"):
             st.code(res.get("raw", ""))
     else:
         st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
