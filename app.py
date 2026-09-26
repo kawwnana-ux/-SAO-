@@ -259,8 +259,9 @@ def analyze_llm(text, model, host):
     """最終方式（A2・学習なし）：LLMで構成要素を先に取り出して固定し、GiNZAの規則で関係を取り出す。"""
     gpp = load_pipeline()
     t0 = time.time()
+    # 網羅候補（R60）は評価用（候補の再現率を測るため）。アプリでは表が重くなるので作らない
     info, judged, raw = pp.llm_select.analyze_claim_a2(ts, gpp, text, cache=st.session_state["_select_cache"],
-                                                      model=model, host=host)
+                                                      model=model, host=host, recall_cands=False)
     cands = []
     for c, j in zip(info["cands"], judged):
         rules = j.get("rules") or []
@@ -387,6 +388,48 @@ def sao_graph(relations, key="main", colors=None):
         with st.expander(f"図に描いていない関係（階層を横切る関係 {len(cross)} 件）"):
             st.dataframe(pd.DataFrame([{"主語": r["source"], "関係": r["relation"], "目的語": r["target"]}
                                        for r in cross]), hide_index=True, use_container_width=True)
+    return colors
+
+
+_GRAPH_EDITOR = components.declare_component("sao_graph_editor", path=str(APP_DIR / "sao_graph_editor"))
+
+
+def graph_edit_section(edited, kb):
+    """図で直す：表で「採用する」になっている関係を、編集できる図（sao_graph_editor）に出す。
+    図で「表に反映」を押すと、表の行を書き換え（削除した関係は「採用する」を外し、足した関係は行を追加）、表を作り直す。"""
+    rows = edited.to_dict("records")
+    edges, rels = [], []
+    for i, r in enumerate(rows):
+        s, a, o = (str(r.get(k) or "").strip() for k in ("主語(S)", "関係(A)", "目的語(O)"))
+        if r.get("採用する") and s and a and o:
+            edges.append({"id": i, "source": s, "relation": a, "target": o})
+            rels.append({"source": s, "relation": a, "target": o})
+    colors = pp.component_colors(rels)
+    st.caption("「＋ 関係を引く」：主語 → 目的語の順に部品をクリック／関係や部品をクリックすると右の欄で直せます／"
+               "直したら「表に反映」を押してください（押すまでは表と保存内容は変わりません）。")
+    val = _GRAPH_EDITOR(edges=edges, colors=colors, key=f"{kb}_graph_{st.session_state[kb + '_ver']}", default=None)
+    if val and val.get("nonce") and val["nonce"] != st.session_state.get(kb + "_nonce"):
+        st.session_state[kb + "_nonce"] = val["nonce"]
+        kept = {e["id"] for e in val["edges"] if e.get("id") is not None}
+        new_rows = []
+        for i, r in enumerate(rows):
+            r = dict(r)
+            if r.get("採用する") and i not in kept:
+                r["採用する"] = False
+            new_rows.append(r)
+        for e in val["edges"]:
+            if e.get("id") is not None and 0 <= e["id"] < len(new_rows):
+                r = new_rows[e["id"]]
+                if (r["主語(S)"], r["関係(A)"], r["目的語(O)"]) != (e["source"], e["relation"], e["target"]):
+                    r.update({"主語(S)": e["source"], "関係(A)": e["relation"], "目的語(O)": e["target"],
+                              "判定": "人手修正", "抽出元": "図で修正"})
+                r["採用する"] = True
+            else:
+                new_rows.append({"採用する": True, "主語(S)": e["source"], "関係(A)": e["relation"],
+                                 "目的語(O)": e["target"], "確率": 1.0, "判定": "人手追加", "抽出元": "図で追加"})
+        st.session_state[kb + "_rows"] = new_rows
+        st.session_state[kb + "_ver"] += 1
+        st.rerun()
     return colors
 
 
@@ -777,16 +820,21 @@ def analyze_body():
     st.markdown("#### ③ 確認・修正")
     st.caption("「採用する」のチェックを付け外しし、主語・関係・目的語は直接書き換えられます。表の一番下の行から関係を追加できます。")
     show = [c for c in res["cands"] if c["status"] != PC.STATUS_REJECT]
-    df = pd.DataFrame([{
-        "採用する": c["status"] == PC.STATUS_ACCEPT or (c["status"] == PC.STATUS_REVIEW and c["selected"]),
-        "主語(S)": c["source"], "関係(A)": c["relation"], "目的語(O)": c["target"], "確率": c["prob"],
-        "判定": c["status"], "抽出元": c["origin"]} for c in show],
-        columns=["採用する", "主語(S)", "関係(A)", "目的語(O)", "確率", "判定", "抽出元"])
+    kb = "an_" + str(abs(hash((res["text"], tuple((c["source"], c["relation"], c["target"], c["status"])
+                                                   for c in show)))) % 10**10)
+    if kb + "_rows" not in st.session_state:
+        st.session_state[kb + "_rows"] = [{
+            "採用する": c["status"] == PC.STATUS_ACCEPT or (c["status"] == PC.STATUS_REVIEW and c["selected"]),
+            "主語(S)": c["source"], "関係(A)": c["relation"], "目的語(O)": c["target"], "確率": c["prob"],
+            "判定": c["status"], "抽出元": c["origin"]} for c in show]
+        st.session_state[kb + "_ver"] = 0
+    df = pd.DataFrame(st.session_state[kb + "_rows"],
+                      columns=["採用する", "主語(S)", "関係(A)", "目的語(O)", "確率", "判定", "抽出元"])
     edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, hide_index=True,
-                            column_config=editor_config(), key=f"an_editor_{hash(res['text']) % 10**8}")
+                            column_config=editor_config(), key=f"{kb}_editor_{st.session_state[kb + '_ver']}")
     confirmed = [r for r in PC.table_to_review(edited) if r["keep"]]
 
-    st.markdown(f"**構成要素（GiNZA）**：{'、'.join(res['tags']) or '―'}")
+    st.markdown(f"**構成要素（GiNZA）**：{'、'.join(t for t in res['tags'] if t not in ('一方', '他方', '双方', '両方')) or '―'}")
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("✅ 確定して保存", type="primary"):
         if res.get("pick") in PATENTS:
@@ -804,7 +852,13 @@ def analyze_body():
     b2.download_button("⬇️ CSVで保存", pd.DataFrame(confirmed).to_csv(index=False).encode("utf-8-sig"),
                        file_name="sao_confirmed.csv", mime="text/csv")
     st.markdown("**確定予定のSAO構造**")
-    colors = sao_graph(confirmed, key="analyze")
+    edit_mode = st.toggle("✏️ 図で直す", value=False, key=f"{kb}_graphedit",
+                          help="図の上で、関係の追加・削除・向きの反転・関係名の変更、部品の名前の変更・親の付け替えができます。"
+                               "「表に反映」を押すと、上の表（と保存される内容）に反映されます。")
+    if edit_mode:
+        colors = graph_edit_section(edited, kb)
+    else:
+        colors = sao_graph(confirmed, key="analyze")
     with st.expander("請求項の本文（構成要素を図と同じ色でマーク）"):
         st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(res['text'], colors)}</div>",
                     unsafe_allow_html=True)
