@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-25k"
+NEED_PIPELINE = "2026-09-26b"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -263,9 +263,11 @@ def analyze_llm(text, model, host):
                                                       model=model, host=host)
     cands = []
     for c, j in zip(info["cands"], judged):
+        rules = j.get("rules") or []
         cands.append({"source": c["source"], "relation": c["relation"], "target": c["target"],
                       "prob": j["score"], "selected": j["selected"], "status": j["status"],
-                      "origin": j["basis"], "srcs": list(c.get("srcs", []))})
+                      "origin": j["basis"] + ("（規則 " + "・".join(rules) + "）" if rules else ""),
+                      "rules": rules, "srcs": list(c.get("srcs", []))})
     cands.sort(key=lambda r: -r["prob"])
     cands = tidy_candidates(cands)
     mode = info.get("mode", "llm")
@@ -281,7 +283,7 @@ def analyze_llm(text, model, host):
     bands = {"accept": 0.8, "threshold": 0.8, "review_low": 0.5, "method": "a2"}
     return {"tags": list(used) or list(info["tags"]), "title": info.get("title"), "format": info.get("format", ""),
             "cands": cands, "steps": steps, "bands": bands, "elapsed": time.time() - t0, "raw": str(raw)[:2000],
-            "mode": mode}
+            "mode": mode, "dropped": list(info.get("dropped") or [])}
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
@@ -812,6 +814,51 @@ def analyze_body():
                                    for c in res["cands"]]).rename(columns={
             "status": "判定", "prob": _pl, "source": "主語", "relation": "関係", "target": "目的語", "origin": "抽出元"}),
             hide_index=True, use_container_width=True)
+    if res.get("dropped"):
+        with st.expander(f"規則で除いた関係（{len(res['dropped'])} 件）"):
+            st.caption("分野に依存しない規則（「規則の一覧」ページ）で除いた関係です。正しいものが除かれていたら、"
+                       "その規則の見直しの材料になります。")
+            st.dataframe(pd.DataFrame([{"規則": f"{d['rule']} {pp.rulebook.name(d['rule'])}", "主語": d["source"],
+                                        "関係": d["relation"], "目的語": d["target"]} for d in res["dropped"]]),
+                         hide_index=True, use_container_width=True)
+
+
+def page_rules():
+    st.title("📏 規則の一覧")
+    st.caption("最終方式（LLMで構成要素を固定 → GiNZAの規則）の流れは固定し、この一覧の「分野に依存しない規則」を"
+               "足していきます。解析結果の表の「抽出元」に、その関係を作った・書き換えた規則の番号が出ます。")
+    RB = pp.rulebook
+    rows = []
+    for r in RB.RULES:
+        eff = RB.EFFECTS.get(r["id"], {})
+        rows.append({"番号": r["id"], "段階": r["stage"], "規則": r["name"], "説明": r["desc"], "例": r["example"],
+                     "LLM": "使う" if r["llm"] else "―",
+                     "532件での効果（F1差）": ((f"完全一致 {eff['f1_delta']:+.2f}pt／構造 {eff.get('struct_delta', 0):+.2f}pt"
+                                             + (f"（{eff['note']}）" if eff.get("note") else ""))
+                                            if "f1_delta" in eff else
+                                            ("LLMが必要（規則だけでは測れない）" if r["llm"] else "未測定")),
+                     "状態": "有効" if RB.enabled(r["id"]) else "停止中"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=min(700, 38 * (len(rows) + 1)))
+    st.caption("効果＝その規則を入れたときのF1の変化（532件・半導体・LLMなしで、規則を1つずつ止めて測った差）。"
+               "規則をすべて使ったときは 完全一致 F1 42.85%／構造 F1 49.52%（2026-09-25）。半導体の正解データでは"
+               "小さく、マイナスのもの（R11・R21）もあるが、方法の請求項や長い列挙など、他分野の請求項での崩れを防ぐために入れている。")
+    st.markdown("#### 規則を足すときの手順")
+    st.markdown(
+        "1. `rulebook.py`（統合版では patent_pipeline.py の中）の一覧に1行足し、実装した場所をその番号のスイッチで囲む\n"
+        "2. **run_rules_check.bat** をダブルクリック（LLM不要・532件・約10分）。前回からのF1の変化が表示される\n"
+        "3. 規則を足すきっかけになった請求項で、正しく直ることを「解析と確認」で確かめる\n"
+        "4. 規則ごとの効果を測るときは、`--disable R31` のようにその規則だけ止めて同じ確認を回す")
+    hist = APP_DIR / "rules_history.json"
+    if hist.exists():
+        try:
+            H = json.loads(hist.read_text(encoding="utf-8"))
+            st.markdown("#### 規則の確認の履歴（run_rules_check.bat の結果）")
+            st.dataframe(pd.DataFrame([{"日時": h["time"], "止めた規則": "・".join(h.get("disabled") or []) or "なし",
+                                        "件数": h["n"], "完全一致 F1": f"{100 * h['exact_f1']:.1f}",
+                                        "構造 F1": f"{100 * h['struct_f1']:.1f}", "メモ": h.get("note", "")}
+                                       for h in reversed(H)]), hide_index=True, use_container_width=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def review_body():
@@ -1574,6 +1621,7 @@ nav = st.navigation({
                    st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
     "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
                 st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
-    "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export")],
+    "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export"),
+            st.Page(page_rules, title="規則の一覧", icon="📏", url_path="rules")],
 }, expanded=True)
 nav.run()
