@@ -9479,7 +9479,8 @@ rulebook.py
 規則を足すときの手順：
   1. 下の RULES に1行足す（id・段階・名前・説明・例）。id は段階ごとの番号（構成要素 R0x、分割 R1x、SAO R2x、整理 R3x）
   2. 実装した場所で `if RB.enabled("R..")` で囲み、関係を作った・書き換えた・除いたときは rule id を記録する
-  3. run_rules_check.bat（LLMなし・532件）で、足す前より F1 が下がっていないことを確かめ、effect に結果を書く
+  3. run_rules_check.bat（LLMなし）で dev を選び、足す前より F1 が下がっていないことを確かめ、effect に結果を書く
+     （誤りの中身を見てよいのは dev だけ。test は数字を測るだけ。評価の手順.md）
   4. 規則を足すきっかけになった請求項（他分野など）で、正しく直ることを確かめる
 
 評価コマンドの --disable R31,R33 のように指定すると、その規則を止めて測れる（規則ごとの効果の確認）。
@@ -9507,6 +9508,14 @@ RULES = [
      "desc": "確かめた名前をGiNZAの解析結果の中で1語に結合し、その語を構成要素として規則で関係を取り出す",
      "example": "第１周波数変換器・しょうが・原料を加熱する工程 が途中で切れない", "llm": True},
     # ---- 構造の分割 ----
+    {"id": "R48", "stage": "構成要素", "name": "名前の端の切れ端を外す",
+     "desc": "名前の後ろの「の一部」「の夫々」「の各々」、前に残った「つの」（「１つの」の切れ端）、「前記」の「前」が落ちた「記」を外す。"
+             "「第１」だけの名前（「第１側面」などが途中で切れたもの）の関係は除く",
+     "example": "第２ダイパッドの夫々 → 第２ダイパッド、記主配線層 → 主配線層", "llm": False},
+    {"id": "R49", "stage": "構成要素", "name": "いつも持ち主付きで出てくる名前は持ち主ごと名前にする",
+     "desc": "本文で y がいつも「（前記）Xの y」の形で出てきて、X が1つの構成要素に決まるなら、名前を「Xのy」にする"
+             "（「電位」だけでは何の電位か分からない。正解データもこの書き方）",
+     "example": "電位（本文はいつも「第２接続点の電位」）→ 第２接続点の電位", "llm": False},
     {"id": "R10", "stage": "構造の分割", "name": "手がかり句で区間に分ける（新森ら）",
      "desc": "「名詞＋と、」「連用形＋、」「において、」「であって、」で請求項を区間に分け、区間ごとにも解析する",
      "example": "「前記Xは、…を含み、」を1つの文として解析", "llm": False},
@@ -9573,37 +9582,49 @@ RULES = [
      "desc": "題名以外が主語の動詞の関係（接続・配置・封止など）は、区間ごとの解析（R10）でも出たか、本文に「tに…接続されたs」"
              "「前記sは、…tに…接続され」の形（関係名の漢字の語幹で照合）があるときだけ採用する（無ければ要確認）",
      "example": "第２導電接続部材｜接続され｜第一入力接続部（本文にその形が無い）→ 要確認", "llm": False},
+    {"id": "R47", "stage": "SAO", "name": "列挙の展開（R21）を本文の文型で裏付ける",
+     "desc": "LLMが書き出していない要素への列挙の展開（R21）は、本文に「A、B及びCを有するX」「A、B及びCから構成されるX」"
+             "「前記Xは、A、B及びCを有し」の形があるときだけ行う（R20：LLMの構成要素どうしの展開には使わない）",
+     "example": "各々導電性を有する第１制御層、第２制御層… → 導電層｜有する｜各々導電性 のような展開をしない", "llm": False},
+    {"id": "R50", "stage": "つなぎ", "name": "区間ごとの解析だけが出した関係も、裏付けがあれば採用",
+     "desc": "請求項全体の解析では出ず、手がかり句で区切った区間ごとの解析（R10）だけが出した関係のうち、位置関係と、"
+             "本文の文型の裏付け（R45・R46 と同じ照合）がある関係は採用する（題名が主語のものは除く）",
+     "example": "区間「前記第１端子は、前記ケースから露出している部分に設けられた貫通穴を含み」から出た関係", "llm": False},
     # ---- 評価（抽出ではなく、正解との照合に使う規則）----
     {"id": "E01", "stage": "評価", "name": "同一ノードの規則",
      "desc": "「Xの一部」「Xの外側」「Xの上面」などは X と同じ構成要素とみなしてから、正解と抽出を比べる（構造評価）",
      "example": "酸化物半導体層の一部 ＝ 酸化物半導体層", "llm": False},
 ]
 
-# 532件（半導体）で測った効果。run_rules_check.bat の --disable で1つずつ止めて測った値を書く
-# （"F1差" は、その規則を入れたときのトリプル完全一致F1の変化（ポイント）。LLMを使う規則はLLMなしでは測れない）
-# 測定日 2026-09-26。規則をすべて使ったときのF1：完全一致 47.86%／構造 54.50%（LLMなし・532件）
-# （つなぎの規則 R40〜R46・題名の取り直し・工程の規則の修正を入れる前は 42.85%／49.52%）
+# 効果は「評価の手順.md」に従い、dev（260件）で1つずつ止めて測った値（トリプル完全一致F1・構造F1の変化、ポイント）。
+# LLMを使う規則はLLMなしでは測れない。
+# 測定日 2026-09-26。規則をすべて使ったときの dev のF1：完全一致 50.03%／構造 56.19%（LLMなし）
+# 532件全体：完全一致 49.6%（P 57.2／R 43.8）、test（272件）：49.1%。R40 より前は全体 42.9%
 EFFECTS = {
-    "R01": {"f1_delta": 0.23, "struct_delta": 0.25},
-    "R02": {"f1_delta": 0.21, "struct_delta": 0.13},
-    "R03": {"f1_delta": -0.01, "struct_delta": 0.0, "note": "他分野（食品）の「しょうが」のため。半導体ではほぼ該当なし"},
-    "R10": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "R41・R42・R45・R46 の裏付け（区間ごとの解析）として使う"},
-    "R11": {"f1_delta": 0.15, "struct_delta": 0.17},
-    "R21": {"f1_delta": -0.39, "struct_delta": -0.44, "note": "LLMが列挙の一部を書き漏らしたときの補い。LLMなしでは下がる"},
+    "R01": {"f1_delta": 0.24, "struct_delta": 0.25},
+    "R02": {"f1_delta": 0.13, "struct_delta": 0.13},
+    "R03": {"f1_delta": -0.03, "struct_delta": 0.02, "note": "他分野（食品）の「しょうが」のため。半導体ではほぼ該当なし"},
+    "R10": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "R41・R42・R45・R46・R50 の裏付け（区間ごとの解析）として使う"},
+    "R11": {"f1_delta": 0.06, "struct_delta": 0.07},
+    "R21": {"f1_delta": -0.04, "struct_delta": -0.05, "note": "LLMが列挙の一部を書き漏らしたときの補い（R47で本文の裏付けを必須にした）"},
+    "R30": {"f1_delta": 0.05, "struct_delta": 0.04},
+    "R31": {"f1_delta": 0.07, "struct_delta": -0.01},
+    "R32": {"f1_delta": 0.02, "struct_delta": 0.01},
+    "R33": {"f1_delta": 0.06, "struct_delta": 0.02},
+    "R34": {"f1_delta": 0.02, "struct_delta": 0.02},
     "R22": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "532件ではほぼ該当なし"},
-    "R30": {"f1_delta": 0.06, "struct_delta": 0.02},
-    "R31": {"f1_delta": 0.18, "struct_delta": 0.09},
-    "R32": {"f1_delta": 0.05, "struct_delta": 0.03},
-    "R33": {"f1_delta": 0.18, "struct_delta": 0.01},
-    "R34": {"f1_delta": 0.02, "struct_delta": 0.01},
+    "R36": {"f1_delta": 0.25, "struct_delta": 0.16},
     "R35": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "採用の判定には影響しない（採用されない候補の整理）"},
-    "R36": {"f1_delta": 0.37, "struct_delta": 0.28},
-    "R40": {"f1_delta": 0.48, "struct_delta": 0.57},
-    "R41": {"f1_delta": 0.33, "struct_delta": 0.33},
-    "R42": {"f1_delta": 0.23, "struct_delta": 0.28},
-    "R44": {"f1_delta": 0.27, "struct_delta": 0.4},
-    "R45": {"f1_delta": 2.06, "struct_delta": 2.11},
-    "R46": {"f1_delta": 1.06, "struct_delta": 0.87},
+    "R40": {"f1_delta": 0.49, "struct_delta": 0.56},
+    "R41": {"f1_delta": 0.36, "struct_delta": 0.36},
+    "R42": {"f1_delta": 0.31, "struct_delta": 0.34},
+    "R44": {"f1_delta": 0.35, "struct_delta": 0.42},
+    "R45": {"f1_delta": 2.05, "struct_delta": 2.21},
+    "R46": {"f1_delta": 1.12, "struct_delta": 1.0},
+    "R47": {"f1_delta": 0.47, "struct_delta": 0.56},
+    "R48": {"f1_delta": 0.3, "struct_delta": -0.11},
+    "R49": {"f1_delta": 0.48, "struct_delta": 0.09},
+    "R50": {"f1_delta": 0.82, "struct_delta": 1.19},
 }
 
 _BY_ID = {r["id"]: r for r in RULES}
@@ -14589,8 +14610,18 @@ NON_NODES = {"複数", "多数", "一対", "互い", "それぞれ", "各々", "
              "こと", "もの", "場合", "状態", "備え", "有し", "含み", "具備し", "設け", "一つ", "１つ", "1つ"}
 
 
+_R48_SUFFIX_RE = re.compile(r"の(?:一部|夫々|各々|それぞれ)$")
+_R48_ORDINAL_ONLY_RE = re.compile(r"^第[0-9０-９一二三四五六七八九十]+$")
+
+
 def clean_node(x):
-    """【R02】「前記複数の多穴管」→「多穴管」のように、名前の前の数量・指示の言葉を外す（残りが空になるなら外さない）。"""
+    """【R02】「前記複数の多穴管」→「多穴管」のように、名前の前の数量・指示の言葉を外す（残りが空になるなら外さない）。
+    【R48】名前の後ろの「の一部」「の夫々」「の各々」と、前に残った「つの」（「１つの」の切れ端）も外す。"""
+    if enabled("R48"):
+        y = _R48_SUFFIX_RE.sub("", x)
+        y = re.sub(r"^(?:つ|個|本|枚)の", "", y)
+        if len(y) >= 2:
+            x = y
     if not enabled("R02"):
         return x
     prev = None
@@ -14612,6 +14643,9 @@ def normalize_candidates(cands, info=None):
             continue
         if enabled("R01") and (s in NON_NODES or t in NON_NODES):
             drop(info, c, "R01")
+            continue
+        if enabled("R48") and (_R48_ORDINAL_ONLY_RE.match(s) or _R48_ORDINAL_ONLY_RE.match(t)):
+            drop(info, c, "R48")  # 「第１」だけの名前は、名前の切れ端（「第１側面」などが途中で切れたもの）
             continue
         key = (s, c["relation"], t)
         if key in index:
@@ -14684,6 +14718,25 @@ def claim_final_title(clean, title):
     return full if len(full) <= 40 else title
 
 
+def _single_owner(y, text, nodes):
+    """【R49】本文で y がいつも「（前記）Xの y」の形で、X が1つの構成要素に決まるなら X を返す（y だけで出てくる、
+    または持ち主が2つ以上あるなら None）。"""
+    owners, alone = set(), False
+    for m in re.finditer(re.escape(y), text):
+        pre = re.sub(r"(?:前記|該)$", "", text[:m.start()])
+        if pre.endswith("の"):
+            base = pre[:-1]
+            cands = [x for x in nodes if x != y and base.endswith(x)]
+            if cands:
+                owners.add(max(cands, key=len))
+                continue
+        alone = True
+        break
+    if alone or len(owners) != 1:
+        return None
+    return next(iter(owners))
+
+
 def structure_fixes(pp, text, info):
     """分野によらない構造の整理（学習なしの規則。番号は rulebook.py の規則の id）。
     R03 「しょう」→「しょうが」：本文で「〜が及び」「〜が、」と続く名前は「が」まで含める
@@ -14712,6 +14765,21 @@ def structure_fixes(pp, text, info):
                 flipped = True
         if flipped:
             cands = normalize_candidates(cands, info)
+    if enabled("R48"):
+        # 「前記主配線層」の「前」が落ちた「記主配線層」を直す
+        for c in cands:
+            for x in (c["source"], c["target"]):
+                if x.startswith("記") and x not in fixes and ("前" + x) in clean and x not in clean.replace("前" + x, ""):
+                    fixes[x], fix_rule[x] = x[1:], "R48"
+    if enabled("R49"):
+        flat = re.sub(r"\s", "", clean)
+        nodes49 = {c["source"] for c in cands} | {c["target"] for c in cands}
+        for y in nodes49:
+            if y in fixes or y == info.get("title"):
+                continue
+            o = _single_owner(y, flat, nodes49)
+            if o and len(o) + 1 + len(y) <= 25:
+                fixes[y], fix_rule[y] = o + "の" + y, "R49"
     if enabled("R30"):
         cands = _drop_where(info, cands, lambda c: any(p in c["source"] + c["target"] for p in ("、", "，")), "R30")
     steps = [c for c in cands if "ST:工程" in c["srcs"]]
@@ -15146,7 +15214,7 @@ def analyze_claim_ls(ts, pp, text, llm_cache=None, select_cache=None, claim_id=N
 _HAS_LIKE = ("有する", "備える", "含む", "具備する", "構成される", "からなる", "なる", "選ばれる", "選択される")
 
 
-def _enum_ok(d, usedset):
+def _enum_ok(d, usedset, text=None):
     """列挙の展開を採用する条件（どちらか）：
     (a) 展開した関係の両端が、LLM が構成要素として書き出した名前
     (b) LLM が書き出していなくても、「A、B、C及びDを備える／含む／から構成される」のような構成・包含の関係で、
@@ -15158,8 +15226,12 @@ def _enum_ok(d, usedset):
         return False
     rel = d["relation"]
     has_like = rel in _HAS_LIKE or rel.startswith(("構成", "含", "備", "有", "選", "から"))
-    return (has_like and d.get("n_items", 0) >= 3 and len(d["source"]) <= 15 and len(d["target"]) <= 15
-            and d["source"] and d["target"])
+    ok = (has_like and d.get("n_items", 0) >= 3 and len(d["source"]) <= 15 and len(d["target"]) <= 15
+          and d["source"] and d["target"])
+    # 【R47】本文に「A、B及びCを有するX」「A、B及びCから構成されるX」「前記Xは、A、B及びCを有し」の形の裏付けがあること
+    if ok and text is not None and enabled("R47"):
+        ok = has_evidence(d["source"], d["target"], text, lists=True) is not None
+    return bool(ok)
 
 
 # ---- 【R45】「有する」系の関係の、本文での裏付け ----
@@ -15168,9 +15240,14 @@ _R45_LEAD = r"(?:前記|該|複数の|一対の|少なくとも[^、。]{0,6}?�
 _R45_TOPIC = re.compile(r"((?:前記|該)[^、。をにがでとへ]{1,30}?)(?:は|が)[、，]")
 _R45_END = r"(?:と|、|，|及び|および|並びに|又は|または|を)"
 _R45_REL_FORMS = ("有する", "有した", "有している", "含む", "含んだ", "備える", "備えた", "具備する", "具備した")
+# 列挙（R21）の裏付けでは「A、B及びCから構成される群」の形も使う
+_R45_HV_LIST = re.compile(r"(?:を(有する|有した|有している|有し|含む|含んだ|含み|含んでなる|備える|備えた|備え|具備する|具備した|具備し)"
+                          r"|(から構成される|から構成された|からなる|から選ばれる|から選ばれた|から選択される|から選択された))")
+_R45_REL_FORMS_LIST = _R45_REL_FORMS + ("から構成される", "から構成された", "からなる", "から選ばれる", "から選ばれた",
+                                        "から選択される", "から選択された")
 
 
-def has_evidence(s, t, text):
+def has_evidence(s, t, text, lists=False):
     """本文に「s が t を有する」ことの形の裏付けがあるか（学習なしの文型の照合）。
     rel：「t（と、…）を有する s」（t の後の最初の「有する」系の動詞が連体形で、直後が s）
     topic：「前記sは、…t（と、…）を有し」（t の前の最も近い「前記〜は、」が s で、t の後の最初の「有する」系の動詞まで
@@ -15180,14 +15257,15 @@ def has_evidence(s, t, text):
     for mt in re.finditer(et + _R45_END, text):
         tops = list(_R45_TOPIC.finditer(text[:mt.start()]))
         tname = re.sub("^" + _R45_LEAD, "", tops[-1].group(1)) if tops else None
-        mv = _R45_HV.search(text, mt.end() - 1)
+        mv = (_R45_HV_LIST if lists else _R45_HV).search(text, mt.end() - 1)
         if mv is None:
             continue
         mid = text[mt.end() - 1:mv.start()]
         if _R45_TOPIC.search(mid) or "。" in mid:
             continue
         after = re.sub("^" + _R45_LEAD, "", text[mv.end():mv.end() + 80])
-        if mv.group(1) in _R45_REL_FORMS and after.startswith(s):
+        form = mv.group(1) or (mv.group(2) if lists else None)
+        if form in (_R45_REL_FORMS_LIST if lists else _R45_REL_FORMS) and after.startswith(s):
             return "rel"
         if tname == s:
             return "topic"
@@ -15227,6 +15305,26 @@ def verb_evidence(s, t, rel, text):
             if tops and re.sub("^" + _R45_LEAD, "", tops[-1].group(1)) == b:
                 return "topic"
     return None
+
+
+def _segment_supported(c, text, title):
+    """【R50】区間ごとの解析（R10）だけが出した候補（請求項全体の解析では出なかったもの）のうち、
+    位置関係、または本文の文型の裏付け（has_evidence／verb_evidence）がある関係は採用する。"""
+    if not enabled("R50") or not text:
+        return False
+    srcs = c["srcs"]
+    if not any(x.startswith("GS:") for x in srcs) or any(x.startswith(("G:", "GF:", "ST:")) for x in srcs):
+        return False
+    if title and c["source"] == title:
+        return False
+    if "GS:positional" in srcs:
+        return True
+    rel = c["relation"]
+    if rel == "の":
+        return False
+    if rel.startswith(("有", "備", "含", "具備")):
+        return has_evidence(c["source"], c["target"], text) is not None
+    return verb_evidence(c["source"], c["target"], rel, text) in ("rel", "topic")
 
 
 def _weak_link(c, title, use_gf, text=None):
@@ -15291,7 +15389,8 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
     nrm = pp._normalize_node_text_lenient
     doc_t = pp.nlp(clean_t)
     raw_exp = coord_expansions(clean_t, seeds, nrm) + coord_expansions_doc(doc_t, seeds, nrm)
-    _add(info, index, [d for d in raw_exp if _enum_ok(d, usedset)], lambda d: "ST:列挙A2")
+    flat0 = re.sub(r"\s", "", clean_t)
+    _add(info, index, [d for d in raw_exp if _enum_ok(d, usedset, flat0)], lambda d: "ST:列挙A2")
     tmp = dict(info, cands=normalize_candidates(info["cands"], info))
     info["cands"] = structure_fixes(pp, text, tmp)
     for k in ("title", "title_long", "dropped"):
@@ -15327,6 +15426,10 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
         elif g and use_gf:
             judged.append({"selected": False, "score": 0.5, "status": "要確認",
                            "basis": "通常のGiNZAの規則だけが出した関係"})
+        elif _segment_supported(c, flat_t, info.get("title")):
+            mark(c, "R50")
+            judged.append({"selected": True, "score": 0.7, "status": "採用",
+                           "basis": "区間ごとの解析＋本文の文型（R50）"})
         else:
             judged.append({"selected": False, "score": 0.1, "status": "除外", "basis": "その他の規則の候補"})
     judged = tidy(pp, info["cands"], judged)
@@ -15851,7 +15954,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-26b"
+PIPELINE_VERSION = "2026-09-26c"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -15860,7 +15963,7 @@ DEFAULT_BANDS = {
 }
 METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
 METHOD_SCORE = ("学習データを使わない最終方式。LLMの呼び出しは1件あたり1回（構成要素の書き出し）。"
-                "参考（532件・LLMなし）：規則だけで トリプル完全一致 F1 47.9%（適合率 55.8%・再現率 41.9%）・構造 F1 54.5%（つなぎの規則 R40〜R46 を入れる前は 42.9%）。"
+                "参考（532件・LLMなし）：規則だけで トリプル完全一致 F1 49.6%（適合率 57.2%・再現率 43.8%。規則を作るのに使っていない test の半分では 49.1%）（つなぎの規則 R40〜R50 を入れる前は 42.9%）。"
                 "精度はローカルのOllamaで評価コマンドを実行して測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
@@ -16542,6 +16645,7 @@ lenient（旧：トリプル全体の意味的類似度 0.75）／strict（旧�
 毎件 --out に保存するので、--resume で途中から再開できる。
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -16628,6 +16732,12 @@ def _load_llm_cache(cache_path):
         return {}
 
 
+def split_of(claim_id):
+    """評価の手順：文献番号の SHA-1 の偶奇で、532件を dev（260件）と test（272件）に固定で分ける。
+    dev＝誤りを見て規則を作ってよい半分、test＝数字を測るだけで、誤りの中身は見ない半分。"""
+    return "dev" if int(hashlib.sha1(claim_id.encode("utf-8")).hexdigest(), 16) % 2 == 0 else "test"
+
+
 def _record_rules_history(args, agg, tot, n):
     """--method rules の結果を rules_history.json に追記し、前回と、同じ件数で規則を止めていない最新の結果と比べる。"""
     import datetime
@@ -16638,6 +16748,7 @@ def _record_rules_history(args, agg, tot, n):
            "ginza_model": globals().get("GINZA_MODEL_NAME") or os.environ.get("SAO_GINZA_MODEL", "").strip() or "ja_ginza",
            "n": n, "exact_p": agg["micro"]["precision"], "exact_r": agg["micro"]["recall"],
            "exact_f1": agg["micro"]["f1"], "struct_p": P, "struct_r": R, "struct_f1": F, "note": args.note,
+           "split": getattr(args, "split", "all"),
            "rules": [r["id"] for r in rulebook.RULES if rulebook.enabled(r["id"])]}
     path = _pathlib.Path(args.data_dir) / "rules_history.json"
     hist = []
@@ -16862,6 +16973,9 @@ def main_eval():
                         help="--with-translate の英訳経由の抽出結果を保存・再利用するファイル")
     parser.add_argument("--disable", default="",
                         help="止める規則の番号をカンマ区切りで（例：R31,R33）。規則ごとの効果を測るときに使う（rulebook.py）")
+    parser.add_argument("--split", default="all", choices=["all", "dev", "test"],
+                        help="評価に使う半分（dev＝規則を作るときに誤りを見てよい半分／test＝数字を測るだけで誤りは見ない半分）。"
+                             "文献番号のハッシュで固定に分ける（評価の手順.md）")
     parser.add_argument("--note", default="", help="--method rules の結果に残すメモ（例：R37を追加）")
     parser.add_argument("--components", default="ginza", choices=["ginza", "llm"],
                         help="--method llm-select の土台。ginza: 通常のGiNZAの規則／llm: 構成要素をLLMで先に取り出し、"
@@ -17044,6 +17158,10 @@ def main_eval():
     if args.format:
         claims = [c for c in claims if pp.classify_claim_format(c["text"]) == args.format]
         print(f"表現形式「{args.format}」に絞り込み: {len(claims)}件")
+
+    if args.split != "all":
+        claims = [c for c in claims if split_of(c["id"]) == args.split]
+        print(f"評価の半分「{args.split}」に絞り込み: {len(claims)}件（評価の手順.md）")
 
     if args.sample:
         # 先頭からではなく、全体から等間隔に選ぶ（会社・年・分野が偏らないように。毎回同じ請求項になる）
@@ -17423,9 +17541,9 @@ node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=L
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
 struct_extra = _types.SimpleNamespace(CONJ=CONJ, HAS_STEMS=HAS_STEMS, LEAD_RE=LEAD_RE, NOT_ITEM_RE=NOT_ITEM_RE, STEP_END_RE=STEP_END_RE, _CONJ_WORDS=_CONJ_WORDS, _LEAD_WORDS=_LEAD_WORDS, _ORDINAL_ONLY=_ORDINAL_ONLY, _chunk_left=_chunk_left, _chunk_name=_chunk_name, _chunk_right=_chunk_right, _clean=_clean, _nounish=_nounish, _np_left=_np_left, _span_text=_span_text, coord_expansions=coord_expansions, coord_expansions_doc=coord_expansions_doc, doc_text=doc_text, find_lists=find_lists, find_lists_doc=find_lists_doc, step_candidates=step_candidates)
 comp_first = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS, COMPONENT_SYSTEM=COMPONENT_SYSTEM, NOUNISH=NOUNISH_cf, _nounish=_nounish_cf, _pattern=_pattern, extract_components_llm=extract_components_llm, forced_relations=forced_relations, guard_names=guard_names, llm_component_relations=llm_component_relations, parse_components=parse_components)
-llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, SELECT_SYSTEM=SELECT_SYSTEM, _GA_FIX_LIST_RE=_GA_FIX_LIST_RE, _GA_FIX_RE=_GA_FIX_RE, _HAS_LIKE=_HAS_LIKE, _HAS_RELS=_HAS_RELS, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, claim_final_title=claim_final_title, clean_node=clean_node, families=families, grounded=grounded, group_pairs=group_pairs, has_evidence=has_evidence, is_base=is_base, judge=judge, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, tidy=tidy, top_level_items=top_level_items, translate_relations=translate_relations, verb_evidence=verb_evidence)
+llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, SELECT_SYSTEM=SELECT_SYSTEM, _GA_FIX_LIST_RE=_GA_FIX_LIST_RE, _GA_FIX_RE=_GA_FIX_RE, _HAS_LIKE=_HAS_LIKE, _HAS_RELS=_HAS_RELS, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_HV_LIST=_R45_HV_LIST, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_REL_FORMS_LIST=_R45_REL_FORMS_LIST, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _segment_supported=_segment_supported, _single_owner=_single_owner, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, claim_final_title=claim_final_title, clean_node=clean_node, families=families, grounded=grounded, group_pairs=group_pairs, has_evidence=has_evidence, is_base=is_base, judge=judge, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, tidy=tidy, top_level_items=top_level_items, translate_relations=translate_relations, verb_evidence=verb_evidence)
 platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
-eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, ts=ts)
+eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, split_of=split_of, ts=ts)
 
 
 if __name__ == "__main__":

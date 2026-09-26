@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-26b"
+NEED_PIPELINE = "2026-09-26c"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
