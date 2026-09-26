@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+
+<style>
+  :root { --bg:#ffffff; --fg:#1f2937; --muted:#6b7280; --line:#d1d5db; --accent:#2563eb; --warn:#b45309; --panel:#f8fafc; }
+  html, body { margin:0; padding:0; font-family: "Hiragino Sans","Yu Gothic UI","Meiryo",sans-serif; color:var(--fg); background:transparent; }
+  .wrap { display:flex; flex-direction:column; gap:6px; }
+  .bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  button { font:inherit; font-size:13px; padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--fg); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.primary { background:#dc2626; color:#fff; border-color:#dc2626; }
+  button:disabled { opacity:.45; cursor:default; }
+  .main { display:flex; gap:8px; }
+  #net { flex:1; height:470px; border:1px solid var(--line); border-radius:10px; background:var(--bg); }
+  .side { width:250px; border:1px solid var(--line); border-radius:10px; padding:10px; background:var(--panel); font-size:13px; box-sizing:border-box; }
+  .side h4 { margin:0 0 6px; font-size:14px; }
+  .side label { display:block; margin:6px 0 2px; color:var(--muted); font-size:12px; }
+  .side input, .side select { width:100%; box-sizing:border-box; font:inherit; font-size:13px; padding:4px 6px; border:1px solid var(--line); border-radius:5px; background:#fff; color:var(--fg); }
+  .side .row { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
+  .msg { font-size:12px; color:var(--muted); min-height:18px; }
+  .msg.warn { color:var(--warn); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="bar">
+    <button id="bAddEdge" title="主語の部品 → 目的語の部品の順にクリックし、右の欄で関係名を入れます">＋ 関係を引く</button>
+    <button id="bAddNode" title="右の欄に名前を入れて追加します">＋ 部品</button>
+    <button id="bReverse" disabled title="選んだ関係の向きを逆にします">⇄ 向きを逆に</button>
+    <button id="bDelete" disabled title="選んだ関係、または部品（とその関係）を消します">🗑 削除</button>
+    <button id="bUndo" disabled>↶ 元に戻す</button>
+    <span style="flex:1"></span>
+    <button id="bApply" class="primary" disabled>表に反映</button>
+  </div>
+  <div class="msg" id="msg">部品をドラッグすると位置を動かせます。関係（矢印）か部品をクリックすると、右の欄で直せます。</div>
+  <div class="main">
+    <div id="net"></div>
+    <div class="side" id="side"><h4>選択なし</h4><div class="msg">図の関係か部品をクリックしてください。</div></div>
+  </div>
+</div>
+<script>
+function send(type, extra) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*"); }
+// vis-network を読む（同じフォルダ → jsDelivr → unpkg の順）。読めなければ、その旨を表示する
+function loadVis(urls, done) {
+  if (!urls.length) { done(false); return; }
+  const sc = document.createElement("script"); sc.src = urls[0];
+  sc.onload = () => done(true); sc.onerror = () => loadVis(urls.slice(1), done);
+  document.head.appendChild(sc);
+}
+function main() {
+// ---- Streamlit との通信（streamlit-component-lib と同じ postMessage の約束事） ----
+function setHeight() { send("streamlit:setFrameHeight", {height: document.body.scrollHeight + 8}); }
+
+let edges = [];      // {eid, id (表の行番号 or null), source, relation, target}
+let colors = {};
+let history = [];
+let dirty = false;
+let network = null, nodesDS = null, edgesDS = null;
+let mode = null;     // "edge1" / "edge2" / "node"
+let pendingSource = null;
+let lastDataKey = null;
+let nextEid = 1;
+const $ = (id) => document.getElementById(id);
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function snapshot() { history.push(JSON.stringify(edges)); if (history.length > 50) history.shift(); $("bUndo").disabled = false; }
+function markDirty(text) {
+  dirty = true; $("bApply").disabled = false;
+  const m = $("msg"); m.className = "msg warn"; m.textContent = (text ? text + "　" : "") + "未反映の変更があります。「表に反映」を押すと表と図に確定されます。";
+}
+function nodeNames() {
+  const s = new Set(); edges.forEach(e => { s.add(e.source); s.add(e.target); });
+  extraNodes.forEach(n => s.add(n)); return Array.from(s);
+}
+let extraNodes = new Set();   // 関係がまだ無い、追加しただけの部品
+
+function colorOf(n) { return colors[n] || {fill:"#eef2ff", border:"#6366f1", font:"#111827"}; }
+function redraw(keepView) {
+  const names = nodeNames();
+  const pos = network ? network.getPositions() : {};
+  const nodes = names.map(n => {
+    const c = colorOf(n);
+    const o = {id: n, label: n, shape: "box", margin: 10, borderWidth: 2,
+               color: {background: c.fill, border: c.border, highlight: {background: c.fill, border: "#111827"}, hover: {background: c.fill, border: "#111827"}},
+               font: {size: 15, face: "Hiragino Sans, Yu Gothic UI, Meiryo, sans-serif", color: c.font || "#111827"}};
+    if (pendingSource === n) { o.borderWidth = 4; o.color.border = "#dc2626"; }
+    return o;
+  });
+  const es = edges.map(e => ({id: e.eid, from: e.source, to: e.target, label: e.relation, arrows: "to",
+                              font: {size: 12, color: "#1d4ed8", strokeWidth: 3, strokeColor: "#ffffff", align: "horizontal"},
+                              color: {color: "#475569", highlight: "#dc2626"}, smooth: {type: "cubicBezier", forceDirection: "vertical", roundness: 0.4}}));
+  if (!network) {
+    nodesDS = new vis.DataSet(nodes); edgesDS = new vis.DataSet(es);
+    network = new vis.Network($("net"), {nodes: nodesDS, edges: edgesDS}, {
+      layout: {hierarchical: {enabled: true, direction: "UD", sortMethod: "directed", levelSeparation: 110, nodeSpacing: 150, shakeTowards: "roots"}},
+      physics: false, interaction: {hover: true, multiselect: false, navigationButtons: false, zoomView: true, dragView: true},
+      edges: {width: 1.6}
+    });
+    network.on("click", onClick);
+  } else {
+    nodesDS.clear(); edgesDS.clear(); nodesDS.add(nodes); edgesDS.add(es);
+  }
+}
+
+function onClick(p) {
+  const nodeId = p.nodes && p.nodes[0];
+  const edgeId = (!nodeId && p.edges && p.edges[0]) || null;
+  if (mode === "edge1" && nodeId) { pendingSource = nodeId; mode = "edge2"; msg(`主語「${nodeId}」を選びました。次に目的語の部品をクリックしてください。`); redraw(); return; }
+  if (mode === "edge2" && nodeId) {
+    const src = pendingSource; pendingSource = null; mode = null; $("bAddEdge").classList.remove("on");
+    if (src === nodeId) { msg("同じ部品どうしには関係を引けません。"); redraw(); return; }
+    snapshot();
+    const e = {eid: "n" + (nextEid++), id: null, source: src, relation: "有する", target: nodeId};
+    edges.push(e); extraNodes.delete(src); extraNodes.delete(nodeId);
+    redraw(); markDirty("関係を追加しました（関係名は右の欄で直せます）。");
+    showEdge(e); network.selectEdges([e.eid]); return;
+  }
+  if (nodeId) showNode(nodeId);
+  else if (edgeId) showEdge(edges.find(e => e.eid === edgeId));
+  else showNone();
+}
+function msg(t) { const m = $("msg"); m.className = dirty ? "msg warn" : "msg"; m.textContent = t; }
+
+let selected = null;
+function showNone() { selected = null; $("bReverse").disabled = true; $("bDelete").disabled = true;
+  $("side").innerHTML = '<h4>選択なし</h4><div class="msg">図の関係か部品をクリックしてください。</div>'; setHeight(); }
+function options(sel) { return nodeNames().sort().map(n => `<option ${n === sel ? "selected" : ""}>${esc(n)}</option>`).join(""); }
+function showEdge(e) {
+  if (!e) return showNone();
+  selected = {kind: "edge", eid: e.eid}; $("bReverse").disabled = false; $("bDelete").disabled = false;
+  $("side").innerHTML = `<h4>関係を直す</h4>
+    <label>主語（S）</label><select id="fS">${options(e.source)}</select>
+    <label>関係（A）</label><input id="fA" value="${esc(e.relation)}">
+    <label>目的語（O）</label><select id="fO">${options(e.target)}</select>
+    <div class="row"><button id="fOk">変更する</button></div>
+    <div class="msg" style="margin-top:8px">例：「固定部」を「冷却器」の子にするには、主語を「冷却器」、目的語を「固定部」にします。</div>`;
+  $("fOk").onclick = () => {
+    const s = $("fS").value, a = $("fA").value.trim(), o = $("fO").value;
+    if (!a) { msg("関係名を入れてください。"); return; }
+    if (s === o) { msg("主語と目的語が同じです。"); return; }
+    snapshot(); e.source = s; e.relation = a; e.target = o; redraw(); markDirty("関係を変更しました。"); showEdge(e);
+  };
+  setHeight();
+}
+function showNode(n) {
+  selected = {kind: "node", name: n}; $("bReverse").disabled = true; $("bDelete").disabled = false;
+  const parents = edges.filter(e => e.target === n).map(e => `${esc(e.source)}（${esc(e.relation)}）`);
+  $("side").innerHTML = `<h4>部品を直す</h4>
+    <label>名前</label><input id="fN" value="${esc(n)}">
+    <div class="row"><button id="fRename">名前を変更</button></div>
+    <label>親の部品にする（この部品を目的語にした「有する」の関係を作る）</label>
+    <select id="fP"><option value="">（選ぶ）</option>${nodeNames().filter(x => x !== n).sort().map(x => `<option>${esc(x)}</option>`).join("")}</select>
+    <div class="row"><button id="fParent">親にする</button></div>
+    <div class="msg" style="margin-top:8px">今の親：${parents.length ? parents.join("、") : "なし（一番上）"}</div>`;
+  $("fRename").onclick = () => {
+    const v = $("fN").value.trim(); if (!v || v === n) return;
+    snapshot(); edges.forEach(e => { if (e.source === n) e.source = v; if (e.target === n) e.target = v; });
+    if (extraNodes.has(n)) { extraNodes.delete(n); extraNodes.add(v); }
+    if (colors[n] && !colors[v]) colors[v] = colors[n];
+    redraw(); markDirty(`「${n}」を「${v}」に変えました（この部品の関係すべて）。`); showNode(v);
+  };
+  $("fParent").onclick = () => {
+    const p = $("fP").value; if (!p) return;
+    snapshot();
+    const e = {eid: "n" + (nextEid++), id: null, source: p, relation: "有する", target: n};
+    edges.push(e); extraNodes.delete(n); extraNodes.delete(p);
+    redraw(); markDirty(`「${p}」を「${n}」の親にしました。`); showNode(n);
+  };
+  setHeight();
+}
+
+$("bAddEdge").onclick = () => {
+  if (mode === "edge1" || mode === "edge2") { mode = null; pendingSource = null; $("bAddEdge").classList.remove("on"); msg("関係の追加をやめました。"); redraw(); return; }
+  mode = "edge1"; $("bAddEdge").classList.add("on"); msg("主語にする部品をクリックしてください（もう一度ボタンを押すとやめます）。");
+};
+$("bAddNode").onclick = () => {
+  $("side").innerHTML = `<h4>部品を追加</h4><label>名前</label><input id="fNew" placeholder="例：固定部">
+    <div class="row"><button id="fAdd">追加する</button></div>
+    <div class="msg" style="margin-top:8px">追加したあと「＋ 関係を引く」で、ほかの部品とつないでください。</div>`;
+  $("fAdd").onclick = () => {
+    const v = $("fNew").value.trim(); if (!v) return;
+    if (nodeNames().includes(v)) { msg(`「${v}」はすでにあります。`); return; }
+    snapshot(); extraNodes.add(v); redraw(); markDirty(`部品「${v}」を追加しました。`); showNode(v);
+  };
+  setHeight();
+};
+$("bReverse").onclick = () => {
+  if (!selected || selected.kind !== "edge") return;
+  const e = edges.find(x => x.eid === selected.eid); if (!e) return;
+  snapshot(); [e.source, e.target] = [e.target, e.source]; redraw(); markDirty("向きを逆にしました。"); showEdge(e);
+};
+$("bDelete").onclick = () => {
+  if (!selected) return;
+  snapshot();
+  if (selected.kind === "edge") { edges = edges.filter(e => e.eid !== selected.eid); markDirty("関係を削除しました。"); }
+  else { const n = selected.name; const k = edges.length; edges = edges.filter(e => e.source !== n && e.target !== n); extraNodes.delete(n);
+         markDirty(`部品「${n}」と、その関係 ${k - edges.length} 件を削除しました。`); }
+  redraw(); showNone();
+};
+$("bUndo").onclick = () => {
+  if (!history.length) return;
+  edges = JSON.parse(history.pop()); $("bUndo").disabled = history.length === 0;
+  redraw(); markDirty("1つ前に戻しました。"); showNone();
+};
+$("bApply").onclick = () => {
+  send("streamlit:setComponentValue", {value: {edges: edges.map(e => ({id: e.id, source: e.source, relation: e.relation, target: e.target})),
+                                                 nonce: Date.now()}, dataType: "json"});
+  dirty = false; $("bApply").disabled = true; msg("表に反映しました。");
+};
+
+window.addEventListener("message", (ev) => {
+  const d = ev.data;
+  if (!d || d.type !== "streamlit:render") return;
+  const args = d.args || {};
+  const key = JSON.stringify(args.edges || []) + JSON.stringify(args.colors || {});
+  if (key === lastDataKey && network) { setHeight(); return; }   // 同じデータなら編集中の状態を保つ
+  lastDataKey = key;
+  colors = args.colors || {};
+  edges = (args.edges || []).map(e => ({eid: "e" + (nextEid++), id: (e.id === undefined ? null : e.id), source: e.source, relation: e.relation, target: e.target}));
+  extraNodes = new Set(); history = []; dirty = false; $("bUndo").disabled = true; $("bApply").disabled = true;
+  redraw(); showNone(); msg("部品をドラッグすると位置を動かせます。関係（矢印）か部品をクリックすると、右の欄で直せます。");
+  setHeight();
+});
+
+
+}
+loadVis(["vis-network.min.js",
+         "https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js",
+         "https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"], (ok) => {
+  if (!ok) {
+    document.body.innerHTML = '<div style="padding:14px;border:1px solid #f59e0b;border-radius:8px;background:#fffbeb;color:#92400e;font-size:14px">' +
+      '図を描く部品（vis-network）を読み込めませんでした。app.py と同じ場所に sao_graph_editor フォルダを置くか、インターネットにつながる環境で開いてください。上の表では直せます。</div>';
+    send("streamlit:componentReady", {apiVersion: 1});
+    send("streamlit:setFrameHeight", {height: 90});
+    return;
+  }
+  main();
+  send("streamlit:componentReady", {apiVersion: 1});
+  setHeight();
+});
+</script>
+</body>
+</html>
