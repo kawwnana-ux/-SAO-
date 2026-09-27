@@ -359,7 +359,8 @@ def llm_extract(text):
 
 def llm_error_message():
     return ("OpenRouterのレート制限に達した可能性があります。しばらく待って再試行してください。" if BACKEND == "cloud" else
-            f"Ollamaが起動しているか（ollama serve）、モデルが取得済みか（ollama pull {model_name}）を確認してください。")
+            f"Ollamaが起動しているか（ollama serve）、モデルが取得済みか（ollama pull {model_name}）を確認してください。"
+            "準備の手順は、サイドバーの「ヘルプ」→「🛠️ ローカルLLMの準備」にあります。")
 
 
 GRAPH_GROUPS = list(pp.RELATION_GROUP_NAMES) + ["その他"]
@@ -1204,6 +1205,153 @@ def analyze_body():
             st.dataframe(pd.DataFrame([{"規則": f"{d['rule']} {pp.rulebook.name(d['rule'])}", "主語": d["source"],
                                         "関係": d["relation"], "目的語": d["target"]} for d in res["dropped"]]),
                          hide_index=True, use_container_width=True)
+
+
+# ===========================================================================
+# 🛠️ ローカルLLMの準備（手順書）
+# ===========================================================================
+_LLM_SETUP_MD = r'''# ローカルLLM環境構築手順書
+
+このツールは、利用者のPCの中で動くLLM（Ollama）を使います。請求項などのデータを外部のサービスに送らず、利用料もかかりません。この手順書では、Windows のPCに、ツールを動かす環境を一から用意する手順を説明します。
+
+## 1. 必要なもの
+
+| 項目 | 目安 |
+|---|---|
+| OS | Windows 10 / 11（64ビット） |
+| メモリ | 16GB 以上をおすすめ |
+| GPU | NVIDIA の GPU（ビデオメモリ 8GB 以上）があると速い。無くても CPU で動くが、1件の解析に数分かかる |
+| ディスクの空き | 20GB 以上（qwen3.5:9b は約7GB。大きいモデルを入れる場合は、さらに十数GB） |
+| ネット接続 | 最初のインストールとモデルのダウンロードのときだけ必要 |
+
+## 2. Python を入れる
+
+1. python.org から **Python 3.12** のインストーラーをダウンロードして実行する。
+   - 最初の画面で「Add python.exe to PATH」にチェックを入れる。
+   - Python 3.13 以降だけでは、GiNZA（日本語の解析器）が動かないことがあります。3.12 を使ってください。
+2. コマンドプロンプトを開き、次を入力して `Python 3.12.x` と表示されることを確かめる。
+
+```
+py -3.12 --version
+```
+
+## 3. ツールに必要なライブラリを入れる
+
+ツールのフォルダ（`app.py`・`patent_pipeline.py`・`requirements_platform.txt` があるフォルダ）でコマンドプロンプトを開き、次を実行します。数分かかります。
+
+```
+py -3.12 -m pip install -r requirements_platform.txt
+```
+
+終わったら、次を入力して、エラーが出ないことを確かめます。
+
+```
+py -3.12 -c "import spacy; spacy.load('ja_ginza'); print('GiNZA OK')"
+```
+
+## 4. Ollama を入れる
+
+1. **https://ollama.com/download** から Windows 版のインストーラー（OllamaSetup.exe）をダウンロードして実行する。
+2. インストールが終わると、Ollama は自動で起動し、画面右下の通知領域にラマのアイコンが出ます。PC を起動するたびに自動で動きます。
+3. コマンドプロンプトで次を入力し、版の番号が表示されることを確かめる。
+
+```
+ollama --version
+```
+
+## 5. LLM のモデルを入れる
+
+ツールの標準のモデルは **qwen3.5:9b** です。次を入力すると、ダウンロードが始まります（約7GB）。
+
+```
+ollama pull qwen3.5:9b
+```
+
+入ったモデルは、次で一覧できます。
+
+```
+ollama list
+```
+
+### より大きいモデルを使う場合（任意）
+
+大きいモデルほど抽出の精度は上がりやすくなりますが、遅くなり、多くのビデオメモリを使います。
+
+| モデル | 必要なメモリの目安 | 向いているPC |
+|---|---|---|
+| qwen3.5:9b（標準） | 約7GB | ほとんどのPC |
+| gpt-oss:20b | 約14GB | ビデオメモリ 16GB の GPU |
+| qwen3.5:27b | 約17GB | ビデオメモリ 16〜24GB の GPU（16GB では一部をメインメモリで動かすため遅くなる） |
+
+入れ方は同じです（例：`ollama pull qwen3.5:27b`）。ツールのフォルダにある `setup_bigger_llm.bat` をダブルクリックしても入れられます。
+
+## 6. 動くかを確かめる
+
+短い質問を1つ投げてみます。
+
+```
+ollama run qwen3.5:9b "特許の請求項とは何か、1文で答えてください。"
+```
+
+答えが返ってきたら、次を入力して、GPU で動いているかを確かめます。
+
+```
+ollama ps
+```
+
+- PROCESSOR の列が「100% GPU」なら、GPU に全部収まっていて速く動きます。
+- 「40%/60% CPU/GPU」のように CPU が混ざっている場合は、GPU に収まりきっていません。動きますが遅くなります。より小さいモデルを使うと速くなります。
+
+## 7. ツールを起動する
+
+ツールのフォルダでコマンドプロンプトを開き、次を実行します。
+
+```
+py -3.12 -m streamlit run app.py
+```
+
+ブラウザが開き、ツールの画面が表示されます。左のサイドバーの「LLMの設定」で、次を確かめてください。
+
+- **Ollamaモデル名**：入れたモデルの名前（例：`qwen3.5:9b`）。`ollama list` に出る名前をそのまま入力します。
+- **Ollamaホスト**：ふつうは空欄のままで大丈夫です（`http://localhost:11434` を使います）。別のPCの Ollama を使う場合だけ入力します。
+
+「解析と確認」→「請求項を貼り付けて解析する」で請求項を1件解析し、処理の流れの「① 構成要素の取り出し（LLM）」に構成要素の数が表示されれば、LLM が正しく使われています。「LLMを呼べませんでした」と出る場合は、次の「困ったとき」を見てください。
+
+## 8. 困ったとき
+
+| 症状 | 原因と対処 |
+|---|---|
+| 「LLMを呼べませんでした」「接続できません」 | Ollama が起動していない。通知領域にラマのアイコンがあるか確かめる。無ければスタートメニューから Ollama を起動するか、コマンドプロンプトで `ollama serve` を実行する |
+| 「model not found」 | モデルが入っていないか、名前が違う。`ollama list` で名前を確かめ、サイドバーのモデル名を同じにする。無ければ `ollama pull モデル名` |
+| 解析がとても遅い | `ollama ps` で CPU が混ざっていないか確かめる。混ざっていれば小さいモデルにする。ほかの重いソフトを閉じる |
+| 評価で「timed out」と出る | 大きいモデルで1件の答えに時間がかかりすぎている。待ち時間の上限は、環境変数 `SAO_FEWSHOT_TIMEOUT`（秒、標準1500）で延ばせる |
+| `nvidia-smi` が見つからない | NVIDIA 以外の GPU か、ドライバーのツールが入っていない。Ollama は動くので、`ollama ps` で GPU を使っているかを確かめる |
+| GiNZA の読み込みでエラー | Python 3.12 以外で動かしている可能性がある。`py -3.12 -m streamlit run app.py` のように 3.12 を指定する |
+| bat ファイルがすぐ閉じる | bat ファイルの文字コードが変わった可能性がある。配布されたものをそのまま使い、メモ帳で保存し直さない |
+| ディスクがいっぱい | 使わないモデルを `ollama rm モデル名` で消す |
+
+## 9. データの扱い
+
+- LLM は利用者の PC の中だけで動き、請求項・要約などのデータは外部に送られません。
+- モデルのダウンロードのときだけインターネットに接続します。
+- LLM の答えは、ツールのフォルダのキャッシュファイル（`fewshot_cache.json` など）に保存され、同じ請求項をもう一度解析するときはすぐに終わります。
+'''
+
+
+def page_llm_setup():
+    st.title("🛠️ ローカルLLMの準備")
+    st.caption("この手順書は、ツールのフォルダの LLM_SETUP_GUIDE.md と同じ内容です。")
+    md = _LLM_SETUP_MD
+    try:
+        p = Path(__file__).with_name("LLM_SETUP_GUIDE.md")
+        if p.exists():
+            md = p.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    body = md.split("\n", 1)[1] if md.startswith("# ") else md
+    st.markdown(body)
+    st.download_button("📄 手順書をダウンロード（Markdown）", md.encode("utf-8"), file_name="ローカルLLM環境構築手順書.md",
+                       mime="text/markdown")
 
 
 def page_rules():
@@ -2097,5 +2245,6 @@ nav = st.navigation({
                 st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
     "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export"),
             st.Page(page_rules, title="規則の一覧", icon="📏", url_path="rules")],
+    "ヘルプ": [st.Page(page_llm_setup, title="ローカルLLMの準備", icon="🛠️", url_path="setup")],
 }, expanded=True)
 nav.run()
