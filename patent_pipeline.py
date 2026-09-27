@@ -9487,7 +9487,7 @@ rulebook.py
 """
 import os
 
-STAGES = ["構成要素", "構造の分割", "SAO", "整理", "つなぎ", "候補", "評価"]
+STAGES = ["構成要素", "構造の分割", "SAO", "整理", "つなぎ", "候補", "選ぶ", "評価"]
 
 RULES = [
     # ---- 構成要素 ----
@@ -9605,15 +9605,48 @@ RULES = [
      "llm": False},
     # ---- 候補を広げる（再現率の上限を上げる。採用の判定には使わない）----
     {"id": "R60", "stage": "候補", "name": "網羅候補を作る",
-     "desc": "本文から、構成要素の名前（名詞まとまり・その末尾・「XのY」の連鎖・連体修飾＋名詞・符号付きの名前）と、"
-             "関係（「有する」系の文型、「XのY」、述語の前の格助詞付きの名前と述語の直後の名前・主題、比較・「である」）を"
-             "広く作り、「除外」の候補として足す。まず正解が候補のどこかに入る割合（候補の再現率）を上げ、"
-             "そのあと、どれを採用するかの規則で適合率を上げる",
-     "example": "候補の再現率（dev）：70.0% → 80.4%", "llm": False},
+     "desc": "本文から、構成要素の名前（名詞まとまり・その末尾・「XのY」の連鎖・「前記」を除いた名前・連体修飾＋名詞・符号付きの名前・"
+             "持ち主を付けた名前「第5トランジスタの第2端」）と、関係（「有する」系の文型、述語のまわりの格助詞付きの名前、比較・"
+             "「である」、近くに出てくる名前の組とその間の述語の語幹、「AとBとの間のC」）を広く作り、「除外」の候補として足す。"
+             "まず正解が候補のどこかに入る割合（候補の再現率）を上げ、そのあと、どれを採用するかの規則で適合率を上げる（recall_gen.py）",
+     "example": "候補の再現率（dev）：49.5% → 91.5%（test 91.0%。1件あたりの候補 約4万件）", "llm": False},
+    # ---- 選ぶ（適合率を上げる）----
+    {"id": "R61", "stage": "選ぶ", "name": "裏付けの少ない採用は要確認",
+     "desc": "採用した関係の組を、ほかの独立した候補の作り方（区間内の組・係り受けの組・題名の組・網羅候補の文型の規則）が"
+             "いくつ出しているか（裏付けの数）を数え、必要な数（標準 2、アプリの既定 3、高信頼 5）に足りなければ要確認にする"
+             "（学習はせず、作り方どうしの一致を数えるだけ。要確認に回すだけなので、採用＋要確認の再現率は変わらない）",
+     "example": "どの作り方も出していない 冷却器｜接続される｜端子 → 要確認", "llm": False},
+    {"id": "R62", "stage": "選ぶ", "name": "裏付けの多い候補を要確認に出す",
+     "desc": "採用・要確認に無い組のうち、裏付けが3以上で本文の文型（R45・R46 の照合）とも合うもの、または裏付けが4以上の"
+             "動詞の関係を、要確認として表に出す（1件あたり最大30件。人が確認して拾えるように）",
+     "example": "区間内の組・係り受けの組・述語のまわりの規則が一致した 第１のトランス｜受ける｜第１の送信信号 → 要確認",
+     "llm": False},
+    {"id": "R63", "stage": "選ぶ", "name": "要確認だけを LLM に確かめさせる（実験）",
+     "desc": "要確認の候補（1件あたり最大30件）について、LLM に「その関係が本文に書かれているか」を はい／いいえ で答えさせ、"
+             "「はい」を採用にする。LLM は関係を作らず、規則が作った候補を確かめるだけ（--llm-verify のときだけ使う）",
+     "example": "要確認 第１のトランス｜受ける｜第１の送信信号 → LLM：はい → 採用", "llm": True},
+    {"id": "R66", "stage": "SAO", "name": "比較の補完",
+     "desc": "「Ｘよりも不純物濃度の高いＹ」のように、比べている量が片方にしか書かれていない比較を、両方に量を補って関係にする。"
+             "「ＱはＮ以上Ｍ以下」は「Ｑ｜以上｜Ｎ」「Ｑ｜以下｜Ｍ」にする（省略された語を補う考え方）",
+     "example": "第１半導体領域よりも不純物濃度の高い第１蓄積領域 → 第１蓄積領域の不純物濃度｜より高い｜第１半導体領域の不純物濃度",
+     "llm": False},
+    {"id": "R65", "stage": "選ぶ", "name": "構成要素ではない語を含む関係は要確認",
+     "desc": "「面」「直列」「位置」「第１導電型」「第１方向」「平面視」のような、向き・位置・性質・状態を表す語が主語か目的語の"
+             "関係は、自動では採用せず要確認にする（dev の誤りの分類で、正解の構成要素にほとんど現れない名前）",
+     "example": "第２のサージ電圧吸収素子｜接続された｜直列 → 要確認", "llm": False},
+    {"id": "R64", "stage": "選ぶ", "name": "手本つきLLMと規則が一致した要確認を採用（実験）",
+     "desc": "書き方の決まりと dev の手本4件を見せたローカル LLM にも SAO を書き出させ、規則の要確認と同じ関係なら採用にする。"
+             "LLM だけが出した関係は要確認として表に出す（--fewshot のときだけ使う）",
+     "example": "要確認 第１端子｜接続される｜第１電極 ＋ LLM も同じ関係を抽出 → 採用", "llm": True},
     # ---- 評価（抽出ではなく、正解との照合に使う規則）----
     {"id": "E01", "stage": "評価", "name": "同一ノードの規則",
      "desc": "「Xの一部」「Xの外側」「Xの上面」などは X と同じ構成要素とみなしてから、正解と抽出を比べる（構造評価）",
      "example": "酸化物半導体層の一部 ＝ 酸化物半導体層", "llm": False},
+    {"id": "E02", "stage": "評価", "name": "意味一致（意味が伝われば正解）",
+     "desc": "M1 同一ノード（E01）／M2 修飾語・持ち主の省略（残りが「の」や活用語尾で終わるときだけ）／M3 関係の言い換え"
+             "（意味のまとまりが同じ）／M4 向きの無い関係は逆向きも可／M5 受け身と能動の言い換え。埋め込みは使わない。"
+             "でたらめな組み合わせは F1 3.5% にしかならないことを確認済み",
+     "example": "正解 放熱装置の主面｜形成される｜凹部 ＝ 抽出 主面｜設けられる｜凹部", "llm": False},
 ]
 
 # 効果は「評価の手順.md」に従い、dev（260件）で1つずつ止めて測った値（トリプル完全一致F1・構造F1の変化、ポイント）。
@@ -9648,7 +9681,18 @@ EFFECTS = {
     "R51": {"f1_delta": 0.06, "struct_delta": 0.06},
     "R52": {"f1_delta": -0.04, "struct_delta": -0.05, "note": "並列の主題の関係（部品の階層）を正しく作るための規則"},
     "R53": {"f1_delta": 0.52, "struct_delta": 0.58},
-    "R60": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "採用には影響しない。候補の再現率（dev）49.5% → 80.4%"},
+    "R61": {"f1_delta": 0.36, "struct_delta": 0.0,
+            "note": "必要な裏付け 2（test +0.58）。自動採用の適合率／再現率（dev）：2→60.5／44.0、3→64.3／41.8、4→68.5／29.8、5→75.2／17.2、6→82.1／5.8"},
+    "R62": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "採用には影響しない。採用＋要確認の再現率（dev）45.9% → 53.1%（1件あたり要確認 約13件）"},
+    "R60": {"f1_delta": 0.0, "struct_delta": 0.0, "note": "採用には影響しない。候補の再現率（dev）49.5% → 91.5%（run_recall_check.bat で測る）"},
+    "R65": {"f1_delta": 1.3, "struct_delta": 1.1,
+            "note": "2026-09-26 測定。dev 50.9 → 52.2、test 50.0 → 51.1（完全一致）。意味一致 dev 54.6 → 55.7、test 53.8 → 54.8"},
+    "R66": {"f1_delta": 0.3, "struct_delta": 0.2,
+            "note": "2026-09-27 測定。dev 52.2 → 52.5、test 51.1 → 51.2（完全一致）。意味一致 dev 55.7 → 56.0、test 54.8 → 54.9。"
+                    "比較は正解の約2%なので効果は小さいが、dev で作った比較の関係の約7割が正解"},
+    "R64": {"f1_delta": 4.1, "struct_delta": 0.0,
+            "note": "LLM が必要。dev 10件だけの予備の測定（R65 の前）：規則だけ 58.8 → 62.9（完全一致）。"
+                    "要確認→採用にした関係の 75% が正解。本番の数字は run_r64_check.bat で測る"},
 }
 
 _BY_ID = {r["id"]: r for r in RULES}
@@ -11665,6 +11709,7 @@ node_match_eval.py
   あらゆる関係語が「有する」系と同義扱いになっていた）。
 """
 import re
+from collections import defaultdict as collections_defaultdict
 
 _KANJI_NUM = str.maketrans("一二三四五六七八九", "123456789")
 _NUM_RE = re.compile(r"\d+|[a-zA-Z]")
@@ -11922,6 +11967,159 @@ def prf_counts(tp, n_pred, n_gold):
     P = tp / n_pred if n_pred else 0.0
     R = tp / n_gold if n_gold else 0.0
     return P, R, (2 * P * R / (P + R) if P + R else 0.0)
+
+
+# ---------------------------------------------------------------- 意味一致（「意味が伝われば正解」の評価・2026-09-26）
+# 完全一致では「主面」と「放熱装置の主面」、「設けられる」と「配置される」のような、読む人には同じ意味が
+# 伝わる違いも誤りになる。そこで、次の規則を評価の前に固定し、規則だけで判定する（埋め込みは使わない。
+# 以前の埋め込みによる緩い評価は、でたらめな組み合わせでも F1 67% になったため使わない）。
+#   M1 ノードの同一視（E01）：「Xの主面」「Xの一部」などは X と同じ（構造評価と同じ規則、正解と抽出の両方にかける）
+#   M2 修飾語・持ち主の省略：短い方の名前が長い方の名前の末尾と一致し、長い方の残りが「の」または
+#      活用語尾（る・た・い・な・え）で終わるとき同じとみなす（「基板上に設けられたゲート電極」＝「ゲート電極」、
+#      「放熱装置の主面」＝「主面」）。番号（第１・Ａなど）が食い違うものは除く。「ゲート電極」と「電極」の
+#      ように名詞が続くだけのものは別の部品なので同じとみなさない。
+#   M3 関係の言い換え：関係を意味のまとまり（MEANING_FAMILIES）に分け、同じまとまりなら一致
+#   M4 向き：つながり・接触・向かい合い・重なりなど、向きの無い関係だけ主語と目的語が逆でも一致
+#   M5 受け身と能動：「絶縁基板｜収容された｜樹脂ケース」と「樹脂ケース｜収容する｜絶縁基板」のように、
+#      片方が受け身・もう片方が能動で動詞の漢字が同じなら、主語と目的語が逆でも一致
+#   参考 M6 正解から導ける関係：「持つ・含む」の関係だけ、正解の「A 有する B」「B 有する C」から導ける
+#      「A 有する C」を正しい内容とみなす（適合率にだけ数え、正解の数は増やさない。meaning_implied）
+# 1つの正解には1つの抽出だけを対応させる（1対1）。
+MEANING_FAMILIES = {
+    "持つ・含む": ("有する", "備える", "具備", "含む", "含有", "含め", "からなる", "構成され", "含んでなる",
+                "主成分", "内蔵"),
+    "設けられる・置かれる": ("設け", "配置", "形成", "位置", "搭載", "実装", "載置", "配設", "取り付け", "取付",
+                     "装着", "固定", "固着", "挿入", "収容", "収納", "充填", "設置", "間にある", "上にある",
+                     "埋め込", "埋設"),
+    "つながる": ("接続", "連結", "接合", "結合", "連通", "導通"),
+    "接する": ("接触", "当接", "接する", "隣接", "密着"),
+    "覆う・囲む": ("覆", "被覆", "封止", "囲", "塞"),
+    "向かい合う": ("対向", "面する", "向か"),
+    "重なる・交わる": ("重な", "交差", "直交", "重畳"),
+    "離れる": ("離間", "離れ"),
+    "突き出る・延びる": ("突出", "延び", "延出", "延在", "張り出"),
+    "通る": ("貫通", "通過", "介する", "介して", "流れ", "経由"),
+    "大きい": ("より大きい", "より高い", "より厚い", "より長い", "より広い", "以上", "超え"),
+    "小さい": ("より小さい", "より低い", "より薄い", "より短い", "より狭い", "以下", "未満"),
+}
+SYMMETRIC_FAMILIES = {"つながる", "接する", "向かい合う", "重なる・交わる", "離れる"}
+_M2_BOUNDARY_RE = re.compile(r"(の|[るたいなえ])$")
+
+
+def meaning_family(rel):
+    rel = rel or ""
+    if rel == "の":
+        return "持つ・含む"
+    for fam, keys in MEANING_FAMILIES.items():
+        if any(k in rel for k in keys):
+            return fam
+    return None
+
+
+def meaning_node(a, b, use_m2=True):
+    """M2：同じ名前か、修飾語・持ち主を省いた名前どうしなら True"""
+    if a == b:
+        return True
+    if not use_m2:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < 2 or not long_.endswith(short):
+        return False
+    rest = long_[: -len(short)]
+    return bool(_M2_BOUNDARY_RE.search(rest)) and set(numbers(short)) <= set(numbers(long_))
+
+
+def meaning_rel(pp, p_rel, g_rel, use_m3=True):
+    if rel_match(pp, p_rel, g_rel):
+        return True
+    if not use_m3:
+        return False
+    fp, fg = meaning_family(p_rel), meaning_family(g_rel)
+    return fp is not None and fp == fg
+
+
+MEANING_LEVELS = {0: "完全一致", 1: "＋M1 ノードの同一視", 2: "＋M2 修飾語・持ち主の省略",
+                  3: "＋M3 関係の言い換え", 4: "＋M4 向きの無い関係の向き", 5: "＋M5 受け身と能動の言い換え"}
+_PASSIVE_RE = re.compile(r"(れる|れた|れて|れ|られる|られた|され|される|された|まれる|まれた)$")
+_KANJI_RE = re.compile(r"[\u4e00-\u9fff々]+")
+
+
+def is_passive(rel):
+    return bool(_PASSIVE_RE.search(rel or ""))
+
+
+def voice_flip(p_rel, g_rel):
+    """M5：片方が受け身・もう片方が能動で、動詞の漢字が同じ（「収容された」と「収容する」）"""
+    if is_passive(p_rel) == is_passive(g_rel):
+        return False
+    kp, kg = "".join(_KANJI_RE.findall(p_rel or "")), "".join(_KANJI_RE.findall(g_rel or ""))
+    return bool(kp) and kp == kg
+
+
+def meaning_align(pp, predicted, gold, level=5):
+    """意味一致の対応付け。predicted・gold は {"source","relation","target"} のリスト。
+    戻り値：(対応した (抽出の番号, 正解の番号) のリスト, 同一視後の抽出, 同一視後の正解)"""
+    n = pp._normalize_node_text_lenient
+    if level >= 1:
+        P, G = canon_pair(pp, predicted, gold)
+    else:
+        P = [(n(r["source"]), r["relation"], n(r["target"])) for r in predicted]
+        G = [(n(r["source"]), r["relation"], n(r["target"])) for r in gold]
+    m2, m3, m4, m5 = level >= 2, level >= 3, level >= 4, level >= 5
+
+    def ok(p, g):
+        if m5 and voice_flip(p[1], g[1]) and meaning_node(p[0], g[2], m2) and meaning_node(p[2], g[0], m2):
+            return True
+        if not meaning_rel(pp, p[1], g[1], m3):
+            return False
+        if meaning_node(p[0], g[0], m2) and meaning_node(p[2], g[2], m2):
+            return True
+        if m4 and meaning_family(g[1]) in SYMMETRIC_FAMILIES:
+            return meaning_node(p[0], g[2], m2) and meaning_node(p[2], g[0], m2)
+        return False
+
+    def score(p, g):
+        return (p[0] == g[0]) + (p[2] == g[2]) + rel_match(pp, p[1], g[1])
+
+    return _align(P, G, ok, score), P, G
+
+
+
+def meaning_implied(pp, P, G, unmatched_idx, maxd=3):
+    """参考 M6：対応しなかった抽出のうち、正解の「持つ・含む」の関係を2〜3段たどって導けるものの数"""
+    has = collections_defaultdict(set)
+    for s, r, t in G:
+        if meaning_family(r) == "持つ・含む":
+            has[s].add(t)
+    nodes = set(has) | {t for v in has.values() for t in v}
+    cnt = 0
+    for i in unmatched_idx:
+        s, r, t = P[i]
+        if meaning_family(r) != "持つ・含む":
+            continue
+        start = {x for x in nodes if meaning_node(s, x)}
+        goal = {x for x in nodes if meaning_node(t, x)}
+        fr, seen = set(start), set(start)
+        for d in range(maxd):
+            fr = {y for x in fr for y in has[x]} - seen
+            if d > 0 and fr & goal:
+                cnt += 1
+                break
+            seen |= fr
+    return cnt
+
+
+def meaning_counts(pp, predicted, gold):
+    """各段階の一致数 {段階: {"tp","n_pred","n_gold"}}。M1 以降は同一視後の件数で数える。
+    "implied" は参考 M6 の数（M5 で対応しなかった抽出のうち、正解から導けるもの）"""
+    out = {}
+    for lv in MEANING_LEVELS:
+        pairs, P, G = meaning_align(pp, predicted, gold, lv)
+        out[lv] = {"tp": len(pairs), "n_pred": len(P), "n_gold": len(G)}
+        if lv == max(MEANING_LEVELS):
+            mp = {i for i, _ in pairs}
+            out[lv]["implied"] = meaning_implied(pp, P, G, [i for i in range(len(P)) if i not in mp])
+    return out
 
 
 # ===========================================================================
@@ -14426,6 +14624,606 @@ def llm_component_relations(ts, pp, text, model=None, host=None, cache=None, cle
 
 
 # ===========================================================================
+# 【統合】recall_gen.py
+# 名前の付け替え: CASES → CASES_rg, HAS → HAS_rg
+# ===========================================================================
+"""
+recall_gen.py
+==============
+【R60】網羅候補：正解のSAOが候補のどこかに入る割合（候補の再現率）を最大にするための候補づくり（学習なし）。
+採用の判定には使わず、「除外」の候補として足す（あとで、どれを採用するかの規則で適合率を上げる）。
+
+構成要素の名前：名詞まとまり（新森ら）とその末尾、「XのY」の連鎖（途中の修飾を飛ばした形も）、「前記」を除いた本文での名前、
+  連体修飾＋名詞（「準備する工程」）、符号付きの名前（「銅層(13)」）、「AへのB」「AにおけるB」、
+  持ち主を付けた名前（「第2端を有する第5トランジスタ」→「第5トランジスタの第2端」、「前記Xの…y」、主題「前記Xは、…y」）
+関係：「有する」系の文型、「XのY」、述語（GiNZA）の前の格助詞付きの名前と述語の直後の名前・主題、比較・「である」、
+  近く（60字以内・同じ文）に出てくる名前の組と、その間の述語の語幹、「AとBとの間のC」
+"""
+import re
+from collections import defaultdict
+
+NOUNISH_POS={"NOUN","PROPN","NUM","SYM"}
+POSW={"上","内","下","側","中","外","間"}
+def is_nounish(t):
+    return t.pos_ in NOUNISH_POS or t.tag_.startswith(("接尾辞","接頭辞","名詞")) or (t.text in ("ー","－","・","−") )
+def chunks(doc):
+    """名詞まとまり（新森ら）：名詞・数詞・記号・接頭辞・接尾辞の連続（「前記」「該」は外す）"""
+    out=[]; i=0; N=len(doc)
+    while i<N:
+        if is_nounish(doc[i]) and doc[i].text not in ("前記","該","\n"):
+            j=i
+            while j+1<N and is_nounish(doc[j+1]) and doc[j+1].text not in ("前記","該","\n"): j+=1
+            out.append((i,j)); i=j+1
+        else: i+=1
+    return out
+def txt(doc,i,j): return "".join(t.text for t in doc[i:j+1]).strip()
+def node_candidates(doc):
+    ch=chunks(doc); names=set(); spans=[]
+    for (i,j) in ch:
+        base=txt(doc,i,j); names.add(base); spans.append((i,j,base))
+        # 後ろの部分（複合語の末尾）
+        for k in range(i+1,j+1):
+            s=txt(doc,k,j)
+            if len(s)>=2: names.add(s)
+        # 末尾の位置の語を外した形（チップ上→チップ）
+        if doc[j].text in POSW and j>i: names.add(txt(doc,i,j-1))
+    # 「XのY」の連鎖（2段まで）
+    idx={i:(i,j) for i,j in ch}; endat={j:(i,j) for i,j in ch}
+    for (i,j) in ch:
+        cur_i=i; name=txt(doc,i,j)
+        for depth in range(3):
+            k=cur_i-1
+            if k>=1 and doc[k].text=="の" and (k-1) in endat:
+                a,b=endat[k-1]
+                pre=txt(doc,a,b)
+                if pre in ("前記","該"): break
+                name=pre+"の"+name; names.add(name); cur_i=a
+                if depth>=1: names.add(pre+"の"+txt(doc,i,j))   # 途中の修飾を飛ばした「XのY」
+                # 「前記」を挟む：「XのY」の Y が「前記」付きのとき
+            elif k>=2 and doc[k].text in ("前記","該") and doc[k-1].text=="の" and (k-2) in endat:
+                a,b=endat[k-2]; name=txt(doc,a,b)+"の"+name; names.add(name); cur_i=a
+            else: break
+    # 連体修飾（acl）＋名詞：「準備する工程」「パワーモジュールに流れる電流」
+    for t in doc:
+        if t.dep_=="acl" and t.head.i>t.i and is_nounish(t.head):
+            h=t.head
+            hi=next(((a,b) for a,b in ch if a<=h.i<=b),None)
+            if not hi: continue
+            full=txt(doc,t.left_edge.i,hi[1])
+            short=txt(doc,t.i,hi[1])
+            for s in (full,short):
+                s=re.sub(r"^(前記|該)","",s)
+                if 2<=len(s)<=40 and "、" not in s: names.add(s)
+    return {re.sub(r"^(前記|該)","",x) for x in names if len(x)>=1}
+
+
+HAS_rg=re.compile(r"を(有する|有した|有している|有し|含む|含んだ|含み|含んでなる|備える|備えた|備え|具備する|具備した|具備し|含有する|含有し|含有した)")
+HASLAB={"有し":"有する","有した":"有する","有している":"有する","含み":"含む","含んだ":"含む","含んでなる":"含む","備え":"備える",
+        "備えた":"備える","具備し":"具備する","具備した":"具備する","含有し":"含有する","含有した":"含有する"}
+RELF=("有する","有した","有している","含む","含んだ","備える","備えた","具備する","具備した","含有する","含有した")
+CASES_rg=r"(?:に|を|と|から|で|へ|より|との|が|は|によって|により|にて|として)"
+NONN={"一方","他方","双方","両方","複数","それぞれ","各々","互い","一対","こと","もの","場合","状態","前記","該"}
+LINK=r"(?:の|への|からの|との|における|内の|上の|間の|による)"
+def extra_nodes(flat, nodes):
+    out=set()
+    # 符号付き：「半導体層(11)」
+    for x in list(nodes):
+        for m in re.finditer(re.escape(x)+r"(\([0-9A-Za-z０-９Ａ-Ｚａ-ｚ]{1,6}\))", flat): out.add(x+m.group(1))
+    # 「AへのB」「AにおけるB」など（Aの前の「前記」は外す）
+    nl=sorted(nodes,key=len,reverse=True)
+    for m in re.finditer(LINK, flat):
+        a_txt=flat[max(0,m.start()-30):m.start()]; b_txt=flat[m.end():m.end()+30]
+        a=next((x for x in nl if a_txt.endswith(x)),None)
+        b_txt=re.sub(r"^(前記|該)","",b_txt)
+        b=next((x for x in nl if b_txt.startswith(x)),None)
+        if a and b and len(a)+len(b)+len(m.group(0))<=40: out.add(a+m.group(0)+b)
+    return out
+def _after(flat, k):
+    a=flat[k:k+80]
+    a=re.sub(r"^[、，]","",a)
+    a=re.sub(r"^ことを特徴とす(?:る|る、)","",a)
+    a=re.sub(r"^(前記|該|複数の|一対の)+","",a)
+    return a
+NEAR_SUB=False
+FLAG_7B=True
+def generate(pp, text, base_cands, title, Lm, light=False):
+    clean=pp._clean_claim_text(text); flat=re.sub(r"\s","",clean)
+    doc=pp.nlp(clean)
+    nodes={x for x in node_candidates(doc)}|{c[0] for c in base_cands}|{c[2] for c in base_cands}
+    # 「Xの前記Y」→「XのY」：前記・該を除いた本文でも名前を作る
+    clean2=re.sub(r"(前記|該|上記)","",clean)
+    if clean2!=clean:
+        nodes|={x for x in node_candidates(pp.nlp(clean2))}
+    flat_raw=re.sub(r"\s","",text)
+    flat_all=flat+"\n"+re.sub(r"\s","",clean2)+"\n"+flat_raw
+    # 符号付きの名前（前処理で符号が消えるため、元の本文から作る）：「銅層(13)」
+    for x in list(nodes):
+        for m in re.finditer(re.escape(x)+r"([\(（][0-9A-Za-z０-９Ａ-Ｚａ-ｚ]{1,6}[\)）])", flat_raw): nodes.add(x+m.group(1))
+    # 連体修飾＋名詞（本文の文字列から）：「半導体装置を準備する工程」「準備する工程」
+    for m in re.finditer(r"([^、。，]{0,30}?)((?:[一-龥々ァ-ヴー]+)(?:する|される|した|された|している|されている|できる|しない|となる|になる|る|た))([一-龥々ァ-ヴー]{1,12})", flat):
+        y=m.group(3)
+        if y in nodes or any(x.endswith(y) for x in nodes):
+            nodes.add(m.group(2)+y)
+            longp=re.sub(r"^(?:前記|該)","",m.group(1)+m.group(2)+y)
+            if len(longp)<=35: nodes.add(longp)
+    nodes={x for x in nodes if x and x not in NONN and 1<=len(x)<=40 and x in flat_all}
+    nodes|=extra_nodes(flat,nodes)
+    for m in re.finditer(r"[0-9０-９]+(?:[.．][0-9０-９]+)?\s*(?:°C|℃|%|％|質量%|mm|μm|nm|V|A|W|Hz|倍)?", flat):
+        v=m.group(0).strip()
+        if v: nodes.add(v)
+    for m in re.finditer(r"[A-Za-z0-9(),./\-]{3,}", flat_raw):
+        if re.search(r"[A-Za-z]",m.group(0)) and re.search(r"[0-9(]",m.group(0)): nodes.add(m.group(0).strip(",."))
+    for m in re.finditer(r"(?:前記|該)?([^、。をにがはで]{1,20}?と(?:前記|該)?[^、。をにがはで]{1,20}?との(?:間の|和|差|界面|接合部|間隔|接合界面)[^、。をにがはでと]{0,15})", flat):
+        nodes.add(re.sub(r"(前記|該)","",m.group(1)))
+    for m in re.finditer(r"(?:^|(?<=[、をにがはでとの]))([ぁ-ん]{2,3}[一-龥ァ-ヴー]{1,6})", flat):
+        nodes.add(m.group(1))
+    nl=sorted(nodes,key=len,reverse=True)
+    out=defaultdict(set); has1=set(); STEP=["?"]
+    def add(s,r,t,tag=None):
+        if s and t and s!=t: out[(s,r,t)].add(tag or STEP[0])
+    STEP[0]="1has"
+    # 1. 有する系
+    for t in nl:
+        for mt in re.finditer(re.escape(t)+Lm._R45_END, flat):
+            mv=HAS_rg.search(flat, mt.end()-1)
+            if not mv: continue
+            mid=flat[mt.end()-1:mv.start()]
+            if Lm._R45_TOPIC.search(mid) or "。" in mid: continue
+            lab=HASLAB.get(mv.group(1),mv.group(1))
+            aft=_after(flat,mv.end())
+            owners=[x for x in nl if aft.startswith(x)][:3] if mv.group(1) in RELF else []
+            tops=list(Lm._R45_TOPIC.finditer(flat[:mt.start()]))
+            if tops: owners+=[x for x in Lm.topic_names(tops[-1].group(1)) if x in nodes]
+            if title and (not tops or not owners): owners.append(title)
+            for o in owners: add(o,lab,t); has1.add((o,t))
+    STEP[0]="2no"
+    # 2. 「XのY」
+    for y in nl:
+        m=re.match(r"^(.+?)"+LINK+r"(.+)$",y)
+        if m and m.group(1) in nodes:
+            add(m.group(1),"の",y); add(m.group(1),"有する",m.group(2))
+    STEP[0]="3verb"
+    # 3. 動詞（GiNZA の述語）のまわり
+    offs=[]; pos=0
+    for tok in doc:
+        k=flat.find(tok.text.strip(),pos) if tok.text.strip() else -1
+        offs.append(k if k>=0 else pos)
+        if k>=0: pos=k+len(tok.text.strip())
+    for tok in doc:
+        is_pred = tok.pos_ in ("VERB","ADJ") or (tok.pos_=="NOUN" and any(c.lemma_ in ("する","できる") and c.dep_ in ("aux","cop") for c in tok.children))
+        if not is_pred: continue
+        vs=offs[tok.i]; 
+        tail="".join(c.text for c in tok.children if c.dep_ in ("aux","mark","fixed") and c.i>tok.i)
+        ve=vs+len(tok.text)+len(tail)
+        labs={tok.lemma_, tok.text+tail}
+        if tok.pos_=="NOUN": labs|={tok.text+"する", tok.text+"される"}
+        # 副詞的な前置き（「電気的に」「熱的に」）も関係名に
+        pre=flat[max(0,vs-6):vs]
+        mpre=re.search(r"([一-龥]{1,3}的に)$",pre)
+        if mpre: labs.add(mpre.group(1)+tok.lemma_)
+        labs={l for l in labs if l and len(l)<=20}
+        win=flat[max(0,vs-80):vs]; off=max(0,vs-80)
+        args=[]
+        for x in nl:
+            for m in re.finditer(re.escape(x)+CASES_rg, win):
+                if "。" in win[m.end():]: continue
+                args.append((off+m.start(),x))
+        args=[x for _,x in sorted(args)][-8:]
+        aft=_after(flat,ve)
+        heads=[]
+        for x in nl:
+            if aft.startswith(x): heads.append(x); break
+        if not heads:
+            m2=re.match(r"^[^、。]{0,25}?",aft)
+            seg=aft[:30]
+            for x in nl:
+                k=seg.find(x)
+                if 0<=k<=25 and "、" not in seg[:k]: heads.append(x); break
+        tops=list(Lm._R45_TOPIC.finditer(flat[:vs]))
+        tn=[x for x in Lm.topic_names(tops[-1].group(1)) if x in nodes] if tops else []
+        # 係り受け：述語から連用・並列（advcl・conj）をたどり、連体修飾（acl）でかかる名詞（遠くの主語）
+        t_=tok; steps=0
+        while t_.head.i!=t_.i and steps<12:
+            steps+=1
+            if t_.dep_=="acl" and t_.head.pos_ in ("NOUN","PROPN"):
+                h=t_.head; hs=offs[h.i]; he=hs+len(h.text)
+                cand=[x for x in nl if flat.find(x,max(0,he-len(x)-15),he+15)>=0 and flat.rfind(x,0,he+15)>=0 and he-len(x)-15<=flat.rfind(x,0,he+15)<=he]
+                if cand: heads.append(cand[0])
+                break
+            if t_.dep_ not in ("advcl","conj","aux","mark","fixed","ccomp"): break
+            t_=t_.head
+        subj=list(dict.fromkeys(heads+tn))
+        for l in labs:
+            for s in subj:
+                for a in args:
+                    add(s,l,a,"3sa"); add(a,l,s,"3as")
+            for i in range(len(args)):
+                for j in range(i+1,len(args)):
+                    a,b=args[i],args[j]
+                    if not (a in b or b in a): add(a,l,b,"3aa"); add(b,l,a,"3aa")
+    STEP[0]="4cmp"
+    # 4. 比較・「である」
+    for m in re.finditer(r"([^、。をにがはでと]{1,30}?)(?:は|が)[、，]?([^、。をにがはでと]{1,40}?)(以上|以下|未満|を超える|超|より大きい|より小さい|と異なる|と等しい|である|となる)", flat):
+        a=re.sub("^"+Lm._R45_LEAD,"",m.group(1)); b=re.sub("^"+Lm._R45_LEAD,"",m.group(2))
+        xa=next((x for x in nl if a.endswith(x)),None); yb=next((y for y in nl if b.endswith(y) or b==y),None)
+        if xa and yb:
+            lab=m.group(3); add(xa, lab if lab in ("である","となる") else lab+"である", yb); add(xa,lab,yb)
+    owners=defaultdict(set); near_owners=defaultdict(set); pos=defaultdict(list)
+    if not light:
+        STEP[0]="5hasall"
+        # 5. 組があれば「有する」の向きも（両向き）
+        for (s,r,t) in list(out):
+            add(s,"有する",t)
+        STEP[0]="6own"
+        # 6. 持ち主を付けた名前：「第2端を有する第5トランジスタ」→「第5トランジスタの第2端」
+        owners=defaultdict(set)
+        for s,t in has1:
+            if s!=t and "の" not in t and len(s)+len(t)<=30 and s!=title:
+                owners[t].add(s)
+        # 「Xの（…の）y」「XのAとy」：同じ名詞句の中で、X の後ろに（助詞「の」「と」「及び」だけを挟んで）y が続く
+        flat_nz=re.sub(r"(前記|該|上記)","",flat)
+        for x in nl:
+            if len(x)>20: continue
+            for m in re.finditer(re.escape(x)+r"の", flat_nz):
+                rest=flat_nz[m.end():m.end()+40]
+                mm=re.match(r"^[^、。をにがはでへ]{0,40}",rest)
+                seg=mm.group(0) if mm else ""
+                for y in nl:
+                    if y==x or "の" in y or len(y)>15: continue
+                    k=seg.find(y)
+                    if k>=0 and (k+len(y)==len(seg) or seg[k+len(y):k+len(y)+1] in ("の","と","及","お","並","又","ま","") or True):
+                        owners[y].add(x)
+        # 近く（前後60字・同じ文）に出てくる名前 X を、y の持ち主の候補にする（「…接合温度が高くなる第2半導体チップ」→「第2半導体チップの接合温度」）
+        near_owners=defaultdict(set)
+        posm=defaultdict(list)
+        for x in nl:
+            for m in re.finditer(re.escape(x), flat): posm[x].append(m.start())
+        for y in nl:
+            if "の" in y or len(y)>12: continue
+            for yp in posm.get(y,[]):
+                lo,hi=max(0,yp-60),min(len(flat),yp+len(y)+60)
+                win=flat[lo:hi]
+                for x in nl:
+                    if x==y or y in x or x in y or len(x)>20 or "の" in x: continue
+                    for xp in posm.get(x,[]):
+                        if lo<=xp<hi and "。" not in flat[min(xp,yp):max(xp,yp)]:
+                            near_owners[y].add(x); break
+        # 主題「前記Xは、…」の範囲に出てくる名前 y にも、持ち主 X を付けた名前を作る
+        for names_, a_, b_ in Lm._topic_clauses(flat):
+            clause=flat[a_:b_]
+            for y in nl:
+                if "の" in y or len(y)>15 or y in names_ or y==title: continue
+                if y in clause:
+                    for o in names_:
+                        if o in nodes and o!=y and len(o)+len(y)<=30: owners[y].add(o)
+        for s,r,t in list(out):
+            for side in (0,2):
+                y=(s,r,t)[side]
+                for o in owners.get(y,()):
+                    if o in (s,t): continue
+                    comp=o+"の"+y
+                    if side==0: add(comp,r,t)
+                    else: add(s,r,comp)
+        for y,os_ in owners.items():
+            for o in os_:
+                add(o,"の",o+"の"+y); add(o,"有する",o+"の"+y)
+        # 近くの持ち主の候補：持ち主との関係と、y と組になっている相手のうち近くに出てくるものとの関係だけ作る
+        ytrip=defaultdict(list)
+        for s_,r_,t_ in list(out):
+            ytrip[s_].append((0,r_,t_)); ytrip[t_].append((2,r_,s_))
+        for y,os_ in near_owners.items():
+            for o in os_:
+                if o in owners.get(y,()): continue
+                comp=o+"の"+y
+                add(o,"の",comp); add(o,"有する",comp)
+                for side,r_,other in (ytrip.get(y,[]) if NEAR_SUB else []):
+                    if other==o: continue
+                    # 相手が y の近く（前後60字）に出てくるときだけ
+                    if any(abs(p1-p2)<=60 for p1 in posm.get(y,[]) for p2 in posm.get(other,[])):
+                        if side==0: add(comp,r_,other)
+                        else: add(other,r_,comp)
+        STEP[0]="7lab"
+        # 7. 関係名を足す：組の2つの名前が本文で近くに出てくるところの、間（と後ろ）の述語の語幹（「基づいて」→「基づ」）
+        pos=defaultdict(list)
+        for x in nl:
+            for m in re.finditer(re.escape(x), flat): pos[x].append((m.start(),m.end()))
+        pairs={(s,t) for (s,r,t) in out}
+        # 近くに出てくる名前の組（60字以内・同じ文）も組にする（関係名は下で、間の述語の語幹から付ける）
+        ment=sorted((a0,a1,x) for x,ps in pos.items() for a0,a1 in ps)
+        for i,(a0,a1,x) in enumerate(ment):
+            for b0,b1,y in ment[i+1:]:
+                if b0-a1>60: break
+                if b0<a1 or x==y or x in y or y in x: continue
+                if "。" in flat[a1:b0]: continue
+                pairs.add((x,y)); add(x,"有する",y,"7near"); add(y,"有する",x,"7near")
+        for s,t in list(pairs):
+            if (t,s) in pairs and s>t: continue
+            best=None
+            for a0,a1 in pos.get(s,[]):
+                for b0,b1 in pos.get(t,[]):
+                    lo,hi=(a1,b0) if a0<b0 else (b1,a0)
+                    if 0<=hi-lo<=60 and (best is None or hi-lo<best[1]-best[0]): best=(lo,hi)
+            if not best: continue
+            if "。" in flat[best[0]:best[1]]: continue
+            seg=flat[max(0,best[0]-10):min(len(flat),best[1]+40)]
+            k_=seg.find("。",best[1]-max(0,best[0]-10))
+            if k_>=0: seg=seg[:k_]
+            for m in re.finditer(r"(からなる|からなり|からなっ|である|であり|となる|となり|を介し|に対向|に沿っ|に沿う|と接し|を含み|を含む|を有し|を有する|を備え|と同じ|と異なる|より高い|より低い|より大きい|より小さい|よりも高い|よりも低い|よりも大きい|よりも小さい)", seg):
+                lab=m.group(1)
+                add(s,lab,t); add(t,lab,s)
+            for m in re.finditer(r"([一-龥々]{1,6})(?=[ぁ-ん])", seg):
+                lab=m.group(1)
+                if lab in ("前記","該","第","上","下","内","側","間","各","複数","少","一","他","方"): continue
+                add(s,lab,t); add(t,lab,s)
+        STEP[0]="7b"
+        # 7b. 同じ属性（「〜の熱伝導率」）を持ち主ごとに作った名前どうしを、本文の比較の言葉でつなぐ
+        comps=defaultdict(set)
+        for y,os_ in owners.items():
+            for o in os_: comps[y].add(o+"の"+y)
+        # 近くの持ち主は、y の直後に比較の言葉（「が…より高い」など）が続くときだけ
+        for y,os_ in near_owners.items():
+            if re.search(re.escape(y)+r"(?:は|が)?[^、。]{0,30}?(?:より|と(?:同じ|等し|異な))", flat):
+                for o in os_: comps[y].add(o+"の"+y)
+        cmp_labs=set(m.group(0) for m in re.finditer(r"(?:よりも|より)(?:高い|低い|大きい|小さい|広い|狭い|深い|浅い|厚い|薄い|長い|短い|高く|低く|大きく|小さく|広く|狭く|深く|浅く|厚く|薄く|長く|短く)|と(?:同じ|等しい|異なる)", flat))
+        cmp_labs|={x.replace("よりも","より") for x in cmp_labs}
+        for y,cs_ in comps.items():
+            cs_=list(cs_)
+            if len(cs_)<2 or not cmp_labs or not FLAG_7B: continue
+            for i in range(len(cs_)):
+                for j in range(len(cs_)):
+                    if i!=j:
+                        for lab in cmp_labs: add(cs_[i],lab,cs_[j])
+    STEP[0]="7c"
+    # 7c. 「AよりもPが高いB」→ BのP｜より高い｜AのP
+    for m in re.finditer(r"(?:前記)?([^、。をにがはでと]{1,25}?)(?:よりも|より)((?:[^、。をにがはで]{1,12}?))(?:が|は)?(高|低|大き|小さ|広|狭|厚|薄|長|短|深|浅)(い|く)", flat):
+        a=next((x for x in nl if m.group(1).endswith(x)),None); P=m.group(2)
+        if not a or len(P)<1: continue
+        after=re.sub(r"^(前記|該)","",flat[m.end():m.end()+40])
+        b=next((x for x in nl if x in after[:30]),None)
+        lab="より"+m.group(3)+"い"
+        if b:
+            add(b+"の"+P,lab,a+"の"+P); add(b+"の"+P,lab+"である",a+"の"+P); add(b,"の",b+"の"+P); add(a,"の",a+"の"+P)
+    STEP[0]="8between"
+    # 8. 「AとBとの間のC」「AとBとの間にC」→ C｜間に位置する｜A、B
+    for m in re.finditer(r"(?:前記)?([^、。をにがはでと]{1,25}?)と(?:前記)?([^、。をにがはでと]{1,25}?)との間(?:の|に|で)", flat):
+        a=next((x for x in nl if m.group(1).endswith(x)),None); b=next((x for x in nl if m.group(2).endswith(x)),None)
+        after=re.sub(r"^(前記|該)","",flat[m.end():m.end()+60])
+        cs=[x for x in nl if x in after[:40]][:4]
+        for cnode in cs:
+            for z in (a,b):
+                if z and cnode!=z:
+                    for lab in ("間に位置する","間に設けられる","間に配置される"): add(cnode,lab,z)
+    return out, nodes
+
+
+# ===========================================================================
+# 【統合】llm_fewshot.py
+# ===========================================================================
+"""
+llm_fewshot.py
+==============
+【実験 F1（2026-09-26）・手本の版 fewshot2（方法の請求項の書き方を正解に合わせて修正）】手本つきの LLM による SAO の直接抽出（ローカル LLM・学習なし）。
+
+書き方の決まり（FEWSHOT_GUIDE）と、dev の正解の手本（FEWSHOT_EXAMPLES、dev の4件）を LLM に見せて、
+請求項から「主語｜関係｜目的語」を1行ずつ書かせる。モデルの学習はしない（手本を見せて頼むだけ）。
+決まりと手本は dev だけを見て作る（評価の手順.md）。手本に使った4件は評価から外す。
+"""
+import hashlib
+import os
+import re
+
+try:
+    import ollama as _ollama
+except ImportError:  # pragma: no cover
+    _ollama = None
+
+FEWSHOT_IDS = ("特開2025-044743", "特開2025-017118", "特開2024-166626", "特許7325536")
+
+FEWSHOT_GUIDE = """あなたは特許の請求項から、構成要素どうしの関係（SAO：主語｜関係｜目的語）を取り出す専門家です。
+次の決まりに従い、1行に1つ「主語｜関係｜目的語」だけを書いてください。説明・番号・見出しは書かないでください。
+
+【名前（主語・目的語）】
+・請求項に書かれた構成要素の名前を使う。「前記」「該」「少なくとも１つの」「複数の」「各」「それぞれの」は付けない。
+・「第１」「第２」などの番号は請求項の表記のまま残す。
+・名前にかかる修飾の節は付けない（「基板上に設けられたゲート電極」→「ゲート電極」）。
+・部品・部分（外縁・端・部分・側面・開口部など）は、持ち主と分けて「持ち主｜有する｜部品」と書き、その後は部品の名前だけで書く。
+・量（面積・厚さ・長さ・平均値・最大値など）は「第２部分の面積」「距離の平均値」のように「の」でつないだ名前のまま使う。
+・場所を表す語（上・主面・内部など）は目的語に含める（「チップ｜設けられる｜第１基板上」）。
+
+【題名とのつながり】
+・請求項の最後の名詞（例「半導体モジュール」）が、最上位で「Ａと、Ｂと、を備える」と並べた構成要素を持つ。
+  「半導体モジュール｜備える｜Ａ」のように、本文の動詞（備える・有する・含む）をそのまま関係にする。
+・方法の請求項では、題名（例「半導体装置の製造方法」）が各工程を持つ：「半導体装置の製造方法｜備える｜被封止部材を形成する工程」。
+  工程の名前は「前記」を除いた「〜を〜する工程」の形にする。さらに、工程の中に書かれた物どうしの関係も書く。
+・最上位で構成要素を並べていない請求項（「Ａであって、Ｂは…を有する」だけのもの）では、題名を名前にしない。
+
+【関係】
+・「ＡはＢを有する」「ＡはＢとＣとを含む」→「Ａ｜有する｜Ｂ」（Ｃも同じように1行）。
+・名前にかかる節も関係にする：「Ｂを収容するＡ」→「Ａ｜収容する｜Ｂ」、「Ｂに接続されたＡ」→「Ａ｜接続される｜Ｂ」。
+・受け身は書かれた向きのまま：「ＡにはＢが形成される」「Ｂが形成されたＡ」→「Ｂ｜形成される｜Ａ」、
+  「ＡにＢが搭載され」→「Ｂ｜搭載される｜Ａ」。形成・搭載・配置されたものを主語にする。
+・「ＡとＢとの間に設けられたＣ」→「Ｃ｜間に設けられる｜Ａ」と「Ｃ｜間に設けられる｜Ｂ」の2行。
+・「ＡとＢとを接続するＣ」→「Ｃ｜接続する｜Ａ」と「Ｃ｜接続する｜Ｂ」の2行。
+・関係は辞書形にする（「設けられた」「設けられ」→「設けられる」）。
+・数値：「Ｘは５０μｍ以上３００μｍ以下」→「Ｘ｜以上｜50μm」と「Ｘ｜以下｜300μm」。
+・比較：「Ａの面積よりもＢの面積の方が大きい」→「Ｂの面積｜より大きい｜Ａの面積」。
+・同じ行を2回書かない。請求項に書かれていない関係は書かない。
+"""
+
+FEWSHOT_EXAMPLES = [
+    ("""第１基板と、
+前記第１基板と対向して設けられる第２基板と、
+前記第１基板上かつ前記第１基板と前記第２基板との間に設けられたチップと、
+前記チップ上に設けられ、前記チップと前記第２基板とを接続するスペーサと、
+を含み、
+前記スペーサは、前記チップと接する第１部分の面積よりも、前記第２基板と接する第２部分の面積の方が大きい、半導体装置。""",
+     """半導体装置｜含む｜第１基板
+半導体装置｜含む｜第２基板
+半導体装置｜含む｜チップ
+半導体装置｜含む｜スペーサ
+第２基板｜対向する｜第１基板
+チップ｜設けられる｜第１基板上
+チップ｜間に設けられる｜第１基板
+チップ｜間に設けられる｜第２基板
+スペーサ｜設けられる｜チップ上
+スペーサ｜接続する｜チップ
+スペーサ｜接続する｜第２基板
+スペーサ｜有する｜第１部分
+スペーサ｜有する｜第２部分
+第１部分｜接する｜チップ
+第２部分｜接する｜第２基板
+第２部分の面積｜より大きい｜第１部分の面積"""),
+    ("""空気調和装置の室外機であって、
+室外熱交換器、室外ファン、及び少なくとも１つの電気部品を収容する筐体と、
+前記筐体の内部を、前記室外熱交換器及び前記室外ファンを収容する第１室と、前記少なくとも１つの電気部品を収容する第２室とに仕切る仕切り部材とを備え、
+前記仕切り部材には、第１開口と第２開口とが形成されており、
+前記第１開口と前記第２開口との間を接続しており、前記第２室内に渡されている少なくとも１つのダクトをさらに備え、
+前記第１開口と前記第２開口との間には、前記室外ファンの運転時に圧力差が形成され、
+前記少なくとも１つの電気部品は、前記少なくとも１つのダクトと熱的に接続されている、室外機。""",
+     """室外機｜備える｜筐体
+室外機｜備える｜仕切り部材
+室外機｜備える｜ダクト
+筐体｜収容する｜室外熱交換器
+筐体｜収容する｜室外ファン
+筐体｜収容する｜電気部品
+仕切り部材｜仕切る｜筐体の内部
+第１室｜収容する｜室外熱交換器
+第１室｜収容する｜室外ファン
+第２室｜収容する｜電気部品
+第１開口｜形成される｜仕切り部材
+第２開口｜形成される｜仕切り部材
+ダクト｜接続する｜第１開口
+ダクト｜接続する｜第２開口
+ダクト｜渡される｜第２室
+圧力差｜形成される｜第１開口
+圧力差｜形成される｜第２開口
+電気部品｜熱的に接続される｜ダクト"""),
+    ("""半導体素子を搭載する回路基板と、
+前記半導体素子を収容するケースと、
+前記ケースの内外を貫通するリード端子と、
+前記ケース内で前記半導体素子と前記リード端子とを電気的に接続するボンディングワイヤと、を備え、
+前記リード端子は、前記ボンディングワイヤが接合されるパッド部を有し、
+前記ケースは、前記パッド部を囲むように前記パッド部の少なくとも一部を底面とする凹部を有し、
+前記凹部の側面のうち、前記回路基板の厚さ方向にみて前記ボンディングワイヤに重なる部分である第１側面は、前記底面から前記凹部の開口に向かうに従い前記凹部を広げるように傾斜する、
+半導体モジュール。""",
+     """半導体モジュール｜備える｜回路基板
+半導体モジュール｜備える｜ケース
+半導体モジュール｜備える｜リード端子
+半導体モジュール｜備える｜ボンディングワイヤ
+回路基板｜搭載する｜半導体素子
+ケース｜収容する｜半導体素子
+リード端子｜貫通する｜ケース
+ボンディングワイヤ｜接続する｜半導体素子
+ボンディングワイヤ｜接続する｜リード端子
+リード端子｜有する｜パッド部
+パッド部｜接合される｜ボンディングワイヤ
+ケース｜有する｜凹部
+凹部｜囲む｜パッド部
+凹部｜を底面とする｜パッド部
+凹部｜有する｜第１側面
+第１側面｜重なる｜ボンディングワイヤ
+第１側面｜から傾斜する｜底面
+第１側面｜に向かって傾斜する｜凹部の開口
+第１側面｜広げるように傾斜する｜凹部"""),
+    ("""半導体素子を封止材によって封止した半導体装置の製造方法であって、
+前記封止材によって封止される、前記半導体素子を含む被封止部材を形成する工程と、
+前記被封止部材をケース内に収容する工程と、
+シランカップリング剤の溶液を前記ケース内に流し込む工程と、
+前記ケース内の前記溶液を除去する工程と、
+前記溶液を前記ケース内に流し込む工程において前記被封止部材に付着した前記溶液に処理を施すことによって、前記被封止部材の表面にプライマ層を形成する工程と、
+前記ケース内に封止材を充填することによって、前記プライマ層が形成された前記被封止部材を封止する工程と、
+を備え、
+前記プライマ層を形成する工程は、前記半導体素子の表面に前記プライマ層を形成する工程を含む、半導体装置の製造方法。""",
+     """半導体素子｜封止される｜封止材
+半導体装置の製造方法｜備える｜被封止部材を形成する工程
+半導体装置の製造方法｜備える｜被封止部材をケース内に収容する工程
+半導体装置の製造方法｜備える｜溶液をケース内に流し込む工程
+半導体装置の製造方法｜備える｜ケース内の溶液を除去する工程
+半導体装置の製造方法｜備える｜プライマ層を形成する工程
+半導体装置の製造方法｜備える｜被封止部材を封止する工程
+被封止部材｜含む｜半導体素子
+被封止部材｜封止される｜封止材
+被封止部材｜収容される｜ケース
+溶液｜流し込まれる｜ケース
+溶液｜付着する｜被封止部材
+プライマ層｜形成される｜被封止部材
+プライマ層を形成する工程｜含む｜半導体素子の表面にプライマ層を形成する工程
+プライマ層｜形成される｜半導体素子
+封止材｜充填される｜ケース"""),
+]
+
+NUM_PREDICT = 3000
+# 大きいモデル（qwen3.5:27b など）は1件に数分かかるので、待ち時間の上限を長めにする（環境変数 SAO_FEWSHOT_TIMEOUT で変更可）
+TIMEOUT_SECONDS = int(os.environ.get("SAO_FEWSHOT_TIMEOUT", "1500"))
+_SEP_RE = re.compile(r"\s*[｜|]\s*")
+_LEAD_RE = re.compile(r"^\s*(?:[-・*●]|\d+[.)．、]|（?\d+）)\s*")
+# 「第 1 端子」のような、日本語の前後の空白（小さいモデルがよく入れる）を取る
+_SPACE_RE = re.compile(r"(?<=[^\x00-\x7f])[ \t\u3000]+|[ \t\u3000]+(?=[^\x00-\x7f])")
+_DROP_PREFIX_RE = re.compile(r"^(前記|該|少なくとも[１1一]つの|複数の|各|それぞれの)")
+
+
+def system_prompt():
+    parts = [FEWSHOT_GUIDE, "\n【手本】"]
+    for k, (text, out) in enumerate(FEWSHOT_EXAMPLES, 1):
+        parts.append(f"\n手本{k}の請求項：\n{text}\n手本{k}の出力：\n{out}\n")
+    return "".join(parts)
+
+
+def parse(raw):
+    """LLM の出力から (主語, 関係, 目的語) を取り出す（形の崩れた行は捨てる）"""
+    out, seen = [], set()
+    for line in (raw or "").splitlines():
+        line = _LEAD_RE.sub("", line.strip())
+        if not line or line.endswith("：") or line.endswith(":"):
+            continue
+        parts = _SEP_RE.split(line)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            continue
+        s, r, t = (_SPACE_RE.sub("", p).strip(" 　「」") for p in parts)
+        for _ in range(2):
+            s, t = _DROP_PREFIX_RE.sub("", s), _DROP_PREFIX_RE.sub("", t)
+        if not s or not t or s == t or len(s) > 40 or len(t) > 40:
+            continue
+        if (s, r, t) in seen:
+            continue
+        seen.add((s, r, t))
+        out.append({"source": s, "relation": r, "target": t})
+    return out
+
+
+def _chat(ts, system, user, model, host):
+    ollama = _ollama
+    if ollama is None:
+        raise RuntimeError("ollama パッケージが見つかりません（pip install ollama）。Ollama を起動してください。")
+    client = ollama.Client(host=host, timeout=TIMEOUT_SECONDS)
+    kw = dict(model=model, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+              options={"temperature": 0, "num_predict": NUM_PREDICT,
+                       "num_ctx": getattr(ts, "OLLAMA_NUM_CTX", 16384)})
+    try:
+        resp = client.chat(**kw, think=False)
+    except TypeError:
+        resp = client.chat(**kw)
+    content = resp["message"]["content"]
+    think_re = getattr(ts, "_THINK_BLOCK_RE", None)
+    return think_re.sub("", content).strip() if think_re is not None else content
+
+
+def extract(ts, text, model=None, host=None, cache=None):
+    """請求項 text から SAO を取り出す。戻り値：(関係のリスト, LLM の生の出力)"""
+    model = model or getattr(ts, "DEFAULT_MODEL", "qwen3.5:9b")
+    system = system_prompt()
+    user = f"請求項：\n{text}\n出力："
+    key = hashlib.sha1(("fewshot2\n" + system + "\n" + user + "\n" + model).encode("utf-8")).hexdigest()
+    if cache is not None and key in cache:
+        raw = cache[key]
+    else:
+        raw = _chat(ts, system, user, model, host)
+        if cache is not None:
+            cache[key] = raw
+    return parse(raw), raw
+
+
+# ===========================================================================
 # 【統合】llm_select.py
 # 名前の付け替え: BARE_STEPS → BARE_STEPS_ls, analyze_claim → analyze_claim_ls
 # ===========================================================================
@@ -14471,6 +15269,7 @@ pass  # （統合済み）import comp_first as CF
 pass  # （統合済み）import rulebook as RB
 pass  # （統合済み）import sao_selector13 as S13
 pass  # （統合済み）import struct_extra as SE
+pass  # （統合済み）import recall_gen as RG
 
 SELECT_SYSTEM = """あなたは日本の特許請求項の構造を分析する専門家です。請求項に書かれている構成要素どうしの関係を、
 「主語｜関係｜目的語」の形で、漏れなく、正しく整理するのが仕事です。
@@ -15459,6 +16258,64 @@ def _segment_supported(c, text, title):
     return verb_evidence(c["source"], c["target"], rel, text) in ("rel", "topic")
 
 
+# ---- 【R61・R62】ほかの候補の作り方の「裏付けの数」（独立した作り方がいくつ同じ組を出したか） ----
+_SUPPORT_W = {"W:G": 1, "W:GS": 1, "W:DEP": 1, "W:SEG": 1, "W:TITLE": 1, "W:MRG": 1, "W:ST": 1,
+              "1has": 1, "2no": 1, "3sa": 1, "4cmp": 2, "7c": 1, "8between": 1}
+R62_MIN_VOTES = int(os.environ.get("SAO_R62_MIN_VOTES", "3"))
+# 【R61】自動で採用するのに必要な裏付けの数（これ未満は要確認）。2＝標準（F1 が最も高い）、5＝高信頼（自動採用の適合率 約75%）
+R61_MIN_VOTES = int(os.environ.get("SAO_R61_MIN_VOTES", "2"))
+_SUPPORT_PRI = ["4cmp", "1has", "W:G", "W:GS", "W:DEP", "3sa", "2no", "W:TITLE", "W:MRG", "W:ST", "W:SEG", "8between", "7c"]
+
+
+def support_votes(ts, pp, text, info, base):
+    """組（主語・目的語、表記正規化後）ごとの裏付けの数と、その組の代表の関係名。
+    裏付け＝比較用の広い候補の集め方（区間内の組・係り受けの組・題名の組など）と、網羅候補（R60）の文型の規則のうち、
+    その組を出したものの数（重み付き）。学習はせず、独立した作り方どうしの一致を数えるだけ。"""
+    nrm = pp._normalize_node_text_lenient
+    tags, best = {}, {}
+    pr = {t: i for i, t in enumerate(_SUPPORT_PRI)}
+
+    def note(s, r, t, tg):
+        k = (nrm(s), nrm(t))
+        tags.setdefault(k, set()).update(tg)
+        rank = min([pr.get(x, 99) for x in tg] or [99])
+        if k not in best or rank < best[k][0]:
+            best[k] = (rank, s, r, t)
+
+    wide = build_rule_and_llm_candidates(ts, pp, text, llm_output="", pool="wide")
+    for c in normalize_candidates(wide["cands"], None):
+        note(c["source"], c["relation"], c["target"], {"W:" + x.split(":")[0] for x in c["srcs"] if not x.startswith("E1")})
+    gen, _ = generate(pp, text, base, info.get("title"), globals().get("llm_select") or sys.modules[__name__], light=True)
+    for (s, r, t), tg in gen.items():
+        note(s, r, t, tg)
+    votes = {k: sum(_SUPPORT_W.get(x, 0) for x in v) for k, v in tags.items()}
+    return votes, best, wide
+
+
+# ---- 【R63】要確認の候補だけを LLM に確かめさせる（LLM は関係を作らず、はい／いいえで答えるだけ） ----
+VERIFY_SYSTEM = (
+    "あなたは特許請求項を正確に読む専門家です。請求項の本文と、規則で取り出した関係の候補（主語｜関係｜目的語）が与えられます。"
+    "各候補について、その関係が本文に書かれている（本文から直接読み取れる）なら「はい」、書かれていない・推測が必要・"
+    "主語と目的語の取り違え・別の部品どうしの関係なら「いいえ」と答えてください。"
+    "「有する」「備える」「含む」は、主語の部品が目的語の部品を構成要素として持つという意味です。"
+    "答えは、候補の番号ごとに「番号: はい」または「番号: いいえ」の1行だけを、すべての番号について書いてください。説明は不要です。")
+
+
+def llm_verify(ts, text, triples, model=None, host=None, cache=None):
+    """triples: [(主語, 関係, 目的語)]。戻り値: {番号(0始まり): True/False}（答えが読めなかった番号は含まない）"""
+    if not triples:
+        return {}
+    lines = [f"{i + 1}. {s}｜{r}｜{t}" for i, (s, r, t) in enumerate(triples)]
+    user = "【請求項】\n" + re.sub(r"\s+", "", text) + "\n\n【候補】\n" + "\n".join(lines)
+    out = _chat_cached(ts, VERIFY_SYSTEM, user, model, host, cache)
+    res = {}
+    for m in re.finditer(r"(\d+)\s*[:：.．)）]\s*(はい|いいえ|Yes|No|yes|no)", out or ""):
+        k = int(m.group(1)) - 1
+        if 0 <= k < len(triples):
+            res[k] = m.group(2) in ("はい", "Yes", "yes")
+    return res
+
+
 def _weak_link(c, title, use_gf, text=None):
     """採用の候補のうち、つなぎの裏付けが無いもの（要確認にする規則の id を返す。問題なければ None）。
     裏付け＝区間ごとの解析（R10、新森らの手がかり句）でも同じ関係が出たこと。LLM で構成要素を固定したとき（GF）は、
@@ -15486,7 +16343,96 @@ def _weak_link(c, title, use_gf, text=None):
     return None
 
 
-def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=True, recall_cands=True):
+# 【R66】比較の補完：「Ｘよりも不純物濃度の高いＹ」「Ｘよりも高い熱伝導率を有するＹ」のように、比べている量（不純物濃度・
+# 熱伝導率など）が片方にしか書かれていない比較を、両方に量を補って「Ｙの不純物濃度｜より高い｜Ｘの不純物濃度」にする。
+# 「ＱはＮ以上Ｍ以下」は「Ｑ｜以上｜Ｎ」「Ｑ｜以下｜Ｍ」にする
+_R66_ADJ = {"高": "より高い", "低": "より低い", "大き": "より大きい", "小さ": "より小さい", "厚": "より厚い", "薄": "より薄い",
+            "長": "より長い", "短": "より短い", "広": "より広い", "狭": "より狭い", "深": "より深い", "浅": "より浅い",
+            "多": "より多い", "少な": "より少ない"}
+_R66_AD = "|".join(sorted(_R66_ADJ, key=len, reverse=True))
+_R66_NB = r"[^、。をがはにでとも「」（）()]"
+_R66_Q = (r"(?:ピーク不純物濃度|最大不純物濃度|不純物濃度|濃度|最大厚み|厚さ|厚み|第\d幅|幅|長さ|面積|高さ|深さ|直径|径|オン抵抗|"
+          r"抵抗値|抵抗|熱伝導率|熱伝導性|線熱膨張係数|熱膨張係数|体積抵抗率|ヤング率|電位|電圧|電流|温度|硬さ|結晶欠陥密度|密度|"
+          r"比誘電率|誘電率|寸法|距離|間隔|容量|周波数|検出頻度|頻度)")
+_R66_RES = (
+    re.compile("(" + _R66_NB + "+?)より(?:も)?(" + _R66_Q + ")[のが](" + _R66_AD + r")(?:い|く)(?:第\d導電型の)?("
+               + _R66_NB + "+?)(?=[、。をがはにでと]|$)"),
+    re.compile("(" + _R66_NB + "+?)より(?:も)?(" + _R66_AD + ")(?:い|な)(" + _R66_Q + ")を有する(?:少なくとも1つの)?("
+               + _R66_NB + "+?)(?=[、。をがはにでと]|$)"),
+    re.compile("(" + _R66_NB + "+?の" + _R66_Q + ")は、?(" + _R66_NB + "+?)より(?:も)?(" + _R66_AD + ")(?:い|く)"),
+    re.compile("(" + _R66_NB + "+?)は、?([0-9.]+[^、。以]*?)以上(?:([0-9.]+[^、。以]*?)以下)?"),
+)
+
+
+def _r66_name(x):
+    x = re.split(r"且つ|かつ", x)[-1]
+    return re.sub(r"^[ぁ-ん]+", "", x)
+
+
+def comparison_triples(pp, text):
+    """【R66】比較の補完で作る (主語, 関係, 目的語) のリスト"""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", pp._clean_claim_text(text))
+    t = re.sub(r"(前記|当該|該)", "", re.sub(r"\s", "", t))
+    qre = re.compile(_R66_Q + "$")
+    out = []
+
+    def with_q(x, q):
+        x = _r66_name(x)
+        return x if qre.search(x) else f"{x}の{q}"
+    for m in _R66_RES[0].finditer(t):
+        x, q, a, y = m.groups()
+        out.append((f"{_r66_name(y)}の{q}", _R66_ADJ[a], with_q(x, q)))
+    for m in _R66_RES[1].finditer(t):
+        x, a, q, y = m.groups()
+        out.append((f"{_r66_name(y)}の{q}", _R66_ADJ[a], with_q(x, q)))
+    for m in _R66_RES[2].finditer(t):
+        yq, x, a = m.groups()
+        q = qre.search(yq).group(0)
+        out.append((_r66_name(yq), _R66_ADJ[a], with_q(x, q)))
+    for m in _R66_RES[3].finditer(t):
+        q, a, b = m.groups()
+        q = _r66_name(q)
+        if len(q) > 30:
+            continue
+        out.append((q, "以上", a))
+        if b:
+            out.append((q, "以下", b))
+    out = [(s0, r0, o0) for s0, r0, o0 in out if 2 <= len(s0) <= 40 and 1 <= len(o0) <= 40 and s0 != o0]
+    return list(dict.fromkeys(out))
+
+
+# 【R65】構成要素ではない語（向き・位置・性質・状態・時などを表す語）。dev の誤りの分類（評価の手順.md 4-4）で、
+# 正解の構成要素にほとんど現れない名前として見つけたもの
+_R65_WORDS = {"面", "直列", "並列", "位置", "反対", "反対側", "一方側", "他方側", "平面視", "態様", "共", "時", "否", "結果",
+              "条件", "期間", "物", "値", "各", "熱", "電気", "形状", "材料", "一部", "部分", "領域", "層", "電圧", "電流",
+              "方向", "場合", "状態", "構造", "方式", "際", "間", "内", "外", "上", "下", "側", "端", "両者", "双方", "互い",
+              "全体", "少なくとも一方"}
+_R65_RES = (re.compile(r"^第?[0-9一二三]*導電型$"), re.compile(r"^第[0-9]+方向$"), re.compile(r"^.{0,3}視$"),
+            re.compile(r"^々"))
+
+
+def _not_component(pp, name):
+    x = pp._normalize_node_text_lenient(name or "")
+    return x in _R65_WORDS or any(r.search(x) for r in _R65_RES)
+
+
+_HAS_FAMILY = ("有する", "備える", "具備", "含む", "含め")
+
+
+def _fewshot_rel_ok(pp, a, b):
+    """R64 の関係の一致（評価の rel_match と同じ考え方：表記の正規化・漢字部分の一致・「持つ」の仲間）"""
+    if a == b:
+        return True
+    an, bn = pp._normalize_relation_for_match(a), pp._normalize_relation_for_match(b)
+    if an == bn or (an and bn and (an in bn or bn in an)):
+        return True
+    return (a == "の" or any(h in a for h in _HAS_FAMILY)) and (b == "の" or any(h in b for h in _HAS_FAMILY))
+
+
+def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=True, recall_cands=False,
+                     accept_min_votes=None, verify=False, verify_promote=True, fewshot=False, fewshot_cache=None,
+                     fewshot_review=True):
     """最終方式（A2）。LLM の呼び出しは構成要素の書き出しの1回だけ。
       1. LLM が構成要素の名前を本文の表記のまま書き出す（comp_first.COMPONENT_SYSTEM）
       2. 【R04】新森ら（2004）の「名詞まとまり」の考え方で、名前の境界を確かめる
@@ -15567,8 +16513,132 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
         else:
             judged.append({"selected": False, "score": 0.1, "status": "除外", "basis": "その他の規則の候補"})
     judged = tidy(pp, info["cands"], judged)
+    wide = None
+    if enabled("R61") or enabled("R62"):
+        try:
+            nrm = pp._normalize_node_text_lenient
+            votes, best, wide = support_votes(ts, pp, text, info,
+                                              [(c["source"], c["relation"], c["target"]) for c in info["cands"]])
+            info["support_votes"] = votes
+            amv = accept_min_votes if accept_min_votes is not None else R61_MIN_VOTES
+            if enabled("R61"):
+                # 【R61】採用のうち、ほかの作り方の裏付けがほとんど無い（1以下）関係は要確認にする
+                for c, j in zip(info["cands"], judged):
+                    if j["selected"] and votes.get((nrm(c["source"]), nrm(c["target"])), 0) < amv:
+                        mark(c, "R61")
+                        j.update(selected=False, status="要確認", score=min(j["score"], 0.45),
+                                 basis=f"ほかの作り方の裏付けが少ない（{votes.get((nrm(c['source']), nrm(c['target'])), 0)}／必要 {amv}・R61）")
+            if enabled("R62"):
+                # 【R62】採用・要確認に無い組のうち、裏付けが多く、本文の文型とも合うものを要確認として出す（人が拾えるように）
+                shown = set()
+                for c, j in zip(info["cands"], judged):
+                    if j["status"] in ("採用", "要確認"):
+                        a, b = nrm(c["source"]), nrm(c["target"])
+                        shown |= {(a, b), (b, a)}
+                flat_r = re.sub(r"\s", "", pp._clean_claim_text(text))
+                add = []
+                for k, v in votes.items():
+                    if v < 3 or k in shown or k[0] == k[1]:
+                        continue
+                    _, s0, r0, t0 = best[k]
+                    if r0.startswith(("有", "備", "含", "具備")):
+                        typ, ev = "has", has_evidence(s0, t0, flat_r)
+                    elif r0 == "の":
+                        typ, ev = "no", None
+                    else:
+                        typ, ev = "verb", verb_evidence(s0, t0, r0, flat_r)
+                    if v >= R62_MIN_VOTES or (v >= 3 and ev in ("rel", "topic")) or (v >= 4 and typ == "verb"):
+                        add.append((v, s0, r0, t0))
+                        shown |= {k, (k[1], k[0])}
+                for v, s0, r0, t0 in sorted(add, reverse=True)[:30]:
+                    c = {"source": s0, "relation": r0, "target": t0, "srcs": ["RC:裏付け"], "rules": ["R62"], "base": False}
+                    info["cands"].append(c)
+                    judged.append({"selected": False, "score": 0.35, "status": "要確認",
+                                   "basis": f"複数の作り方が一致（裏付け {v}・R62）", "rules": ["R62"]})
+        except Exception as exc:  # noqa: BLE001
+            info["support_error"] = str(exc)[:200]
+    if enabled("R66"):
+        try:
+            nrm = pp._normalize_node_text_lenient
+            have = {(nrm(c["source"]), c["relation"], nrm(c["target"])) for c in info["cands"]}
+            for s0, r0, o0 in comparison_triples(pp, text):
+                if (nrm(s0), r0, nrm(o0)) in have:
+                    continue
+                c = {"source": s0, "relation": r0, "target": o0, "srcs": ["RC:比較"], "rules": ["R66"], "base": False}
+                info["cands"].append(c)
+                judged.append({"selected": True, "score": 0.7, "status": "採用",
+                               "basis": "比較の補完（比べている量を両方に補う・R66）", "rules": ["R66"]})
+        except Exception as exc:  # noqa: BLE001
+            info["compare_error"] = str(exc)[:200]
+    if enabled("R65"):
+        # 【R65】構成要素ではない語（「面」「直列」「位置」「第１導電型」「第１方向」「平面視」など）が主語・目的語の関係は、
+        # 自動では採用せず要確認にする
+        for c, j in zip(info["cands"], judged):
+            if j["status"] == "採用" and (_not_component(pp, c["source"]) or _not_component(pp, c["target"])):
+                mark(c, "R65")
+                j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                         basis=j["basis"] + "→構成要素ではない語を含む（R65）")
+    if verify and enabled("R63"):
+        # 【R63】要確認（最大30件、確からしさの高い順）を LLM に「本文に書かれているか」だけ確かめさせる
+        idx = sorted([i for i, j in enumerate(judged) if j["status"] == "要確認"], key=lambda i: -judged[i]["score"])[:30]
+        try:
+            ans = llm_verify(ts, text, [(info["cands"][i]["source"], info["cands"][i]["relation"], info["cands"][i]["target"])
+                                        for i in idx], model=model, host=host, cache=cache)
+            info["verify_n"] = len(idx)
+            for k, i in enumerate(idx):
+                if k not in ans:
+                    continue
+                j = judged[i]
+                j["llm_verdict"] = "はい" if ans[k] else "いいえ"
+                if ans[k] and verify_promote:
+                    mark(info["cands"][i], "R63")
+                    j.update(selected=True, status="採用", score=max(j["score"], 0.7),
+                             basis=j["basis"] + "→LLMが本文で確認（R63）")
+                else:
+                    j["basis"] = j["basis"] + f"（LLM：{j['llm_verdict']}）"
+        except Exception as exc:  # noqa: BLE001  LLM を呼べなくても、要確認のまま返す
+            info["verify_error"] = str(exc)[:200]
+    if fewshot and enabled("R64"):
+        # 【R64】手本つきのローカル LLM にも SAO を書き出させ、規則の要確認と同じ関係なら採用にする。
+        # LLM だけが出した関係は、人が拾えるように要確認として出す（fewshot_review）
+        try:
+            pass  # （統合済み）import llm_fewshot as FS
+            fs, _raw = extract(ts, text, model=model, host=host, cache=fewshot_cache)
+            info["fewshot_n"] = len(fs)
+            nrm = pp._normalize_node_text_lenient
+            index = {}
+            for i, c in enumerate(info["cands"]):
+                index.setdefault((nrm(c["source"]), nrm(c["target"])), []).append(i)
+            for f in fs:
+                hit = [i for i in index.get((nrm(f["source"]), nrm(f["target"])), [])
+                       if _fewshot_rel_ok(pp, info["cands"][i]["relation"], f["relation"])]
+                if hit:
+                    for i in hit:
+                        j = judged[i]
+                        j["fewshot"] = j["status"]
+                        if j["status"] == "要確認":
+                            mark(info["cands"][i], "R64")
+                            j.update(selected=True, status="採用", score=max(j["score"], 0.7),
+                                     basis=j["basis"] + "→手本つきLLMも同じ関係を抽出（R64）")
+                        elif j["status"] == "除外" and fewshot_review:
+                            j.update(status="要確認", score=max(j["score"], 0.3),
+                                     basis=j["basis"] + "→手本つきLLMは抽出（R64）")
+                    continue
+                if not fewshot_review:
+                    continue
+                c = {"source": f["source"], "relation": f["relation"], "target": f["target"], "srcs": ["LLM:手本"],
+                     "rules": ["R64"], "base": False}
+                info["cands"].append(c)
+                index.setdefault((nrm(c["source"]), nrm(c["target"])), []).append(len(info["cands"]) - 1)
+                judged.append({"selected": False, "score": 0.25, "status": "要確認", "fewshot": "なし",
+                               "basis": "手本つきLLMだけが抽出（R64）", "rules": ["R64"]})
+        except Exception as exc:  # noqa: BLE001  LLM を呼べなくても、規則の結果を返す
+            info["fewshot_error"] = str(exc)[:200]
     for c, j in zip(info["cands"], judged):
-        j["rules"] = rules_of(c)
+        j["rules"] = j.get("rules") or rules_of(c)
+        for rid in ("R61", "R63", "R64"):
+            if rid in (c.get("rules") or []) and rid not in j["rules"]:
+                j["rules"] = list(j["rules"]) + [rid]
     if recall_cands and enabled("R60"):
         # 【R60】網羅候補：採用・要確認には入れず、「除外」の候補として足す（再現率の上限を上げ、あとで選ぶための材料）
         try:
@@ -15576,9 +16646,11 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
             base = [(c["source"], c["relation"], c["target"]) for c in info["cands"]]
             seen = {(nrm(a), b, nrm(t)) for a, b, t in base}
             # 広い候補（区間内の組・係り受けの組・題名の組など。比較用の選別モデルと同じ候補の集め方）
-            wide = build_rule_and_llm_candidates(ts, pp, text, llm_output="", pool="wide")
+            if wide is None:
+                wide = build_rule_and_llm_candidates(ts, pp, text, llm_output="", pool="wide")
             wide_c = [(c["source"], c["relation"], c["target"]) for c in normalize_candidates(wide["cands"], None)]
-            gen, _ = rc_generate(pp, text, base + wide_c, info.get("title"))
+            gen, _ = generate(pp, text, base + wide_c, info.get("title"),
+                                 globals().get("llm_select") or sys.modules[__name__])
             gen = set(gen) | set(wide_c)
             n_add = 0
             for a, b, t in sorted(gen):
@@ -15595,181 +16667,6 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
         except Exception as exc:  # noqa: BLE001  網羅候補が作れなくても本体の結果は返す
             info["recall_error"] = str(exc)[:200]
     return info, judged, raw
-
-
-# =====================================================================================================
-# 【R60】網羅候補（再現率を最大にするための候補づくり。採用の判定には使わず「除外」として候補にだけ入れる）
-#   構成要素の名前：名詞まとまり（新森ら）・その末尾・「XのY」の連鎖・連体修飾＋名詞・符号付き（「電極(1)」）
-#   関係：「有する」系の文型、「XのY」、述語（GiNZA）の前の格助詞付きの名前と、述語の直後の名前・主題、比較・「である」
-# =====================================================================================================
-_RC_NOUNISH_POS={"NOUN","PROPN","NUM","SYM"}
-_RC_POSW={"上","内","下","側","中","外","間"}
-def _rc_nounish(t):
-    return t.pos_ in _RC_NOUNISH_POS or t.tag_.startswith(("接尾辞","接頭辞","名詞")) or (t.text in ("ー","－","・","−") )
-def _rc_chunks(doc):
-    """名詞まとまり（新森ら）：名詞・数詞・記号・接頭辞・接尾辞の連続（「前記」「該」は外す）"""
-    out=[]; i=0; N=len(doc)
-    while i<N:
-        if _rc_nounish(doc[i]) and doc[i].text not in ("前記","該","\n"):
-            j=i
-            while j+1<N and _rc_nounish(doc[j+1]) and doc[j+1].text not in ("前記","該","\n"): j+=1
-            out.append((i,j)); i=j+1
-        else: i+=1
-    return out
-def _rc_txt(doc,i,j): return "".join(t.text for t in doc[i:j+1]).strip()
-def rc_node_candidates(doc):
-    ch=_rc_chunks(doc); names=set(); spans=[]
-    for (i,j) in ch:
-        base=_rc_txt(doc,i,j); names.add(base); spans.append((i,j,base))
-        # 後ろの部分（複合語の末尾）
-        for k in range(i+1,j+1):
-            s=_rc_txt(doc,k,j)
-            if len(s)>=2: names.add(s)
-        # 末尾の位置の語を外した形（チップ上→チップ）
-        if doc[j].text in _RC_POSW and j>i: names.add(_rc_txt(doc,i,j-1))
-    # 「XのY」の連鎖（2段まで）
-    idx={i:(i,j) for i,j in ch}; endat={j:(i,j) for i,j in ch}
-    for (i,j) in ch:
-        cur_i=i; name=_rc_txt(doc,i,j)
-        for depth in range(3):
-            k=cur_i-1
-            if k>=1 and doc[k].text=="の" and (k-1) in endat:
-                a,b=endat[k-1]
-                pre=_rc_txt(doc,a,b)
-                if pre in ("前記","該"): break
-                name=pre+"の"+name; names.add(name); cur_i=a
-                # 「前記」を挟む：「XのY」の Y が「前記」付きのとき
-            elif k>=2 and doc[k].text in ("前記","該") and doc[k-1].text=="の" and (k-2) in endat:
-                a,b=endat[k-2]; name=_rc_txt(doc,a,b)+"の"+name; names.add(name); cur_i=a
-            else: break
-    # 連体修飾（acl）＋名詞：「準備する工程」「パワーモジュールに流れる電流」
-    for t in doc:
-        if t.dep_=="acl" and t.head.i>t.i and _rc_nounish(t.head):
-            h=t.head
-            hi=next(((a,b) for a,b in ch if a<=h.i<=b),None)
-            if not hi: continue
-            full=_rc_txt(doc,t.left_edge.i,hi[1])
-            short=_rc_txt(doc,t.i,hi[1])
-            for s in (full,short):
-                s=re.sub(r"^(前記|該)","",s)
-                if 2<=len(s)<=40 and "、" not in s: names.add(s)
-    return {re.sub(r"^(前記|該)","",x) for x in names if len(x)>=1}
-
-
-_RC_HAS=re.compile(r"を(有する|有した|有している|有し|含む|含んだ|含み|含んでなる|備える|備えた|備え|具備する|具備した|具備し|含有する|含有し|含有した)")
-_RC_HASLAB={"有し":"有する","有した":"有する","有している":"有する","含み":"含む","含んだ":"含む","含んでなる":"含む","備え":"備える",
-        "備えた":"備える","具備し":"具備する","具備した":"具備する","含有し":"含有する","含有した":"含有する"}
-_RC_RELF=("有する","有した","有している","含む","含んだ","備える","備えた","具備する","具備した","含有する","含有した")
-_RC_CASES=r"(?:に|を|と|から|で|へ|より|との|が|は|によって|により|にて|として)"
-_RC_NONN={"一方","他方","双方","両方","複数","それぞれ","各々","互い","一対","こと","もの","場合","状態","前記","該"}
-_RC_LINK=r"(?:の|への|からの|との|における|内の|上の|間の|による)"
-def _rc_extra_nodes(flat, nodes):
-    out=set()
-    # 符号付き：「半導体層(11)」
-    for x in list(nodes):
-        for m in re.finditer(re.escape(x)+r"(\([0-9A-Za-z０-９Ａ-Ｚａ-ｚ]{1,6}\))", flat): out.add(x+m.group(1))
-    # 「AへのB」「AにおけるB」など（Aの前の「前記」は外す）
-    nl=sorted(nodes,key=len,reverse=True)
-    for m in re.finditer(_RC_LINK, flat):
-        a_txt=flat[max(0,m.start()-30):m.start()]; b_txt=flat[m.end():m.end()+30]
-        a=next((x for x in nl if a_txt.endswith(x)),None)
-        b_txt=re.sub(r"^(前記|該)","",b_txt)
-        b=next((x for x in nl if b_txt.startswith(x)),None)
-        if a and b and len(a)+len(b)+len(m.group(0))<=40: out.add(a+m.group(0)+b)
-    return out
-def _rc_after(flat, k):
-    a=flat[k:k+80]
-    a=re.sub(r"^[、，]","",a)
-    a=re.sub(r"^ことを特徴とす(?:る|る、)","",a)
-    a=re.sub(r"^(前記|該|複数の|一対の)+","",a)
-    return a
-def rc_generate(pp, text, base_cands, title):
-    _RC_SELF = globals().get("llm_select") or sys.modules[__name__]
-    clean=pp._clean_claim_text(text); flat=re.sub(r"\s","",clean)
-    doc=pp.nlp(clean)
-    nodes={x for x in rc_node_candidates(doc)}|{c[0] for c in base_cands}|{c[2] for c in base_cands}
-    nodes={x for x in nodes if x and x not in _RC_NONN and 1<=len(x)<=40 and x in flat}
-    nodes|=_rc_extra_nodes(flat,nodes)
-    nl=sorted(nodes,key=len,reverse=True)
-    out=set()
-    def add(s,r,t):
-        if s and t and s!=t: out.add((s,r,t))
-    # 1. 有する系
-    for t in nl:
-        for mt in re.finditer(re.escape(t)+_RC_SELF._R45_END, flat):
-            mv=_RC_HAS.search(flat, mt.end()-1)
-            if not mv: continue
-            mid=flat[mt.end()-1:mv.start()]
-            if _RC_SELF._R45_TOPIC.search(mid) or "。" in mid: continue
-            lab=_RC_HASLAB.get(mv.group(1),mv.group(1))
-            aft=_rc_after(flat,mv.end())
-            owners=[x for x in nl if aft.startswith(x)][:3] if mv.group(1) in _RC_RELF else []
-            tops=list(_RC_SELF._R45_TOPIC.finditer(flat[:mt.start()]))
-            if tops: owners+=[x for x in _RC_SELF.topic_names(tops[-1].group(1)) if x in nodes]
-            if title and (not tops or not owners): owners.append(title)
-            for o in owners: add(o,lab,t)
-    # 2. 「XのY」
-    for y in nl:
-        m=re.match(r"^(.+?)"+_RC_LINK+r"(.+)$",y)
-        if m and m.group(1) in nodes:
-            add(m.group(1),"の",y); add(m.group(1),"有する",m.group(2))
-    # 3. 動詞（GiNZA の述語）のまわり
-    offs=[]; pos=0
-    for tok in doc:
-        k=flat.find(tok.text.strip(),pos) if tok.text.strip() else -1
-        offs.append(k if k>=0 else pos)
-        if k>=0: pos=k+len(tok.text.strip())
-    for tok in doc:
-        is_pred = tok.pos_ in ("VERB","ADJ") or (tok.pos_=="NOUN" and any(c.lemma_ in ("する","できる") and c.dep_ in ("aux","cop") for c in tok.children))
-        if not is_pred: continue
-        vs=offs[tok.i]; 
-        tail="".join(c.text for c in tok.children if c.dep_ in ("aux","mark","fixed") and c.i>tok.i)
-        ve=vs+len(tok.text)+len(tail)
-        labs={tok.lemma_, tok.text+tail}
-        if tok.pos_=="NOUN": labs|={tok.text+"する", tok.text+"される"}
-        # 副詞的な前置き（「電気的に」「熱的に」）も関係名に
-        pre=flat[max(0,vs-6):vs]
-        mpre=re.search(r"([一-龥]{1,3}的に)$",pre)
-        if mpre: labs.add(mpre.group(1)+tok.lemma_)
-        labs={l for l in labs if l and len(l)<=20}
-        win=flat[max(0,vs-80):vs]; off=max(0,vs-80)
-        args=[]
-        for x in nl:
-            for m in re.finditer(re.escape(x)+_RC_CASES, win):
-                if "。" in win[m.end():]: continue
-                args.append((off+m.start(),x))
-        args=[x for _,x in sorted(args)][-8:]
-        aft=_rc_after(flat,ve)
-        heads=[]
-        for x in nl:
-            if aft.startswith(x): heads.append(x); break
-        if not heads:
-            m2=re.match(r"^[^、。]{0,25}?",aft)
-            seg=aft[:30]
-            for x in nl:
-                k=seg.find(x)
-                if 0<=k<=25 and "、" not in seg[:k]: heads.append(x); break
-        tops=list(_RC_SELF._R45_TOPIC.finditer(flat[:vs]))
-        tn=[x for x in _RC_SELF.topic_names(tops[-1].group(1)) if x in nodes] if tops else []
-        subj=list(dict.fromkeys(heads+tn))
-        for l in labs:
-            for s in subj:
-                for a in args:
-                    add(s,l,a); add(a,l,s)
-            for i in range(len(args)):
-                for j in range(i+1,len(args)):
-                    a,b=args[i],args[j]
-                    if not (a in b or b in a): add(a,l,b); add(b,l,a)
-    # 4. 比較・「である」
-    for m in re.finditer(r"([^、。をにがはでと]{1,30}?)(?:は|が)[、，]?([^、。をにがはでと]{1,40}?)(以上|以下|未満|を超える|超|より大きい|より小さい|と異なる|と等しい|である|となる)", flat):
-        a=re.sub("^"+_RC_SELF._R45_LEAD,"",m.group(1)); b=re.sub("^"+_RC_SELF._R45_LEAD,"",m.group(2))
-        xa=next((x for x in nl if a.endswith(x)),None); yb=next((y for y in nl if b.endswith(y) or b==y),None)
-        if xa and yb:
-            lab=m.group(3); add(xa, lab if lab in ("である","となる") else lab+"である", yb); add(xa,lab,yb)
-    # 5. 組があれば「有する」の向きも（両向き）
-    for s,r,t in list(out):
-        add(s,"有する",t)
-    return out, nodes
 
 
 # ===========================================================================
@@ -16175,6 +17072,134 @@ def similarity_explain(rel_a, rel_b):
 
 
 # ---------------------------------------------------------------------------
+# 請求項（SAO）が無い特許でも使える「語の出どころ」（可視化・分析の6画面で共通）
+#   SAO構成要素：請求項を解析したSAOの部品名（基本語）
+#   発明の名称の語：発明の名称から取り出した語（請求項が無くても使える）
+#   FI：FIメイングループ（例 H01L23/00）
+# ---------------------------------------------------------------------------
+TERM_SOURCES = ["SAO構成要素", "発明の名称の語", "FI"]
+_TITLE_SPLIT_RE = re.compile(r"(?:及び|および|並びに|ならびに|又は|または|もしくは|若しくは|その|これを用いた|を用いた|を有する|"
+                             r"を備えた|を備える|に用いる|に用いられる|のための|ための|における|による|用の|用|の|と|、|，|・|\s|（|）|\(|\))")
+_TITLE_TOKEN_RE = re.compile(r"[一-龥々〆ヵヶァ-ヴーA-Za-zＡ-Ｚａ-ｚ0-9０-９\-－]+")
+TITLE_STOP = {"装置", "方法", "製造方法", "システム", "もの", "こと", "及び", "その", "用途", "方法及び", "製法"}
+
+
+def title_terms(title):
+    """発明の名称の語：「半導体装置及びその製造方法」→ {半導体装置}、「電力変換装置用冷却器」→ {電力変換装置, 冷却器}"""
+    out = set()
+    for piece in _TITLE_SPLIT_RE.split(str(title or "")):
+        for t in _TITLE_TOKEN_RE.findall(piece):
+            t = t.strip("-－")
+            if len(t) >= 2 and t not in TITLE_STOP and not re.fullmatch(r"[0-9０-９]+", t):
+                out.add(t)
+    return out
+
+
+def has_sao(patent, reviews=None):
+    return bool(effective_relations(patent, reviews))
+
+
+def sao_share(corpus, reviews=None):
+    """SAO（請求項の解析結果）がある特許の割合。"""
+    ps = corpus["patents"]
+    return sum(1 for p in ps if has_sao(p, reviews)) / max(1, len(ps))
+
+
+def default_source(corpus, reviews=None):
+    """SAO がある特許が半分以上なら SAO構成要素、そうでなければ発明の名称の語。"""
+    return "SAO構成要素" if sao_share(corpus, reviews) >= 0.5 else "発明の名称の語"
+
+
+def patent_terms(patent, source="SAO構成要素", reviews=None, drop_title=True):
+    """特許1件の語の集合（source ごと）。"""
+    if source == "発明の名称の語":
+        return title_terms(patent.get("title", ""))
+    if source == "FI":
+        return set(patent.get("fi_main") or [])
+    out = {base_term(x) for r in effective_relations(patent, reviews) for x in (r["source"], r["target"])}
+    if drop_title and patent.get("title"):
+        out.discard(base_term(patent["title"]))
+    return {t for t in out if t and len(t) >= 2}
+
+
+def build_cooccurrence_network(corpus, patent_ids=None, source="発明の名称の語", reviews=None, min_patents=2, top_n=60):
+    """語の共起ネットワーク（請求項が無くても使える）。ノード＝語（重み＝その語が出てくる特許の件数）、
+    線＝同じ特許に一緒に出てくる語の組（重み＝その組が一緒に出てくる特許の件数）。"""
+    ids = set(patent_ids) if patent_ids else None
+    node_p = defaultdict(set)
+    per = {}
+    for p in corpus["patents"]:
+        if ids is not None and p["id"] not in ids:
+            continue
+        ts = patent_terms(p, source, reviews)
+        per[p["id"]] = ts
+        for t in ts:
+            node_p[t].add(p["id"])
+    keep = [n for n, ps in node_p.items() if len(ps) >= min_patents]
+    keep = set(sorted(keep, key=lambda n: -len(node_p[n]))[:top_n])
+    edge_p = defaultdict(set)
+    for pid, ts in per.items():
+        ks = sorted(t for t in ts if t in keep)
+        for i in range(len(ks)):
+            for j in range(i + 1, len(ks)):
+                edge_p[(ks[i], ks[j])].add(pid)
+    nodes = [{"id": n, "patents": sorted(node_p[n]), "count": len(node_p[n]), "surfaces": [n]} for n in keep]
+    edges = [{"source": a, "target": b, "count": len(ps), "relation": "共起", "patents": sorted(ps)}
+             for (a, b), ps in edge_p.items()]
+    return nodes, edges
+
+
+def patents_with_term(corpus, term, source="発明の名称の語", reviews=None):
+    return [p for p in corpus["patents"] if term in patent_terms(p, source, reviews)]
+
+
+def basic_features(corpus):
+    """発明の名称（文字の2〜3字）＋FI の TF-IDF（請求項が無くても使える特徴）。Patent World と同じ特徴。"""
+    from scipy.sparse import hstack
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    ps = corpus["patents"]
+    titles = [p.get("title") or (p.get("text") or "")[:60] or p["id"] for p in ps]
+    X1 = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), sublinear_tf=True).fit_transform(titles)
+    parts = [X1]
+    fis = [fi_parts(p.get("fi", ""))[0] + fi_parts(p.get("fi", ""))[1] + fi_parts(p.get("fi", ""))[2] for p in ps]
+    if any(fis):
+        parts.append(TfidfVectorizer(analyzer=lambda x: x or ["FIなし"], sublinear_tf=True).fit_transform(fis) * 1.5)
+    return hstack(parts).tocsr()
+
+
+def similarity_matrix_basic(corpus):
+    """発明の名称＋FI の近さ（コサイン類似度）。"""
+    from sklearn.preprocessing import normalize
+
+    X = normalize(basic_features(corpus))
+    S = (X @ X.T).toarray()
+    np.fill_diagonal(S, 0.0)
+    return S
+
+
+def basic_explain(pa, pb):
+    """2件の共通点（発明の名称の語・FI）。"""
+    return {"共通の名称の語": sorted(title_terms(pa.get("title")) & title_terms(pb.get("title"))),
+            "共通のFI（メイングループ）": sorted(set(pa.get("fi_main") or []) & set(pb.get("fi_main") or [])),
+            "共通のFI（サブクラス）": sorted(set(pa.get("fi_sub") or []) & set(pb.get("fi_sub") or []))}
+
+
+def layout_map_basic(corpus):
+    """類似性マップ（発明の名称＋FI の近さで2次元に配置）の座標。"""
+    ps = corpus["patents"]
+    if len(ps) < 2:
+        for p in ps:
+            p["map2_x"], p["map2_y"] = 0.0, 0.0
+        return corpus
+    Y, _, method = _embed(basic_features(corpus), 2)
+    for p, (a, b) in zip(ps, Y):
+        p["map2_x"], p["map2_y"] = round(float(a), 4), round(float(b), 4)
+    corpus["map2_method"] = method
+    return corpus
+
+
+# ---------------------------------------------------------------------------
 # 集計（ダッシュボード・バブル・ヒートマップ）
 # ---------------------------------------------------------------------------
 
@@ -16218,6 +17243,8 @@ def company_tech_matrix(corpus, axis="FIサブクラス", reviews=None, top_tech
             techs = p.get("fi_sub") or []
         elif axis == "FIメイングループ":
             techs = p.get("fi_main") or []
+        elif axis == "発明の名称の語":
+            techs = sorted(title_terms(p.get("title")))
         else:
             techs = sorted({base_term(x) for r in effective_relations(p, reviews)
                             for x in (r["source"], r["target"])})
@@ -16249,7 +17276,8 @@ def export_excel(corpus, reviews=None, sim=None, top_k=5):
              {"項目": "抽出手法", "値": corpus["meta"].get("method", "")}]).to_excel(xw, sheet_name="概要", index=False)
         pd.DataFrame([{
             "特許番号": p["id"], "発明の名称": p["title"], "出願人": p["applicant"], "企業": p["company"],
-            "出願年": p["year"], "FI": p["fi"], "人手確認": p["id"] in (reviews or {}), "URL": p.get("url", ""),
+            "出願年": p["year"], "FI": p["fi"], "解析した文": text_label(p), "人手確認": p["id"] in (reviews or {}),
+            "URL": p.get("url", ""),
         } for p in corpus["patents"]]).to_excel(xw, sheet_name="特許一覧", index=False)
         pd.DataFrame([{
             "特許番号": p["id"], "主語(S)": r["source"], "関係(A)": r["relation"], "目的語(O)": r["target"],
@@ -16288,7 +17316,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-26c"
+PIPELINE_VERSION = "2026-09-27a"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -16297,7 +17325,8 @@ DEFAULT_BANDS = {
 }
 METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
 METHOD_SCORE = ("学習データを使わない最終方式。LLMの呼び出しは1件あたり1回（構成要素の書き出し）。"
-                "参考（532件・LLMなし）：規則だけで トリプル完全一致 F1 49.6%（適合率 57.2%・再現率 43.8%。規則を作るのに使っていない test の半分では 49.1%）（つなぎの規則 R40〜R50 を入れる前は 42.9%）。"
+                "参考（LLMなし・規則だけ）：トリプル完全一致 F1 は、規則を作るのに使った dev の半分で 52.5%（適合率 64.5%・再現率 44.2%）、"
+                "規則づくりに使っていない test の半分で 51.2%。意味が伝われば正解とする意味一致では dev 56.0%・test 54.9%。"
                 "精度はローカルのOllamaで評価コマンドを実行して測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
@@ -16315,8 +17344,38 @@ COLUMN_ALIASES = {
     "date": ["出願日", "出願年月日", "application_date", "filing_date", "date"],
     "url": ["文献URL", "URL", "url"],
     "claim": ["請求項", "請求項1", "請求項１", "請求の範囲", "特許請求の範囲", "請求項本文", "クレーム", "claim",
-              "claims", "text", "本文"],
+              "claims"],
+    "abstract": ["要約", "要約書", "要約文", "抄録", "要約（抄録）", "要約(抄録)", "abstract", "summary"],
+    "alt": ["解決手段", "課題を解決するための手段", "発明の詳細な説明", "詳細な説明", "発明の概要", "実施形態", "明細書",
+            "本文", "text", "description", "課題"],
 }
+
+# 解析に使う文の優先順（行ごとに、空でない最初の列を使う）
+TEXT_KEYS = [("claim", "請求項"), ("abstract", "要約"), ("alt", "代替")]
+
+
+def text_label(patent):
+    """その特許で解析に使った文の種類（請求項／要約／代替（列名））。文が無ければ「なし」。"""
+    if not (patent.get("text") or "").strip():
+        return "なし"
+    return patent.get("text_source") or "請求項"
+
+
+_ABS_NUM_RE = re.compile(r"(?<=[一-龥々ァ-ヴーA-Za-zＡ-Ｚａ-ｚ])(?<!第)[0-9０-９]+[a-zａ-ｚ]?(?:[,，・][0-9０-９]+[a-zａ-ｚ]?)*"
+                         r"(?=[、。をがはにでとのへや・）)\s上下内外側面間及並又若]|$)")
+
+
+def clean_abstract(text):
+    """要約・明細書の文を解析しやすくする。【解決手段】があればそこだけを使い、【選択図】以降・【…】の見出し・
+    符号（「半導体装置１は」の「１」、「（10）」など）を除く。「第１」の番号や「150℃」のような数値は残す。"""
+    t = str(text or "")
+    if "【解決手段】" in t:
+        t = t.split("【解決手段】", 1)[1]
+    t = re.split(r"【選択図】|【選択図面】|【代表図】", t)[0]
+    t = re.sub(r"【[^】]*】", "", t)
+    t = re.sub(r"[（(][0-9０-９a-zA-Zａ-ｚ,，、\s]+[）)]", "", t)
+    t = _ABS_NUM_RE.sub("", t)
+    return re.sub(r"[ \t　]+", " ", t).strip()
 
 
 def _norm_col(c):
@@ -16330,9 +17389,24 @@ def detect_columns(df):
     for key, aliases in COLUMN_ALIASES.items():
         out[key] = None
         for a in aliases:
-            if _norm_col(a) in norm:
+            if _norm_col(a) in norm and norm[_norm_col(a)] not in out.values():
                 out[key] = norm[_norm_col(a)]
                 break
+    if out.get("alt") is None:
+        # 代替の列：名前で見つからなければ、ほかに使っていない列のうち、平均の文字数が一番長い文の列（40字以上）
+        used = {v for v in out.values() if v is not None}
+        best, best_len = None, 40.0
+        for c in df.columns:
+            if c in used:
+                continue
+            try:
+                vals = df[c].dropna().astype(str)
+                ln = float(vals.str.len().mean()) if len(vals) else 0.0
+            except Exception:  # noqa: BLE001
+                continue
+            if ln > best_len:
+                best, best_len = c, ln
+        out["alt"] = best
     return out
 
 
@@ -16386,25 +17460,35 @@ def fi_parts(fi):
     return list(dict.fromkeys(subs)), list(dict.fromkeys(mains)), list(dict.fromkeys(full))
 
 
-def make_patent(pid, text, title="", applicant="", fi="", date="", url=""):
+def make_patent(pid, text, title="", applicant="", fi="", date="", url="", text_source="請求項"):
     subs, mains, _ = fi_parts(fi)
+    body = first_claim(text) if text_source == "請求項" else clean_abstract(text)
     ym = re.search(r"(19|20)\d{2}", str(date or ""))
     return {"id": str(pid), "title": str(title or ""), "applicant": str(applicant or ""),
             "company": company_name(applicant) if applicant else "不明", "fi": str(fi or ""),
             "fi_sub": subs, "fi_main": mains, "year": int(ym.group(0)) if ym else None,
-            "filing_date": str(date or ""), "url": str(url or ""), "text": first_claim(text),
+            "filing_date": str(date or ""), "url": str(url or ""), "text": body,
+            "text_source": text_source if body else "",
             "relations": [], "n_rejected": 0, "analyzed": False}
 
 
 def patents_from_table(df, cols, limit=None):
     """表（DataFrame）と列の対応から、解析前の特許レコードのリストを作る。
-    請求項の列が無い・空の行も読み込む（J-PlatPat の CSV には請求項が入っていないため）。
-    その特許は text が空のままで、あとから請求項を追加して解析する。"""
+    解析に使う文は、行ごとに「請求項 → 要約 → 代替の列」の順で、空でない最初の列を使う（TEXT_KEYS）。
+    どれも空の行も書誌情報だけで読み込む（J-PlatPat の CSV には請求項が入っていないため）。
+    その特許は text が空のままで、あとから請求項を追加して解析する（可視化は発明の名称の語・FI で行う）。"""
     out, seen = [], set()
     for i, row in df.iterrows():
-        text = row.get(cols["claim"]) if cols.get("claim") else None
-        if text is None or (isinstance(text, float) and math.isnan(text)):
-            text = ""
+        text, source = "", ""
+        for key, label in TEXT_KEYS:
+            col = cols.get(key)
+            if not col:
+                continue
+            v = row.get(col)
+            if v is None or (isinstance(v, float) and math.isnan(v)) or not str(v).strip():
+                continue
+            text, source = str(v), (label if key != "alt" else f"代替（{col}）")
+            break
         if not str(text).strip() and not any(cols.get(k) for k in ("id", "title")):
             continue
 
@@ -16418,7 +17502,8 @@ def patents_from_table(df, cols, limit=None):
             pid = "%s_%d" % (base, k)
             k += 1
         seen.add(pid)
-        out.append(make_patent(pid, text, g("title"), g("applicant"), g("fi") or g("ipc"), g("date"), g("url")))
+        out.append(make_patent(pid, text, g("title"), g("applicant"), g("fi") or g("ipc"), g("date"), g("url"),
+                               text_source=source or "請求項"))
         if limit and len(out) >= limit:
             break
     return out
@@ -16432,14 +17517,14 @@ def norm_pid(x):
     return re.sub(r"[‐‑‒–—―−ー－]", "-", t)
 
 
-def claims_from_table(df, id_col, claim_col):
-    """「文献番号」と「請求項」の列を持つ表から {正規化した文献番号: 請求項1} を作る。"""
+def claims_from_table(df, id_col, claim_col, source="請求項"):
+    """「文献番号」と「請求項」（または要約など）の列を持つ表から {正規化した文献番号: 解析に使う文} を作る。"""
     out = {}
     for _, row in df.iterrows():
         pid, text = row.get(id_col), row.get(claim_col)
         if pid is None or text is None or (isinstance(text, float) and math.isnan(text)):
             continue
-        t = first_claim(text)
+        t = first_claim(text) if source == "請求項" else clean_abstract(text)
         if t:
             out[norm_pid(pid)] = t
     return out
@@ -16562,6 +17647,7 @@ def finalize_dataset(corpus):
     assign_groups(corpus)
     layout_world(corpus)
     layout_map(corpus)
+    layout_map_basic(corpus)
     corpus["meta"]["n"] = len(corpus["patents"])
     return corpus
 
@@ -16758,7 +17844,7 @@ def fi_codes(patent, level=0):
     return fi_parts(patent.get("fi", ""))[level]
 
 
-def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, top_fi=8, share=True):
+def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, top_fi=8, share=True, source="FI", reviews=None):
     """FIを軸にしたレーダーチャート用のデータ。
     by: "出願人"（会社ごと）または "出願年"（年ごと）。値は、そのグループの特許のうち
     そのFIを持つものの割合（share=True、%）または件数。
@@ -16771,13 +17857,17 @@ def fi_radar_data(corpus, by="出願人", level=0, groups=None, top_groups=4, to
         cnt = Counter(key(p) for p in ps)
         groups = [g for g, _ in cnt.most_common() if g not in ("不明", "年不明")][:top_groups]
     sel = [p for p in ps if key(p) in groups]
-    fi_cnt = Counter(c for p in sel for c in set(fi_codes(p, level)))
+
+    def codes(p):
+        return set(fi_codes(p, level)) if source == "FI" else patent_terms(p, source, reviews)
+
+    fi_cnt = Counter(c for p in sel for c in codes(p))
     axes = [c for c, _ in fi_cnt.most_common(top_fi)]
     out, sizes = {}, {}
     for g in groups:
         gp = [p for p in sel if key(p) == g]
         sizes[g] = len(gp)
-        vals = [sum(1 for p in gp if a in fi_codes(p, level)) for a in axes]
+        vals = [sum(1 for p in gp if a in codes(p)) for a in axes]
         out[g] = [round(100 * v / len(gp), 1) if (share and gp) else v for v in vals]
     return axes, out, sizes
 
@@ -16856,6 +17946,9 @@ def wordcloud_terms(corpus, target="構成要素", patent_ids=None, reviews=None
     戻り値: [(語, 選んだ特許での件数, 全体での件数, 特化係数)]
     特化係数＝（選んだ特許のうちその語を含む割合）÷（データ全体での割合）。1が平均、2なら全体の2倍よく出る。"""
     def terms(p):
+        if target in ("発明の名称の語", "FI"):
+            out = patent_terms(p, target, reviews)
+            return {t for t in out if t and len(t) >= 2 and not _WC_NUMERIC_RE.match(t)}
         rels = effective_relations(p, reviews)
         if target == "関係":
             out = {clean_relation(r["relation"]) for r in rels}
@@ -17066,6 +18159,21 @@ def _load_llm_cache(cache_path):
         return {}
 
 
+def _cand_recall_hits(pp, cands, gold):
+    """候補の再現率の分子：正解のうち、同じ主語・目的語（表記正規化後）で関係が rel_match する候補があるものの数
+    （完全一致の評価と同じ決まり。候補は数千件あるので、主語・目的語の組で引けるようにして数える）。"""
+    n = pp._normalize_node_text_lenient
+    idx = {}
+    for c in cands:
+        idx.setdefault((n(c["source"]), n(c["target"])), set()).add(c["relation"])
+    hits = 0
+    for g in gold:
+        rels = idx.get((n(g["source"]), n(g["target"])))
+        if rels and (g["relation"] in rels or any(rel_match(pp, r, g["relation"]) for r in rels)):
+            hits += 1
+    return hits
+
+
 def split_of(claim_id):
     """評価の手順：文献番号の SHA-1 の偶奇で、532件を dev（260件）と test（272件）に固定で分ける。
     dev＝誤りを見て規則を作ってよい半分、test＝数字を測るだけで、誤りの中身は見ない半分。"""
@@ -17082,9 +18190,10 @@ def _record_rules_history(args, agg, tot, n):
            "ginza_model": globals().get("GINZA_MODEL_NAME") or os.environ.get("SAO_GINZA_MODEL", "").strip() or "ja_ginza",
            "n": n, "exact_p": agg["micro"]["precision"], "exact_r": agg["micro"]["recall"],
            "exact_f1": agg["micro"]["f1"], "struct_p": P, "struct_r": R, "struct_f1": F, "note": args.note,
-           "split": getattr(args, "split", "all"),
+           "split": getattr(args, "split", "all"), "accept_min_votes": getattr(args, "accept_min_votes", None),
            "cand_recall": (sum(m.get("候補の正解数", 0) for m in globals().get("_LAST_PER_CLAIM", []))
                            / max(1, sum(m.get("正解データ数", 0) for m in globals().get("_LAST_PER_CLAIM", [])))),
+           "meaning_f1": (globals().get("_LAST_MEANING") or (None, None, None))[2],
            "rules": [r["id"] for r in rulebook.RULES if rulebook.enabled(r["id"])]}
     path = _pathlib.Path(args.data_dir) / "rules_history.json"
     hist = []
@@ -17099,7 +18208,9 @@ def _record_rules_history(args, agg, tot, n):
     print("\n=== 規則の確認 ===")
     print(f"今回（GiNZAのモデル {rec['ginza_model']}）: 完全一致 F1 {100 * rec['exact_f1']:.1f}%"
           f"（P {100 * rec['exact_p']:.1f}／R {100 * rec['exact_r']:.1f}）"
-          f"　構造 F1 {100 * F:.1f}%　止めた規則: {'・'.join(rec['disabled']) or 'なし'}")
+          f"　構造 F1 {100 * F:.1f}%"
+          + (f"　意味一致 F1 {100 * rec['meaning_f1']:.1f}%" if rec.get("meaning_f1") is not None else "")
+          + f"　止めた規則: {'・'.join(rec['disabled']) or 'なし'}")
     if other and not rec["disabled"]:
         o = other[-1]
         print(f"別のGiNZAのモデル（{o.get('ginza_model', 'ja_ginza')}、{o['time']}）との差: "
@@ -17296,10 +18407,11 @@ def main_eval():
                              "アプリの「正解データとして書き出す」で作った他分野の請求項を指定できる")
     parser.add_argument("--gold-file", default=None,
                         help="正解SAOのJSON（既定: data-dir の gold_sao_532_merged.json）")
-    parser.add_argument("--method", default="a2", choices=["a2", "rules", "model", "llm-select"],
+    parser.add_argument("--method", default="a2", choices=["a2", "rules", "model", "llm-select", "fewshot"],
                         help="a2（既定・最終方式）: 構成要素をLLMで固定したGiNZAの規則／rules: 規則の確認用（最終方式からLLMを"
                              "除いたもの。LLM不要。結果を rules_history.json に記録）／model: 学習済み選別モデル（実験14・比較用）／"
-                             "llm-select: 学習なしの試作（GiNZAの規則＋LLMの抽出→LLMによる追加）")
+                             "llm-select: 学習なしの試作（GiNZAの規則＋LLMの抽出→LLMによる追加）／"
+                             "fewshot: 手本つきのローカルLLMによる直接抽出（実験F1。規則だけの結果と同じ請求項で比べる）")
     parser.add_argument("--pool", default="wide", choices=["standard", "wide"],
                         help="--method llm-select の候補の範囲。standard: GiNZAの規則＋LLM／wide（既定）: Recall重視で、"
                              "係り受け・区間の主役・題名・同一ノードの結合の規則の候補も加える")
@@ -17312,6 +18424,16 @@ def main_eval():
     parser.add_argument("--split", default="all", choices=["all", "dev", "test"],
                         help="評価に使う半分（dev＝規則を作るときに誤りを見てよい半分／test＝数字を測るだけで誤りは見ない半分）。"
                              "文献番号のハッシュで固定に分ける（評価の手順.md）")
+    parser.add_argument("--accept-min-votes", type=int, default=None,
+                        help="自動採用に必要な裏付けの数（R61）。省略時は 2（F1 が最も高い）。5 にすると自動採用の適合率 約75%")
+    parser.add_argument("--llm-verify", action="store_true",
+                        help="要確認の候補を LLM（Ollama）に はい／いいえ で確かめさせ、「はい」を採用にする（R63・実験）")
+    parser.add_argument("--fewshot", action="store_true",
+                        help="手本つきのローカルLLMにも SAO を書き出させ、規則の要確認と同じ関係なら採用にする（R64・実験）")
+    parser.add_argument("--fewshot-cache", default="fewshot_cache.json",
+                        help="--fewshot の LLM の答えを保存・再利用するファイル")
+    parser.add_argument("--recall", action="store_true",
+                        help="網羅候補（R60）も作り、候補の再現率（正解が候補のどこかに入る割合）を測る（時間がかかる）")
     parser.add_argument("--note", default="", help="--method rules の結果に残すメモ（例：R37を追加）")
     parser.add_argument("--components", default="ginza", choices=["ginza", "llm"],
                         help="--method llm-select の土台。ginza: 通常のGiNZAの規則／llm: 構成要素をLLMで先に取り出し、"
@@ -17499,6 +18621,10 @@ def main_eval():
         claims = [c for c in claims if split_of(c["id"]) == args.split]
         print(f"評価の半分「{args.split}」に絞り込み: {len(claims)}件（評価の手順.md）")
 
+    if args.method == "fewshot" or args.fewshot:
+        pass  # （統合済み）import llm_fewshot
+        claims = [c for c in claims if c["id"] not in FEWSHOT_IDS]
+        print(f"手本に使った {len(llm_fewshot.FEWSHOT_IDS)} 件は評価から外します")
     if args.sample:
         # 先頭からではなく、全体から等間隔に選ぶ（会社・年・分野が偏らないように。毎回同じ請求項になる）
         step = len(claims) / args.sample
@@ -17559,10 +18685,22 @@ def main_eval():
     rulebook.set_disabled(args.disable.split(","))
     if rulebook.DISABLED:
         print(f"止めた規則: {'、'.join(sorted(rulebook.DISABLED))}")
+    fewshot_cache = (_load_llm_cache(args.fewshot_cache) or {}) if args.fewshot else None
+    if args.fewshot:
+        print(f"手本つきのローカルLLM（{args.model}）と規則が一致した要確認を採用にします（R64）。LLMの答えの保存先: {args.fewshot_cache}")
     if args.method == "rules":
         pass  # （統合済み）import llm_select
         fold_of = {}
         print("規則の確認（最終方式からLLMを除いたもの。GiNZAの規則＋分野に依存しない規則）で評価します。")
+        select_cache = (_load_llm_cache(args.select_cache) or {}) if args.llm_verify else None
+        if args.llm_verify:
+            print(f"要確認の候補を LLM（{args.model}）に確かめさせます（R63）。LLMの答えの保存先: {args.select_cache}")
+    if args.method == "fewshot":
+        pass  # （統合済み）import llm_select
+        pass  # （統合済み）import llm_fewshot
+        fold_of = {}
+        select_cache = _load_llm_cache(args.select_cache) or {}
+        print(f"手本つきのローカルLLM（{args.model}）で直接抽出し、規則だけの結果と比べます。LLMの答えの保存先: {args.select_cache}")
     if args.method == "a2":
         pass  # （統合済み）import llm_select
         fold_of = {}
@@ -17599,12 +18737,47 @@ def main_eval():
         try:
             extra = {}
             if args.method == "rules":
-                info, judged, _raw = analyze_claim_a2(ts, pp, c["text"], use_llm=False)
+                info, judged, _raw = analyze_claim_a2(ts, pp, c["text"], use_llm=False,
+                                                                 recall_cands=args.recall,
+                                                                 accept_min_votes=args.accept_min_votes,
+                                                                 verify=args.llm_verify, cache=select_cache,
+                                                                 model=args.model, host=args.host,
+                                                                 fewshot=args.fewshot, fewshot_cache=fewshot_cache)
+                if args.fewshot:
+                    _save_llm_cache(args.fewshot_cache, fewshot_cache)
+                    if info.get("fewshot_error"):
+                        print(f"  注意: {cid} の手本つきLLMに失敗: {info['fewshot_error'][:120]}")
+                if args.llm_verify:
+                    _save_llm_cache(args.select_cache, select_cache)
+                    if info.get("verify_error"):
+                        print(f"  注意: {cid} の LLM の確認に失敗: {info['verify_error'][:120]}")
                 predicted = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"],
                               "type": "rules"} for cc, j in zip(info["cands"], judged) if j["selected"]]
+            elif args.method == "fewshot":
+                fs_pred, _raw = extract(ts, c["text"], model=args.model, host=args.host, cache=select_cache)
+                _save_llm_cache(args.select_cache, select_cache)
+                info, judged, _r = analyze_claim_a2(ts, pp, c["text"], use_llm=False)
+                rules_pred = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"]}
+                              for cc, j in zip(info["cands"], judged) if j["selected"]]
+                _n = pp._normalize_node_text_lenient
+                both = [p for p in fs_pred if any(_n(p["source"]) == _n(q["source"]) and _n(p["target"]) == _n(q["target"])
+                                                  and rel_match(pp, p["relation"], q["relation"])
+                                                  for q in rules_pred)]
+                union = rules_pred + [p for p in fs_pred if p not in both]
+                predicted = [dict(p, type="fewshot") for p in fs_pred]
+                ls_variants = {"規則だけ（今の方式）": rules_pred, "手本つきLLM": fs_pred,
+                               "和（どちらかが出したもの）": union, "積（両方が出したもの）": both}
+                if not fs_pred:
+                    print(f"  注意: {cid} は LLM の出力から関係を読み取れませんでした: {str(_raw)[:120]}")
             elif args.method == "a2":
                 info, judged, _raw = analyze_claim_a2(ts, pp, c["text"], cache=select_cache,
-                                                                 model=args.model, host=args.host)
+                                                                 model=args.model, host=args.host,
+                                                                 recall_cands=args.recall,
+                                                                 accept_min_votes=args.accept_min_votes,
+                                                                 verify=args.llm_verify,
+                                                                 fewshot=args.fewshot, fewshot_cache=fewshot_cache)
+                if args.fewshot:
+                    _save_llm_cache(args.fewshot_cache, fewshot_cache)
                 ls_modes[info.get("mode")] = ls_modes.get(info.get("mode"), 0) + 1
                 if info.get("mode") != "llm":
                     print(f"  注意: {cid} は {str(_raw)[:120]}")
@@ -17671,15 +18844,56 @@ def main_eval():
                                       for lv in LOOSE_LEVELS}
             # 構造評価（ノードの同一視の規則を正解と抽出の両方にかけてから、部分一致で比べる）
             metrics["構造評価"] = structure_counts(pp, predicted, gold)
+            # 意味一致（意味が伝われば正解。規則 M1〜M5 と参考 M6。評価の手順.md の 4-4）
+            metrics["意味一致"] = {str(k): v for k, v in meaning_counts(pp, predicted, gold).items()}
             if args.method in ("rules", "a2"):
+                ar = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"]}
+                      for cc, j in zip(info["cands"], judged) if j["status"] in ("採用", "要確認")]
+                metrics["要確認込みの正解数"] = evaluate_triples_exact(pp, ar, gold)["正解数"]
+                _mp, _, _mg = meaning_align(pp, ar, gold)
+                metrics["要確認込みの意味一致"] = [len(_mp), len(_mg)]
+                metrics["要確認数"] = sum(1 for j in judged if j["status"] == "要確認")
+            if args.method in ("rules", "a2") and args.llm_verify:
+                vs = {"はい": [0, 0], "いいえ": [0, 0]}
+                gi = {}
+                for g in gold:
+                    gi.setdefault((pp._normalize_node_text_lenient(g["source"]), pp._normalize_node_text_lenient(g["target"])),
+                                  []).append(g["relation"])
+                for cc, j in zip(info["cands"], judged):
+                    v = j.get("llm_verdict")
+                    if v:
+                        k = (pp._normalize_node_text_lenient(cc["source"]), pp._normalize_node_text_lenient(cc["target"]))
+                        ok = any(rel_match(pp, cc["relation"], gr) for gr in gi.get(k, []))
+                        vs[v][0] += 1
+                        vs[v][1] += int(ok)
+                metrics["LLM確認"] = vs
+            if args.method in ("rules", "a2") and args.fewshot:
+                gi2 = {}
+                for g in gold:
+                    gi2.setdefault((pp._normalize_node_text_lenient(g["source"]), pp._normalize_node_text_lenient(g["target"])),
+                                   []).append(g["relation"])
+                fsd = {}
+                for cc, j in zip(info["cands"], judged):
+                    v = j.get("fewshot")
+                    if v is None:
+                        continue
+                    key = {"要確認": "要確認→採用", "除外": "除外→要確認", "なし": "LLMだけ→要確認", "採用": "採用のまま"}.get(v, v)
+                    k2 = (pp._normalize_node_text_lenient(cc["source"]), pp._normalize_node_text_lenient(cc["target"]))
+                    ok = any(rel_match(pp, cc["relation"], gr) for gr in gi2.get(k2, []))
+                    fsd.setdefault(key, [0, 0])
+                    fsd[key][0] += 1
+                    fsd[key][1] += int(ok)
+                metrics["手本つきLLM"] = fsd
+            if args.method in ("rules", "a2") and args.recall:
                 # 候補の再現率：採用・要確認・除外のどれかの候補に、正解が完全一致で入っている割合
-                allc = [{"source": cc["source"], "relation": cc["relation"], "target": cc["target"]}
-                        for cc in info["cands"]]
-                metrics["候補の正解数"] = evaluate_triples_exact(pp, allc, gold)["正解数"]
-                metrics["候補数"] = len(allc)
-            if args.method in ("llm-select", "a2") and ls_variants:
+                metrics["候補の正解数"] = _cand_recall_hits(pp, info["cands"], gold)
+                metrics["候補数"] = len(info["cands"])
+            if args.method in ("llm-select", "a2", "fewshot") and ls_variants:
+                def _mc(pv):
+                    _m = meaning_counts(pp, pv, gold)[max(MEANING_LEVELS)]
+                    return {"m_tp": _m["tp"], "m_pred": _m["n_pred"], "m_gold": _m["n_gold"]}
                 metrics["方式の比較"] = {
-                    name: dict(structure_counts(pp, pv, gold),
+                    name: dict(structure_counts(pp, pv, gold), **_mc(pv),
                                exact=evaluate_triples_exact(pp, pv, gold)["正解数"],
                                n_pred_raw=len(pv), n_gold_raw=len(gold))
                     for name, pv in ls_variants.items()}
@@ -17708,7 +18922,8 @@ def main_eval():
             keep_keys.append("構造評価")
         if "方式の比較" in metrics:
             keep_keys.append("方式の比較")
-        keep_keys += [k for k in ("候補の正解数", "候補数") if k in metrics]
+        keep_keys += [k for k in ("候補の正解数", "候補数", "要確認込みの正解数", "要確認数", "LLM確認",
+                                  "意味一致", "要確認込みの意味一致", "手本つきLLM") if k in metrics]
 
         # 【type×関係語ごとのTP/FP内訳】translate_sao.pyの各関係には、どの処理が
         # 作ったかを示す"type"（llm_direct / claim_title_ginza /
@@ -17825,6 +19040,42 @@ def main_eval():
             print(f"  要素別の一致率（正解のSAOのうち）: 主語 {tot['comp_s'] / g:.4f}／関係 {tot['comp_r'] / g:.4f}"
                   f"／目的語 {tot['comp_o'] / g:.4f}")
             globals()["_LAST_PER_CLAIM"] = per_claim
+            mm = [m["意味一致"] for m in per_claim if "意味一致" in m]
+            if mm:
+                top = str(max(MEANING_LEVELS))
+                print("⑥ 意味一致（意味が伝われば正解。規則は評価の手順.md の 4-4。規則を1つずつ足したときの F1）:")
+                for lv, name in MEANING_LEVELS.items():
+                    t = [sum(x[str(lv)][k] for x in mm) for k in ("tp", "n_pred", "n_gold")]
+                    P, R, F = prf_counts(*t)
+                    print(f"  {name}: precision={P:.4f} recall={R:.4f} f1={F:.4f}")
+                t = [sum(x[top][k] for x in mm) for k in ("tp", "n_pred", "n_gold")]
+                imp = sum(x[top].get("implied", 0) for x in mm)
+                P = (t[0] + imp) / t[1] if t[1] else 0.0
+                R = t[0] / t[2] if t[2] else 0.0
+                print(f"  参考 M6 正解から導ける「持つ・含む」も正しいとみなす: precision={P:.4f} recall={R:.4f} "
+                      f"f1={2 * P * R / (P + R) if P + R else 0.0:.4f}")
+                P, R, F = prf_counts(*t)
+                globals()["_LAST_MEANING"] = (P, R, F)
+                rm = [m["要確認込みの意味一致"] for m in per_claim if "要確認込みの意味一致" in m]
+                if rm:
+                    print(f"  採用＋要確認の再現率（意味一致）: {sum(a for a, b in rm) / max(1, sum(b for a, b in rm)):.4f}")
+            ff = [m["手本つきLLM"] for m in per_claim if "手本つきLLM" in m]
+            if ff:
+                for key in ("要確認→採用", "採用のまま", "除外→要確認", "LLMだけ→要確認"):
+                    nn = sum(v.get(key, [0, 0])[0] for v in ff)
+                    oo = sum(v.get(key, [0, 0])[1] for v in ff)
+                    print(f"⑦ 手本つきLLM（R64） {key}: {nn} 件、うち正解 {oo} 件（{100 * oo / max(1, nn):.1f}%）")
+            vv = [m["LLM確認"] for m in per_claim if "LLM確認" in m]
+            if vv:
+                for key in ("はい", "いいえ"):
+                    nn = sum(v[key][0] for v in vv)
+                    oo = sum(v[key][1] for v in vv)
+                    print(f"⑤ LLM が「{key}」と答えた要確認: {nn} 件、うち正解 {oo} 件（{100 * oo / max(1, nn):.1f}%）")
+            rr = [m for m in per_claim if "要確認込みの正解数" in m]
+            if rr:
+                ng2 = sum(m["正解データ数"] for m in rr) or 1
+                print(f"④ 採用＋要確認の再現率（人が要確認を見て拾う前提の再現率）: "
+                      f"{sum(m['要確認込みの正解数'] for m in rr) / ng2:.4f}（1件あたりの要確認 {sum(m['要確認数'] for m in rr) / len(rr):.1f} 件）")
             cr = [m for m in per_claim if "候補の正解数" in m]
             if cr:
                 ng = sum(m["正解データ数"] for m in cr) or 1
@@ -17835,15 +19086,17 @@ def main_eval():
         rows = [m for m in per_claim if "方式の比較" in m]
         if rows:
             print(f"\n=== 方式の比較（同じ {len(rows)} 件・同じ候補から。数字は％） ===")
-            print(f"{'方式':<34}{'抽出数/件':>8}{'完全一致 P':>10}{'R':>7}{'F1':>7}{'構造 P':>9}{'R':>7}{'F1':>7}")
+            print(f"{'方式':<34}{'抽出数/件':>8}{'完全一致 P':>10}{'R':>7}{'F1':>7}{'意味一致 P':>10}{'R':>7}{'F1':>7}")
             for name in rows[0]["方式の比較"]:
                 t = {k: sum(m["方式の比較"][name][k] for m in rows if name in m["方式の比較"])
                      for k in rows[0]["方式の比較"][name]}
                 eP, eR, eF = prf_counts(t["exact"], t["n_pred_raw"], t["n_gold_raw"])
-                sP, sR, sF = prf_counts(t["struct"], t["n_pred"], t["n_gold"])
+                sP, sR, sF = prf_counts(t.get("m_tp", 0), t.get("m_pred", 0), t.get("m_gold", 0))
                 print(f"{name:<34}{t['n_pred_raw'] / len(rows):>8.1f}{100 * eP:>10.1f}{100 * eR:>7.1f}{100 * eF:>7.1f}"
                       f"{100 * sP:>9.1f}{100 * sR:>7.1f}{100 * sF:>7.1f}")
-            if args.method == "llm-select":
+            if args.method == "fewshot":
+                print("（同じ請求項で、規則だけの結果と、手本つきLLMの結果を比べたもの。和・積は2つを合わせたもの）")
+            elif args.method == "llm-select":
                 print("（A・B・C は選別の前の各方式の出力そのもの。D は規則の結果に、LLM が候補から選んだ関係を追加し、"
                       "ルールで整理したもの）")
             else:
@@ -17876,7 +19129,7 @@ _THIS = sys.modules[__name__]
 rulebook = _types.SimpleNamespace(DISABLED=DISABLED, EFFECTS=EFFECTS, RULES=RULES, SRC_RULE=SRC_RULE, STAGES=STAGES, _BY_ID=_BY_ID, describe=describe, drop=drop, enabled=enabled, mark=mark, name=name, rules_of=rules_of, set_disabled=set_disabled)
 en_relation_rules = _types.SimpleNamespace(ACOMP_LABELS=ACOMP_LABELS, ACTIVE_PREP_VERBS=ACTIVE_PREP_VERBS, ACTIVE_VERB_LABELS=ACTIVE_VERB_LABELS, CAPABLE_OF_GERUND_LABELS=CAPABLE_OF_GERUND_LABELS, CONFIGURE_XCOMP_LABELS=CONFIGURE_XCOMP_LABELS, CONSIST_OF_VERBS=CONSIST_OF_VERBS, HAS_VERBS=HAS_VERBS, PASSIVE_ADVMOD_OVERRIDES=PASSIVE_ADVMOD_OVERRIDES, PASSIVE_VERB_LABELS=PASSIVE_VERB_LABELS, PREP_NOUN_PATTERNS=PREP_NOUN_PATTERNS, REVERSED_PASSIVE_VERB_LABELS=REVERSED_PASSIVE_VERB_LABELS, SURFACE_WORDS=SURFACE_WORDS, TAG_RE=TAG_RE, _LazyNLP=_LazyNLP, _load_nlp=_load_nlp, _nlp_instance=_nlp_instance, _scan_passive_targets=_scan_passive_targets, _verb_key=_verb_key, conj_chain=conj_chain, dedup=dedup, extract_relations=extract_relations, extract_relations_from_text=extract_relations_from_text, is_tag=is_tag, nlp=nlp_en)
 translate_sao = _THIS  # 関数の差し替え（_ollama_chat など）がそのまま効くよう、このファイル自身
-node_match_eval = _types.SimpleNamespace(IDENTITY_TAILS=IDENTITY_TAILS, LOOSE_LEVELS=LOOSE_LEVELS, _IDENTITY_REST_RE=_IDENTITY_REST_RE, _KANJI_NUM=_KANJI_NUM, _NUM_RE=_NUM_RE, _align=_align, _loose_node=_loose_node, canon_pair=canon_pair, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, identity_map=identity_map, loose_match_count=loose_match_count, node_score=node_score, numbers=numbers, prf_counts=prf_counts, rel_match=rel_match, structure_counts=structure_counts)
+node_match_eval = _types.SimpleNamespace(IDENTITY_TAILS=IDENTITY_TAILS, LOOSE_LEVELS=LOOSE_LEVELS, MEANING_FAMILIES=MEANING_FAMILIES, MEANING_LEVELS=MEANING_LEVELS, SYMMETRIC_FAMILIES=SYMMETRIC_FAMILIES, _IDENTITY_REST_RE=_IDENTITY_REST_RE, _KANJI_NUM=_KANJI_NUM, _KANJI_RE=_KANJI_RE, _M2_BOUNDARY_RE=_M2_BOUNDARY_RE, _NUM_RE=_NUM_RE, _PASSIVE_RE=_PASSIVE_RE, _align=_align, _loose_node=_loose_node, canon_pair=canon_pair, evaluate_triples_exact=evaluate_triples_exact, evaluate_triples_node=evaluate_triples_node, identity_map=identity_map, is_passive=is_passive, loose_match_count=loose_match_count, meaning_align=meaning_align, meaning_counts=meaning_counts, meaning_family=meaning_family, meaning_implied=meaning_implied, meaning_node=meaning_node, meaning_rel=meaning_rel, node_score=node_score, numbers=numbers, prf_counts=prf_counts, rel_match=rel_match, structure_counts=structure_counts, voice_flip=voice_flip)
 nested_graph = _types.SimpleNamespace(COMPONENT_PALETTE=COMPONENT_PALETTE, DEEPSEA_BG=DEEPSEA_BG, DEEPSEA_DIM=DEEPSEA_DIM, DEEPSEA_NODE=DEEPSEA_NODE, DEEPSEA_ROOT=DEEPSEA_ROOT, FONT=FONT, HAS_RELATIONS=HAS_RELATIONS, RELATION_COLORS=RELATION_COLORS, RELATION_GROUP_NAMES=RELATION_GROUP_NAMES, TREE_LINE=TREE_LINE, TREE_STYLES=TREE_STYLES, WRAP=WRAP, _esc=_esc, _tree_levels=_tree_levels, component_colors=component_colors, relation_color=relation_color, relation_group=relation_group, relations_to_flat_dot=relations_to_flat_dot, relations_to_nested_dot=relations_to_nested_dot, relations_to_tree_dot=relations_to_tree_dot, relations_to_tree_html=relations_to_tree_html, tree_cross_relations=tree_cross_relations)
 claim_segmenter = _types.SimpleNamespace(_COMPOSE_ONLY_RE=_COMPOSE_ONLY_RE, _COORD_SPLIT_RE=_COORD_SPLIT_RE, _DISTRIB_RE=_DISTRIB_RE, _ENZAI_NAME=_ENZAI_NAME, _JEPSON_RE=_JEPSON_RE, _NEW_TOPIC_RE=_NEW_TOPIC_RE, _ensure_enzai_component=_ensure_enzai_component, _enzai=_enzai, _split_line=_split_line, distribute=distribute, segment_relations=segment_relations, split_claim=split_claim, to_sentence=to_sentence)
 dep_pairs = _types.SimpleNamespace(ARG_DEPS=ARG_DEPS, CASES=CASES, _case_of=_case_of, _comp_map=_comp_map, _component_of=_component_of, _coordinated=_coordinated, _dependency_pairs=_dependency_pairs, _is_pred=_is_pred, _label=_label, dependency_pairs=dependency_pairs, pairs_from_doc=pairs_from_doc)
@@ -17890,9 +19143,11 @@ node_pairs = _types.SimpleNamespace(FORMAL=FORMAL, HAS_LABELS=HAS_LABELS, LEAD=L
 sao_selector14 = _types.SimpleNamespace(HAS_LIKE=HAS_LIKE, HAS_REL=HAS_REL, HERE=HERE, KINDS=KINDS, Selector=Selector14, TRAIN_FILE=TRAIN_FILE14, _pair_origin=_pair_origin, add_has_variants=add_has_variants, add_node_pair_candidates=add_node_pair_candidates, analyze_claim_selected=analyze_claim_selected14, build_candidates=build_candidates14, canon=canon14, claim_features=claim_features14, select=select14, structural_features=structural_features)
 struct_extra = _types.SimpleNamespace(CONJ=CONJ, HAS_STEMS=HAS_STEMS, LEAD_RE=LEAD_RE, NOT_ITEM_RE=NOT_ITEM_RE, STEP_END_RE=STEP_END_RE, _CONJ_WORDS=_CONJ_WORDS, _LEAD_WORDS=_LEAD_WORDS, _ORDINAL_ONLY=_ORDINAL_ONLY, _chunk_left=_chunk_left, _chunk_name=_chunk_name, _chunk_right=_chunk_right, _clean=_clean, _nounish=_nounish, _np_left=_np_left, _span_text=_span_text, coord_expansions=coord_expansions, coord_expansions_doc=coord_expansions_doc, doc_text=doc_text, find_lists=find_lists, find_lists_doc=find_lists_doc, step_candidates=step_candidates)
 comp_first = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS, COMPONENT_SYSTEM=COMPONENT_SYSTEM, NOUNISH=NOUNISH_cf, _nounish=_nounish_cf, _pattern=_pattern, extract_components_llm=extract_components_llm, forced_relations=forced_relations, guard_names=guard_names, llm_component_relations=llm_component_relations, parse_components=parse_components)
-llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, SELECT_SYSTEM=SELECT_SYSTEM, _GA_FIX_LIST_RE=_GA_FIX_LIST_RE, _GA_FIX_RE=_GA_FIX_RE, _HAS_LIKE=_HAS_LIKE, _HAS_RELS=_HAS_RELS, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_HV_LIST=_R45_HV_LIST, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_REL_FORMS_LIST=_R45_REL_FORMS_LIST, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _RC_CASES=_RC_CASES, _RC_HAS=_RC_HAS, _RC_HASLAB=_RC_HASLAB, _RC_LINK=_RC_LINK, _RC_NONN=_RC_NONN, _RC_NOUNISH_POS=_RC_NOUNISH_POS, _RC_POSW=_RC_POSW, _RC_RELF=_RC_RELF, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _rc_after=_rc_after, _rc_chunks=_rc_chunks, _rc_extra_nodes=_rc_extra_nodes, _rc_nounish=_rc_nounish, _rc_txt=_rc_txt, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, claim_final_title=claim_final_title, clean_node=clean_node, distribute_topics=distribute_topics, families=families, grounded=grounded, group_pairs=group_pairs, has_evidence=has_evidence, is_base=is_base, judge=judge, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, rc_generate=rc_generate, rc_node_candidates=rc_node_candidates, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, THERMO_STOPS=THERMO_STOPS, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patents_from_table=patents_from_table, patents_with_node=patents_with_node, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, thermo_color=thermo_color, tidy_relations=tidy_relations, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
-eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, split_of=split_of, ts=ts)
+recall_gen = _types.SimpleNamespace(CASES=CASES_rg, FLAG_7B=FLAG_7B, HAS=HAS_rg, HASLAB=HASLAB, LINK=LINK, NEAR_SUB=NEAR_SUB, NONN=NONN, NOUNISH_POS=NOUNISH_POS, POSW=POSW, RELF=RELF, _after=_after, chunks=chunks, extra_nodes=extra_nodes, generate=generate, is_nounish=is_nounish, node_candidates=node_candidates, txt=txt)
+llm_fewshot = _types.SimpleNamespace(FEWSHOT_EXAMPLES=FEWSHOT_EXAMPLES, FEWSHOT_GUIDE=FEWSHOT_GUIDE, FEWSHOT_IDS=FEWSHOT_IDS, NUM_PREDICT=NUM_PREDICT, TIMEOUT_SECONDS=TIMEOUT_SECONDS, _DROP_PREFIX_RE=_DROP_PREFIX_RE, _LEAD_RE=_LEAD_RE, _SEP_RE=_SEP_RE, _SPACE_RE=_SPACE_RE, _chat=_chat, extract=extract, parse=parse, system_prompt=system_prompt)
+llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, R61_MIN_VOTES=R61_MIN_VOTES, R62_MIN_VOTES=R62_MIN_VOTES, SELECT_SYSTEM=SELECT_SYSTEM, VERIFY_SYSTEM=VERIFY_SYSTEM, _GA_FIX_LIST_RE=_GA_FIX_LIST_RE, _GA_FIX_RE=_GA_FIX_RE, _HAS_FAMILY=_HAS_FAMILY, _HAS_LIKE=_HAS_LIKE, _HAS_RELS=_HAS_RELS, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_HV_LIST=_R45_HV_LIST, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_REL_FORMS_LIST=_R45_REL_FORMS_LIST, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _R65_RES=_R65_RES, _R65_WORDS=_R65_WORDS, _R66_AD=_R66_AD, _R66_ADJ=_R66_ADJ, _R66_NB=_R66_NB, _R66_Q=_R66_Q, _R66_RES=_R66_RES, _SUPPORT_PRI=_SUPPORT_PRI, _SUPPORT_W=_SUPPORT_W, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _fewshot_rel_ok=_fewshot_rel_ok, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _not_component=_not_component, _r66_name=_r66_name, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, claim_final_title=claim_final_title, clean_node=clean_node, comparison_triples=comparison_triples, distribute_topics=distribute_topics, families=families, grounded=grounded, group_pairs=group_pairs, has_evidence=has_evidence, is_base=is_base, judge=judge, llm_verify=llm_verify, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, support_votes=support_votes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, TERM_SOURCES=TERM_SOURCES, TEXT_KEYS=TEXT_KEYS, THERMO_STOPS=THERMO_STOPS, TITLE_STOP=TITLE_STOP, _ABS_NUM_RE=_ABS_NUM_RE, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _TITLE_SPLIT_RE=_TITLE_SPLIT_RE, _TITLE_TOKEN_RE=_TITLE_TOKEN_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, basic_explain=basic_explain, basic_features=basic_features, build_cooccurrence_network=build_cooccurrence_network, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_abstract=clean_abstract, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, default_source=default_source, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, has_sao=has_sao, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_map_basic=layout_map_basic, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patent_terms=patent_terms, patents_from_table=patents_from_table, patents_with_node=patents_with_node, patents_with_term=patents_with_term, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_share=sao_share, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, similarity_matrix_basic=similarity_matrix_basic, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, text_label=text_label, thermo_color=thermo_color, tidy_relations=tidy_relations, title_terms=title_terms, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
+eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _cand_recall_hits=_cand_recall_hits, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, split_of=split_of, ts=ts)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,9 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
     🧪 解析と確認             … 読み込んだ特許のAIの判定を確認・修正して確定する／請求項を1件貼り付けて解析する
   可視化・分析
     🌍 Patent World           … 発明の名称＋FI から得られる特徴の近さで3次元に配置
-    🕸️ SAOネットワーク         … 構成要素のつながり。ノードをクリックすると該当請求項へ
+    🕸️ ネットワーク            … 構成要素（SAO）または発明の名称の語・FIのつながり
     🗺️ 類似性マップ            … SAOの近さで配置。点をクリックすると似た特許と共通部分
-    🧭 FIレーダー              … 出願人（または出願年）ごとのFIの分布
+    🧭 技術レーダー            … 出願人（または出願年）ごとのFI・語の分布
     🫧 技術分布               … 出願年×FIのバブル、出願人×技術のヒートマップ、出願の推移とランキング
   個別ツール
     🐚 2つの請求項を比較 / 🪼 従属請求項を展開
@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-26c"
+NEED_PIPELINE = "2026-09-27a"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -215,6 +215,26 @@ def corpus_similarity(_data, key):
     return PC.similarity_matrix(_data, st.session_state.reviews)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def corpus_similarity_basic(_data, uid):
+    return PC.similarity_matrix_basic(_data)
+
+
+def source_choices():
+    """可視化の語の出どころの選択肢と、既定（SAO がある特許が半分未満なら「発明の名称の語」）。"""
+    share = PC.sao_share(DATA, st.session_state.reviews)
+    opts = (["SAO構成要素"] if share > 0 else []) + ["発明の名称の語"] + \
+        (["FI"] if any(p.get("fi_main") for p in DATA["patents"]) else [])
+    default = PC.default_source(DATA, st.session_state.reviews)
+    return opts, (opts.index(default) if default in opts else 0), share
+
+
+def source_note(share):
+    n = len(DATA["patents"])
+    st.caption(f"請求項を解析したSAOがある特許：{round(share * n)}／{n} 件。SAO が無い特許（請求項が無いデータなど）でも、"
+               "「発明の名称の語」「FI」を選ぶと、すべての特許で可視化できます。")
+
+
 def patent_label(pid):
     p = PATENTS[pid]
     return f"{pid}｜{p['title'] or '（名称なし）'}｜{p['company']}"
@@ -255,13 +275,15 @@ if "_select_cache" not in st.session_state:
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
-def analyze_llm(text, model, host):
+def analyze_llm(text, model, host, accept_min_votes=3, verify=False, fewshot=False):
     """最終方式（A2・学習なし）：LLMで構成要素を先に取り出して固定し、GiNZAの規則で関係を取り出す。"""
     gpp = load_pipeline()
     t0 = time.time()
     # 網羅候補（R60）は評価用（候補の再現率を測るため）。アプリでは表が重くなるので作らない
     info, judged, raw = pp.llm_select.analyze_claim_a2(ts, gpp, text, cache=st.session_state["_select_cache"],
-                                                      model=model, host=host, recall_cands=False)
+                                                      model=model, host=host, recall_cands=False,
+                                                      accept_min_votes=accept_min_votes, verify=verify,
+                                                      fewshot=fewshot, fewshot_cache=st.session_state["_select_cache"])
     cands = []
     for c, j in zip(info["cands"], judged):
         rules = j.get("rules") or []
@@ -323,7 +345,7 @@ def analyze(text, model, host):
 def run_analyze(text):
     host = (ollama_host or "").strip() or None
     if extract_method == METHODS[0]:
-        return analyze_llm(text, model_name, host)
+        return analyze_llm(text, model_name, host, accept_min_votes, verify_llm, fewshot_llm)
     return analyze(text, model_name, host)
 
 
@@ -766,6 +788,29 @@ with st.sidebar:
                                    "GiNZAの解析でその名前を1語に固定してから、GiNZAの規則で関係を取り出す。"
                                    "比較用：532件で学習した選別モデル（実験14）。")
     st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
+    if extract_method == METHODS[0]:
+        st.markdown("### 🎚️ 自動採用の厳しさ")
+        _AMV = {2: "標準（F1が最も高い）", 3: "やや厳しめ（おすすめ）", 4: "厳しめ", 5: "高信頼", 6: "最高信頼"}
+        _AMV_P = {2: (60, 44), 3: (64, 42), 4: (68, 30), 5: (75, 17), 6: (82, 6)}
+        accept_min_votes = st.select_slider(
+            "自動で採用する裏付けの数", options=list(_AMV), value=3, key="accept_min_votes",
+            format_func=lambda v: f"{v}以上：{_AMV[v]}",
+            help="裏付け＝ほかの独立した候補の作り方（区間内の組・係り受けの組・文型の規則など）が同じ組を出した数。"
+                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約53%）は変わりません。")
+        _p, _r = _AMV_P[accept_min_votes]
+        st.caption(f"532件のうち規則づくりに使っていない半分で測った目安：自動採用の適合率 約{_p}%・再現率 約{_r}%／"
+                   "採用＋要確認の再現率 約52%")
+        verify_llm = st.checkbox("要確認をLLMに確かめさせる（実験・R63）", value=False, key="verify_llm",
+                                 help="要確認の候補（最大30件）について、LLMに「その関係が本文に書かれているか」を はい／いいえ で"
+                                      "答えさせ、「はい」を採用にします。LLMは関係を作らず、確かめるだけです。1件あたりLLMの呼び出しが1回増えます。")
+        fewshot_llm = st.checkbox("手本つきLLMにも抽出させて照らし合わせる（実験・R64）", value=False, key="fewshot_llm",
+                                  help="書き方の決まりと手本を見せたローカルLLMにもSAOを書き出させ、規則の要確認と同じ関係なら採用にします。"
+                                       "LLMだけが出した関係は要確認として表に出します。1件あたりLLMの呼び出しが1回増えます"
+                                       "（qwen3.5:9b で約1分）。")
+    else:
+        accept_min_votes = 3
+        verify_llm = False
+        fewshot_llm = False
 
 
 # ===========================================================================
@@ -786,9 +831,10 @@ def page_data():
     if sec == SECS[0]:
         st.markdown(
             "J-PlatPat などから出力した **CSV／Excel** を読み込みます。文献番号・発明の名称・出願人・FI・出願日の列は"
-            "自動で見つけます。**J-PlatPat の CSV には請求項が入っていない**ので、その場合は書誌情報だけで読み込み、"
-            "あとから「📝 請求項を追加」で請求項を足して解析します（書誌情報だけでも Patent World・FIレーダー・"
-            "技術分布は使えます）。請求項の列がある表なら、読み込みと同時に、サイドバーで選んだ抽出方法で解析します。")
+            "自動で見つけます。解析に使う文は、行ごとに **① 請求項 → ② 要約 → ③ 代替の列** の順で、空でない最初の列を使います"
+            "（要約・代替の列は、【解決手段】の部分を使い、「半導体装置１」の符号などを取り除いてから解析します）。"
+            "どれも無い行は書誌情報だけで読み込み、あとから「📝 請求項を追加」で足して解析できます（書誌情報だけでも、"
+            "可視化・分析の6つの画面はすべて使えます。SAOの代わりに発明の名称の語・FIを使います）。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
         pasted = st.text_area("または、請求項を「-----」で区切って貼り付け（書誌情報なしで解析）", height=120,
                               key="ds_paste")
@@ -804,7 +850,8 @@ def page_data():
             st.caption(f"{len(df):,} 行を読み込みました。列の対応を確認してください。")
             det = PC.detect_columns(df)
             labels = {"id": "文献番号", "title": "発明の名称", "applicant": "出願人", "fi": "FI", "date": "出願日",
-                      "url": "URL", "claim": "請求項（任意）"}
+                      "url": "URL", "claim": "① 請求項（最優先）", "abstract": "② 要約（請求項が空のとき）",
+                      "alt": "③ 代替の列（どちらも空のとき）"}
             opts = ["（なし）"] + list(df.columns)
             cols = {}
             grid = st.columns(4)
@@ -818,8 +865,14 @@ def page_data():
             c1, c2 = st.columns([2, 1])
             name = c1.text_input("データセットの名前", value=Path(up.name).stem if up is not None else "貼り付けた請求項")
             limit = c2.number_input("読み込む件数の上限（0で全件）", min_value=0, value=0, step=10)
-            if not cols["claim"]:
-                st.info("請求項の列がありません。書誌情報（文献番号・発明の名称・出願人・FI・出願日）だけで読み込みます。"
+            text_cols = [cols.get(k) for k, _ in PC.TEXT_KEYS if cols.get(k)]
+            if text_cols:
+                _prev = PC.patents_from_table(df.head(200), cols)
+                _cnt = Counter(PC.text_label(p).split("（")[0] for p in _prev)
+                st.caption("解析に使う文（先頭の最大200行の内訳）：" + "／".join(
+                    f"{k} {_cnt.get(k, 0)} 件" for k in ("請求項", "要約", "代替", "なし")))
+            if not text_cols:
+                st.info("請求項・要約・代替の文の列がありません。書誌情報（文献番号・発明の名称・出願人・FI・出願日）だけで読み込みます。"
                         "LLMは使わないので、すぐに終わります。", icon="ℹ️")
                 if st.button("📂 書誌情報だけで読み込む", type="primary", disabled=not (cols["id"] or cols["title"])):
                     ps = PC.patents_from_table(df, cols, limit=int(limit) or None)
@@ -924,15 +977,20 @@ def add_claims_tab():
             opts = list(cdf.columns)
             a, b = st.columns(2)
             idc = a.selectbox("文献番号の列", opts, index=opts.index(det["id"]) if det.get("id") in opts else 0)
-            clc = b.selectbox("請求項の列", opts, index=opts.index(det["claim"]) if det.get("claim") in opts
+            _dc = det.get("claim") or det.get("abstract") or det.get("alt")
+            clc = b.selectbox("請求項（または要約など）の列", opts, index=opts.index(_dc) if _dc in opts
                               else min(1, len(opts) - 1))
-            if st.button("この表の請求項を登録する"):
-                table = PC.claims_from_table(cdf, idc, clc)
+            kind = st.radio("この列の中身", ["請求項", "要約", "代替"], horizontal=True,
+                            index=0 if clc == det.get("claim") else (1 if clc == det.get("abstract") else 2),
+                            key="claims_kind", help="要約・代替は【解決手段】の部分を使い、符号を取り除いてから解析します。")
+            if st.button("この表の文を登録する"):
+                table = PC.claims_from_table(cdf, idc, clc, source=kind)
                 hit = 0
                 for p in ps:
                     t = table.get(PC.norm_pid(p["id"]))
                     if t and t != p.get("text"):
                         p["text"], p["relations"], p["n_rejected"], p["analyzed"] = t, [], 0, False
+                        p["text_source"] = kind if kind != "代替" else f"代替（{clc}）"
                         st.session_state.reviews.pop(p["id"], None)
                         hit += 1
                 st.session_state["_claims_msg"] = f"{hit} 件の特許に請求項を登録しました（表の {len(table)} 件中）。"
@@ -948,7 +1006,7 @@ def add_claims_tab():
             st.markdown(f"[公報を開く]({p['url']})")
         t = st.text_area("請求項1の本文", height=160, key=f"claim_text_{pid}")
         if st.button("この特許の請求項として登録", disabled=not t.strip()):
-            p["text"], p["analyzed"] = PC.first_claim(t), False
+            p["text"], p["analyzed"], p["text_source"] = PC.first_claim(t), False, "請求項"
             st.session_state["_claims_msg"] = f"{pid} に請求項を登録しました。"
             st.rerun()
     else:
@@ -1303,6 +1361,12 @@ def show_patent_card(pid):
     p = PATENTS[pid]
     rels = PC.effective_relations(p, st.session_state.reviews)
     st.markdown(f"**{p['title']}**（{pid}）　{p['applicant']}　FI: {p['fi'] or '―'}")
+    if not (p.get("text") or "").strip():
+        st.caption(f"出願日：{p.get('filing_date') or '―'}／発明の名称の語：{'、'.join(sorted(PC.title_terms(p.get('title')))) or '―'}"
+                   "。この特許には請求項・要約がありません（「データの読み込み」→「請求項を追加」から足すと、SAOも表示されます）。")
+        return
+    if PC.text_label(p) != "請求項":
+        st.caption(f"解析に使った文：**{PC.text_label(p)}**（請求項が無いため）")
     c1, c2 = st.columns([2, 3])
     with c1:
         words = {x for r in rels for x in (r["source"], r["target"])}
@@ -1323,19 +1387,34 @@ def page_network():
     need_data()
     import plotly.graph_objects as go
 
-    st.title("🕸️ SAOネットワーク")
-    st.caption("SAOを、番号や「前記」を除いた基本語（例：第１電極→電極）でまとめたネットワーク。"
-               "丸の大きさ＝その構成要素が現れる特許の件数、線の太さ＝その関係が現れる特許の件数。"
-               " **丸をクリックすると、その構成要素が出てくる請求項が下に表示されます。** ")
+    st.title("🕸️ ネットワーク（SAO・語）")
+    opts, di, share = source_choices()
+    src = st.radio("語の出どころ", opts, index=di, horizontal=True, key="net_src",
+                   help="SAO構成要素＝請求項を解析したSAOの部品名と、その関係。発明の名称の語・FI＝請求項が無くても使える。"
+                        "同じ特許に一緒に出てくる語を線で結ぶ（共起）。")
+    source_note(share)
+    sao = src == "SAO構成要素"
+    if sao:
+        st.caption("SAOを、番号や「前記」を除いた基本語（例：第１電極→電極）でまとめたネットワーク。"
+                   "丸の大きさ＝その構成要素が現れる特許の件数、線の太さ＝その関係が現れる特許の件数。"
+                   " **丸をクリックすると、その構成要素が出てくる請求項が下に表示されます。** ")
+    else:
+        st.caption(f"{src}の共起ネットワーク。丸の大きさ＝その語が出てくる特許の件数、線の太さ＝2つの語が同じ特許に"
+                   "一緒に出てくる件数。 **丸をクリックすると、その語を含む特許が下に表示されます。** ")
     small = len(DATA["patents"]) < 40
     c1, c2, c3, c4, c5 = st.columns(5)
     comp = c1.multiselect("出願人", sorted({p["company"] for p in DATA["patents"]}))
-    top_n = c2.slider("構成要素の数", 10, 150, 50, step=10)
-    min_p = c3.slider("構成要素の最低出現特許数", 1, 20, 1 if small else 3)
-    min_e = c4.slider("線を引く最低特許数", 1, 20, 1 if small else 3, help="その関係が何件の特許に現れたら線を引くか")
-    kind = c5.selectbox("関係の種類", ["すべて", "構成（有する・備える）", "機能・配置（それ以外）"])
+    top_n = c2.slider("語の数" if not sao else "構成要素の数", 10, 150, 50, step=10)
+    min_p = c3.slider("最低出現特許数", 1, 20, 1 if small else (3 if sao else 2))
+    min_e = c4.slider("線を引く最低特許数", 1, 20, 1 if small else (3 if sao else 2),
+                      help="その関係（共起）が何件の特許に現れたら線を引くか")
+    kind = c5.selectbox("関係の種類", ["すべて", "構成（有する・備える）", "機能・配置（それ以外）"]) if sao else "すべて"
     ids = [p["id"] for p in DATA["patents"] if not comp or p["company"] in comp]
-    nodes, edges = PC.build_network(DATA, ids, st.session_state.reviews, min_patents=min_p, top_n=top_n)
+    if sao:
+        nodes, edges = PC.build_network(DATA, ids, st.session_state.reviews, min_patents=min_p, top_n=top_n)
+    else:
+        nodes, edges = PC.build_cooccurrence_network(DATA, ids, source=src, reviews=st.session_state.reviews,
+                                                     min_patents=min_p, top_n=top_n)
     edges = [e for e in edges if e["count"] >= min_e]
     if kind != "すべて":
         want = kind.startswith("構成")
@@ -1343,7 +1422,7 @@ def page_network():
     linked = {x for e in edges for x in (e["source"], e["target"])}
     nodes = [n for n in nodes if n["id"] in linked] or nodes
     if not nodes:
-        st.info("条件に合う構成要素がありません。スライダーの値を下げてください。")
+        st.info("条件に合う語がありません。スライダーの値を下げるか、語の出どころを変えてください。")
         return
     pos = PC.layout_network(nodes, edges)
     fig = go.Figure()
@@ -1351,9 +1430,10 @@ def page_network():
     for e in edges:
         x0, y0 = pos[e["source"]]
         x1, y1 = pos[e["target"]]
+        color = ("rgba(37,99,235,.35)" if PC.is_has(e["relation"]) else "rgba(234,88,12,.45)") if sao else \
+            "rgba(100,116,139,.35)"
         fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines", hoverinfo="skip", showlegend=False,
-                                 line=dict(width=0.5 + 4 * e["count"] / maxc,
-                                           color="rgba(37,99,235,.35)" if PC.is_has(e["relation"]) else "rgba(234,88,12,.45)")))
+                                 line=dict(width=0.5 + 4 * e["count"] / maxc, color=color)))
     sel = st.session_state.net_node
     deg = Counter()
     for e in edges:
@@ -1366,32 +1446,44 @@ def page_network():
         textposition="top center", textfont=dict(size=11),
         text=[n["id"] if (n["count"] >= label_min or n["id"] == sel) else "" for n in nodes],
         customdata=[[n["id"]] for n in nodes],
-        hovertext=[f"{n['id']}<br>特許 {n['count']} 件／つながり {deg[n['id']]}<br>表記例：{'、'.join(n['surfaces'][:4])}"
-                   for n in nodes], hoverinfo="text", showlegend=False,
+        hovertext=[f"{n['id']}<br>特許 {n['count']} 件／つながり {deg[n['id']]}" +
+                   (f"<br>表記例：{'、'.join(n['surfaces'][:4])}" if sao else "") for n in nodes],
+        hoverinfo="text", showlegend=False,
         marker=dict(size=[10 + 30 * (n["count"] / maxn) ** 0.5 for n in nodes],
                     color=["#f59e0b" if n["id"] == sel else "#0ea5e9" for n in nodes],
                     line=dict(width=1, color="#0f172a"))))
     fig.update_layout(height=680, margin=dict(l=10, r=10, t=10, b=10), dragmode="pan",
                       xaxis=dict(visible=False), yaxis=dict(visible=False), clickmode="event+select")
     event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points", key="net_chart")
-    st.caption("青い線＝構成（有する・備える）／橙の線＝機能・配置（接続される・配置される等）")
-    # クリック直後の再実行では図を変えずに選択を受け取り、印を付け直すために再実行する
+    st.caption("青い線＝構成（有する・備える）／橙の線＝機能・配置（接続される・配置される等）" if sao else
+               "線＝同じ特許に一緒に出てくる（共起）。太いほど一緒に出てくる特許が多い。")
     clicked = _clicked(event)
     if clicked and clicked != st.session_state.net_node:
         st.session_state.net_node = clicked
         st.rerun()
     names = [n["id"] for n in sorted(nodes, key=lambda n: -n["count"])]
     cur = st.session_state.net_node if st.session_state.net_node in names else names[0]
-    term = st.selectbox("構成要素（クリックでも選べます）", names, index=names.index(cur))
+    term = st.selectbox("語（クリックでも選べます）", names, index=names.index(cur))
     if term != cur:
         st.session_state.net_node = term
         st.rerun()
-    hits = [h for h in PC.patents_with_node(DATA, term, st.session_state.reviews) if h["patent"]["id"] in ids]
-    st.markdown(f"#### 「{term}」が出てくる請求項：{len(hits)} 件")
     nb = Counter()
     for e in edges:
         if term in (e["source"], e["target"]):
             nb[(e["source"], e["relation"], e["target"])] += e["count"]
+    if not sao:
+        hits = [p for p in PC.patents_with_term(DATA, term, src, st.session_state.reviews) if p["id"] in ids]
+        st.markdown(f"#### 「{term}」を含む特許：{len(hits)} 件")
+        if nb:
+            st.write("よく一緒に出てくる語：" + "／".join(f"{t if s == term else s}（{c}件）"
+                                                   for (s, r, t), c in nb.most_common(8)))
+        st.dataframe(pd.DataFrame([{"特許番号": p["id"], "発明の名称": p["title"], "出願人": p["company"],
+                                    "出願年": p.get("year"), "FI": p.get("fi"),
+                                    "解析した文": PC.text_label(p)} for p in hits]),
+                     hide_index=True, use_container_width=True)
+        return
+    hits = [h for h in PC.patents_with_node(DATA, term, st.session_state.reviews) if h["patent"]["id"] in ids]
+    st.markdown(f"#### 「{term}」が出てくる請求項：{len(hits)} 件")
     if nb:
         st.write("主なつながり：" + "／".join(f"{s}→{r}→{t}（{c}件）" for (s, r, t), c in nb.most_common(6)))
     for h in hits[:30]:
@@ -1414,19 +1506,39 @@ def page_similarity():
     import plotly.express as px
 
     st.title("🗺️ 類似性マップ")
-    st.caption("各特許のSAO（基本語にしたトリプル・組・構成要素）をTF-IDFで数値化し、似ているものほど近くに"
-               "配置した地図。 **点をクリックすると、似ている特許と共通するSAOが表示されます。** "
-               "Patent World（発明の名称＋FI）とは違い、請求項の構造の近さで並べている。色は出願人。")
+    share = PC.sao_share(DATA, st.session_state.reviews)
+    bases = (["SAO（請求項の構造）"] if share > 0 else []) + ["発明の名称＋FI"]
+    basis = st.radio("近さの基準", bases, index=0 if share >= 0.5 and share > 0 else len(bases) - 1, horizontal=True,
+                     key="map_basis",
+                     help="SAO＝請求項を解析したSAO（基本語にしたトリプル・組・構成要素）の近さ。"
+                          "発明の名称＋FI＝請求項が無い特許も含めて、発明の名称の文字とFIの近さ。")
+    source_note(share)
+    sao = basis.startswith("SAO")
+    if sao:
+        st.caption("各特許のSAO（基本語にしたトリプル・組・構成要素）をTF-IDFで数値化し、似ているものほど近くに"
+                   "配置した地図。 **点をクリックすると、似ている特許と共通するSAOが表示されます。** 色は出願人。")
+    else:
+        st.caption("各特許の発明の名称（文字の並び）とFIをTF-IDFで数値化し、似ているものほど近くに配置した地図。"
+                   "請求項が無い特許も表示できます。 **点をクリックすると、似ている特許と共通する語・FIが表示されます。** 色は出願人。")
     if len(DATA["patents"]) < 2:
         st.info("2件以上の特許が必要です。")
         return
-    S = corpus_similarity(DATA, data_key())
+    if sao:
+        S = corpus_similarity(DATA, data_key())
+        kx, ky = "map_x", "map_y"
+    else:
+        if any("map2_x" not in p for p in DATA["patents"]):
+            with st.spinner("配置を計算中…"):
+                PC.layout_map_basic(DATA)
+        S = corpus_similarity_basic(DATA, DATA["meta"]["uid"])
+        kx, ky = "map2_x", "map2_y"
     ids = [p["id"] for p in DATA["patents"]]
-    df = pd.DataFrame([{"特許番号": p["id"], "発明の名称": p["title"], "出願人": p["group"], "x": p.get("map_x", 0.0),
-                        "y": p.get("map_y", 0.0), "SAO数": len(PC.effective_relations(p, st.session_state.reviews))}
+    df = pd.DataFrame([{"特許番号": p["id"], "発明の名称": p["title"], "出願人": p["group"], "x": p.get(kx, 0.0),
+                        "y": p.get(ky, 0.0), "SAO数": len(PC.effective_relations(p, st.session_state.reviews)),
+                        "解析した文": PC.text_label(p)}
                        for p in DATA["patents"]])
     fig = px.scatter(df, x="x", y="y", color="出願人", color_discrete_map=COLORS,
-                     hover_name="発明の名称", hover_data={"特許番号": True, "x": False, "y": False},
+                     hover_name="発明の名称", hover_data={"特許番号": True, "x": False, "y": False, "解析した文": True},
                      custom_data=["特許番号"], height=620)
     fig.update_traces(marker=dict(size=8))
     sel = st.session_state.map_patent
@@ -1454,6 +1566,19 @@ def page_similarity():
              "類似度": round(float(S[i, j]), 3)} for j in np.argsort(-S[i])[:top_k]]
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     other = st.selectbox("共通部分を見る特許", [r["特許番号"] for r in rows], format_func=patent_label)
+    if not sao:
+        ex = PC.basic_explain(PATENTS[pid], PATENTS[other])
+        cols = st.columns(3)
+        for col, k in zip(cols, ex):
+            col.markdown(f"**{k}（{len(ex[k])}）**")
+            col.write("\n".join(f"- {x}" for x in ex[k][:25]) or "―")
+        a, b = st.columns(2)
+        for col, x in ((a, pid), (b, other)):
+            with col:
+                q = PATENTS[x]
+                st.markdown(f"**{x}**　{q['title']}")
+                st.caption(f"{q['company']}／出願日 {q.get('filing_date') or '―'}／FI {q.get('fi') or '―'}")
+        return
     ra = PC.effective_relations(PATENTS[pid], st.session_state.reviews)
     rb = PC.effective_relations(PATENTS[other], st.session_state.reviews)
     ex = PC.similarity_explain(ra, rb)
@@ -1477,13 +1602,17 @@ def page_similarity():
 def page_wordcloud():
     need_data()
     st.title("🔥 ワードクラウド")
-    st.caption("SAOに出てくる部品名（または関係語）を、サーモグラフィーのように表示する。"
+    st.caption("SAOに出てくる部品名・関係語、または発明の名称の語・FIを、サーモグラフィーのように表示する。"
                "文字の大きさ＝その語が出てくる特許の件数。色（温度）＝件数、または全体と比べた偏り（特化係数）。"
                "語にマウスを重ねると件数が出ます。")
     pats = DATA["patents"]
     c1, c2, c3 = st.columns([1.2, 1.6, 1.2])
-    target = c1.radio("対象", ["構成要素", "関係"], horizontal=True,
-                      help="構成要素＝番号を除いた部品名（「第1電極」「第2電極」→「電極」）。関係＝「接続される」などの関係語。")
+    _opts, _di, _share = source_choices()
+    targets = (["構成要素", "関係"] if _share > 0 else []) + ["発明の名称の語"] + (["FI"] if "FI" in _opts else [])
+    target = c1.radio("対象", targets, index=targets.index("構成要素") if _di == 0 and _share >= 0.5 else
+                      targets.index("発明の名称の語"), horizontal=True,
+                      help="構成要素＝番号を除いた部品名（「第1電極」「第2電極」→「電極」）。関係＝「接続される」などの関係語"
+                           "（どちらも請求項のSAOから）。発明の名称の語・FI＝請求項が無い特許でも使える。")
     color_by = c2.radio("色（温度）の意味", ["件数", "特化係数（全体と比べた偏り）"], horizontal=True,
                         help="特化係数＝選んだ特許でその語が出てくる割合 ÷ データ全体での割合。"
                              "1が平均（赤紫）、2倍で橙、3倍近くで白。平均より少ない語は紫〜紺。")
@@ -1498,7 +1627,8 @@ def page_wordcloud():
     fi = c5.selectbox("FI（サブクラス）で絞り込む", [ALLFI] + fis) if fis else ALLFI
     years = sorted({int(p["year"]) for p in pats if str(p.get("year", "")).isdigit()})
     yr = c6.select_slider("出願年", options=years, value=(years[0], years[-1])) if len(years) > 1 else None
-    drop_title = st.checkbox("発明の名称そのもの（「半導体装置」など）は除く", value=True)
+    source_note(_share)
+    drop_title = st.checkbox("発明の名称そのもの（「半導体装置」など）は除く", value=True) if target == "構成要素" else True
     ids = [p["id"] for p in pats
            if (comp == ALL or p["company"] == comp) and (fi == ALLFI or fi in PC.fi_codes(p, level))
            and (yr is None or (str(p.get("year", "")).isdigit() and yr[0] <= int(p["year"]) <= yr[1]))]
@@ -1535,18 +1665,22 @@ def page_radar():
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    st.title("🧭 FIレーダー")
-    st.caption("出願人（または出願年）ごとに、どのFI（技術分類）の特許をどれだけ持っているかを比べる。"
-               "軸はデータ全体でよく使われているFI。")
-    if not any(p.get("fi") for p in DATA["patents"]):
-        st.info("このデータセットにはFIの列がありません。FIを含む特許リストを読み込むと表示できます。")
-        return
+    st.title("🧭 技術レーダー")
+    st.caption("出願人（または出願年）ごとに、どの技術（FI・発明の名称の語・SAOの構成要素）の特許をどれだけ持っているかを"
+               "比べる。軸はデータ全体でよく出てくるもの。")
+    has_fi = any(p.get("fi") for p in DATA["patents"])
+    _opts, _di, _share = source_choices()
+    axis_opts = (["FI"] if has_fi else []) + ["発明の名称の語"] + (["SAO構成要素"] if _share > 0 else [])
+    axis_src = st.radio("軸", axis_opts, index=0, horizontal=True, key="radar_axis",
+                        help="FI＝技術分類。発明の名称の語・SAO構成要素＝FIが無いデータや、請求項の中身で比べたいときに。")
+    if not has_fi:
+        st.caption("このデータにはFIの列が無いため、発明の名称の語などを軸にしています。")
     c1, c2, c3 = st.columns(3)
     by = c1.radio("比べるもの", ["出願人", "出願年"], horizontal=True)
-    level_name = c2.selectbox("FIの細かさ", list(PC.FI_LEVELS))
-    top_fi = c3.slider("軸にするFIの数", 3, 12, 8)
+    level_name = c2.selectbox("FIの細かさ", list(PC.FI_LEVELS)) if axis_src == "FI" else list(PC.FI_LEVELS)[0]
+    top_fi = c3.slider("軸の数", 3, 12, 8)
     c4, c5 = st.columns([2, 1])
-    value = c4.radio("値", ["特化係数（全体と比べた偏り）", "割合（%）", "件数"], horizontal=True,
+    value = c4.radio("値", ["特化係数（全体と比べた偏り）", "割合（%）", "件数"], index=0 if axis_src == "FI" else 1, horizontal=True,
                      help="特化係数＝そのグループでの割合 ÷ データ全体での割合。1より大きいほど、そのFIに力を入れている。"
                           "どの出願人も多いFI（H01Lなど）に引っぱられず、違いが見やすい。")
     layout = c5.radio("表示", ["並べて表示", "重ねて表示"], horizontal=True)
@@ -1561,13 +1695,17 @@ def page_radar():
         st.info(f"比べる{by}を選んでください。")
         return
     share = not value.startswith("件数")
-    axes, vals, sizes = PC.fi_radar_data(DATA, by=by, level=level, groups=groups, top_fi=top_fi, share=share)
+    axes, vals, sizes = PC.fi_radar_data(DATA, by=by, level=level, groups=groups, top_fi=top_fi, share=share,
+                                         source=axis_src, reviews=st.session_state.reviews)
     if len(axes) < 3:
-        st.info("レーダーチャートには3つ以上のFIが必要です。FIの細かさを変えるか、比べるグループを増やしてください。")
+        st.info("レーダーチャートには3つ以上の軸が必要です。軸の種類・細かさを変えるか、比べるグループを増やしてください。")
         return
     if value.startswith("特化"):
         n_all = len(DATA["patents"])
-        base = [100 * sum(1 for p in DATA["patents"] if a in PC.fi_codes(p, level)) / n_all for a in axes]
+        def _has(p, a):
+            return a in (PC.fi_codes(p, level) if axis_src == "FI" else PC.patent_terms(p, axis_src, st.session_state.reviews))
+
+        base = [100 * sum(1 for p in DATA["patents"] if _has(p, a)) / n_all for a in axes]
         vals = {g: [round(v / b, 2) if b else 0 for v, b in zip(vals[g], base)] for g in groups}
     unit = {"特": "", "割": "%", "件": "件"}[value[0]]
     vmax = max(max(v) for v in vals.values()) or 1
@@ -1632,11 +1770,16 @@ def page_distribution():
     tab1, tab2, tab3 = st.tabs(["🫧 出願年 × FI（バブル）", "🔥 出願人 × 技術（ヒートマップ）", "📈 出願の推移とランキング"])
     reviews = st.session_state.reviews
     with tab1:
-        if not any(p.get("fi") for p in DATA["patents"]) or not any(p.get("year") for p in DATA["patents"]):
-            st.info("出願日とFIの列があるデータで表示できます。")
+        _opts, _di, _share = source_choices()
+        has_fi = any(p.get("fi") for p in DATA["patents"])
+        y_opts = (["FI"] if has_fi else []) + ["発明の名称の語"] + (["SAO構成要素"] if _share > 0 else [])
+        if not any(p.get("year") for p in DATA["patents"]):
+            st.info("出願日の列があるデータで表示できます。")
         else:
-            c1, c2, c3 = st.columns(3)
-            level_name = c1.selectbox("FIの細かさ", list(PC.FI_LEVELS)[:2], key="bub_level")
+            c0, c1, c2, c3 = st.columns(4)
+            y_src = c0.selectbox("縦軸", y_opts, key="bub_ysrc")
+            level_name = c1.selectbox("FIの細かさ", list(PC.FI_LEVELS)[:2], key="bub_level") if y_src == "FI" else \
+                list(PC.FI_LEVELS)[0]
             top_fi = c2.slider("表示するFIの数", 5, 30, 12, key="bub_top")
             groups_all = [g for g in DATA.get("groups", []) if g]
             comps = c3.multiselect("出願人（色分け）", groups_all, default=groups_all, key="bub_comp")
@@ -1645,7 +1788,8 @@ def page_distribution():
             for p in DATA["patents"]:
                 if not p.get("year") or p["group"] not in comps:
                     continue
-                for f in set(PC.fi_codes(p, level)):
+                codes = set(PC.fi_codes(p, level)) if y_src == "FI" else PC.patent_terms(p, y_src, reviews)
+                for f in codes:
                     rows.append({"出願年": p["year"], "FI": f, "出願人": p["group"],
                                  "SAO数": len(PC.effective_relations(p, reviews))})
             df = pd.DataFrame(rows)
@@ -1660,8 +1804,9 @@ def page_distribution():
                 gl = [g for g in comps if g in set(agg["出願人"])]
                 width = 0.8 / max(len(gl), 1)
                 agg["x"] = agg.apply(lambda r: r["出願年"] + (gl.index(r["出願人"]) - (len(gl) - 1) / 2) * width, axis=1)
-                fig = px.scatter(agg, x="x", y="FI", size="件数", size_max=24, color="出願人",
-                                 color_discrete_map=COLORS, category_orders={"FI": order, "出願人": gl},
+                agg = agg.rename(columns={"FI": y_src}) if y_src != "FI" else agg
+                fig = px.scatter(agg, x="x", y=y_src, size="件数", size_max=24, color="出願人",
+                                 color_discrete_map=COLORS, category_orders={y_src: order, "出願人": gl},
                                  height=160 + 44 * len(order),
                                  hover_data={"x": False, "出願年": True, "件数": True, "平均SAO数": True})
                 years = sorted(agg["出願年"].unique())
@@ -1671,18 +1816,20 @@ def page_distribution():
                 for y in years[:-1]:
                     fig.add_vline(x=y + 0.5, line_width=1, line_color="rgba(148,163,184,.35)")
                 plot(fig)
-                st.caption("横軸＝出願年、縦軸＝FI（件数の多い順）、色＝出願人、バブルの大きさ＝その年・そのFIのその出願人の"
-                           "特許の件数。同じ年に複数の出願人がいるときは、年の枠の中で横に並べている。"
-                           "1件の特許に複数のFIがあれば、それぞれに数える。")
+                st.caption(f"横軸＝出願年、縦軸＝{y_src}（件数の多い順）、色＝出願人、バブルの大きさ＝その年・その{y_src}の"
+                           "その出願人の特許の件数。同じ年に複数の出願人がいるときは、年の枠の中で横に並べている。"
+                           f"1件の特許に複数の{y_src}があれば、それぞれに数える。平均SAO数は請求項を解析した特許だけの値。")
     with tab2:
         c1, c2, c3, c4 = st.columns(4)
-        axis = c1.selectbox("技術の軸", ["FIサブクラス", "FIメイングループ", "主要構成要素（SAO）"])
+        _ax = (["FIサブクラス", "FIメイングループ"] if any(p.get("fi") for p in DATA["patents"]) else []) + \
+            ["発明の名称の語"] + (["主要構成要素（SAO）"] if PC.sao_share(DATA, reviews) > 0 else [])
+        axis = c1.selectbox("技術の軸", _ax)
         top = c2.slider("表示する技術の数", 5, 30, 15)
         top_comp = c3.slider("表示する出願人の数", 3, 30, 12)
         norm = c4.checkbox("出願人ごとの割合で表示", value=False)
         m = PC.company_tech_matrix(DATA, axis=axis, reviews=reviews, top_tech=top, top_comp=top_comp)
         if m.empty:
-            st.info("データがありません（FIの列がない場合は「主要構成要素（SAO）」を選んでください）。")
+            st.info("データがありません（FIの列がない場合は「発明の名称の語」を選んでください）。")
         else:
             z = m.div(m.sum(axis=1), axis=0).round(3) if norm else m
             fig = px.imshow(z, text_auto=".0%" if norm else True, aspect="auto", color_continuous_scale="YlOrRd",
@@ -1700,6 +1847,8 @@ def page_distribution():
                     ok = tech in p["fi_sub"]
                 elif axis == "FIメイングループ":
                     ok = tech in p["fi_main"]
+                elif axis == "発明の名称の語":
+                    ok = tech in PC.title_terms(p.get("title"))
                 else:
                     ok = any(PC.base_term(x) == tech for r in PC.effective_relations(p, reviews)
                              for x in (r["source"], r["target"]))
@@ -1939,9 +2088,9 @@ nav = st.navigation({
     "データ": [st.Page(page_data, title="データの読み込み", icon="📥", url_path="data", default=True)],
     "抽出と確認": [st.Page(page_extract, title="解析と確認", icon="🧪", url_path="extract")],
     "可視化・分析": [st.Page(page_world, title="Patent World", icon="🌍", url_path="world"),
-                   st.Page(page_network, title="SAOネットワーク", icon="🕸️", url_path="network"),
+                   st.Page(page_network, title="ネットワーク", icon="🕸️", url_path="network"),
                    st.Page(page_similarity, title="類似性マップ", icon="🗺️", url_path="similarity"),
-                   st.Page(page_radar, title="FIレーダー", icon="🧭", url_path="radar"),
+                   st.Page(page_radar, title="技術レーダー", icon="🧭", url_path="radar"),
                    st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution"),
                    st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
     "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
