@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-27a"
+NEED_PIPELINE = "2026-09-28a"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -791,15 +791,15 @@ with st.sidebar:
     st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
     if extract_method == METHODS[0]:
         st.markdown("### 🎚️ 自動採用の厳しさ")
-        _AMV = {2: "標準（F1が最も高い）", 3: "やや厳しめ（おすすめ）", 4: "厳しめ", 5: "高信頼", 6: "最高信頼"}
-        _AMV_P = {2: (60, 44), 3: (64, 42), 4: (68, 30), 5: (75, 17), 6: (82, 6)}
+        _AMV = {2: "標準（devでF1が最も高い）", 3: "やや厳しめ（おすすめ）", 4: "厳しめ", 5: "高信頼", 6: "最高信頼"}
+        _AMV_P = {2: (63, 43), 3: (67, 42), 4: (71, 30), 5: (78, 19), 6: (81, 7)}  # test 272件（2026-09-28、規則の整理の後）
         accept_min_votes = st.select_slider(
             "自動で採用する裏付けの数", options=list(_AMV), value=3, key="accept_min_votes",
             format_func=lambda v: f"{v}以上：{_AMV[v]}",
             help="裏付け＝ほかの独立した候補の作り方（区間内の組・係り受けの組・文型の規則など）が同じ組を出した数。"
-                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約53%）は変わりません。")
+                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約52%）は変わりません。")
         _p, _r = _AMV_P[accept_min_votes]
-        st.caption(f"532件のうち規則づくりに使っていない半分で測った目安：自動採用の適合率 約{_p}%・再現率 約{_r}%／"
+        st.caption(f"532件のうち規則づくりに使っていない半分（test 272件）で測った目安：自動採用の適合率 約{_p}%・再現率 約{_r}%／"
                    "採用＋要確認の再現率 約52%")
         verify_llm = st.checkbox("要確認をLLMに確かめさせる（実験・R63）", value=False, key="verify_llm",
                                  help="要確認の候補（最大30件）について、LLMに「その関係が本文に書かれているか」を はい／いいえ で"
@@ -1364,15 +1364,16 @@ def page_rules():
         eff = RB.EFFECTS.get(r["id"], {})
         rows.append({"番号": r["id"], "段階": r["stage"], "規則": r["name"], "説明": r["desc"], "例": r["example"],
                      "LLM": "使う" if r["llm"] else "―",
-                     "532件での効果（F1差）": ((f"完全一致 {eff['f1_delta']:+.2f}pt／構造 {eff.get('struct_delta', 0):+.2f}pt"
+                     "devでの効果（止めたときの低下）": ((f"完全一致 F1 {eff['f1_delta']:+.2f}pt"
+                                             + (f"／採用＋要確認の再現率 {eff['review_delta']:+.2f}pt" if "review_delta" in eff else "")
                                              + (f"（{eff['note']}）" if eff.get("note") else ""))
                                             if "f1_delta" in eff else
                                             ("LLMが必要（規則だけでは測れない）" if r["llm"] else "未測定")),
                      "状態": "有効" if RB.enabled(r["id"]) else "停止中"})
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=min(700, 38 * (len(rows) + 1)))
-    st.caption("効果＝その規則を入れたときのF1の変化（532件・半導体・LLMなしで、規則を1つずつ止めて測った差）。"
-               "規則をすべて使ったときは 完全一致 F1 42.85%／構造 F1 49.52%（2026-09-25）。半導体の正解データでは"
-               "小さく、マイナスのもの（R11・R21）もあるが、方法の請求項や長い列挙など、他分野の請求項での崩れを防ぐために入れている。")
+    st.caption("効果＝dev（260件・半導体・LLMなし）で、その規則だけを止めたときに下がった量。規則をすべて使ったときは "
+               "完全一致 F1 52.59%／採用＋要確認の再現率 53.81%（2026-09-28）。この測り方で効果が見られなかった9つの規則"
+               "（R03・R21・R22・R30・R32・R34・R35・R47・R52）は、2026-09-28 の整理で削除した（番号は欠番）。")
     st.markdown("#### 規則を足すときの手順")
     st.markdown(
         "1. `rulebook.py`（統合版では patent_pipeline.py の中）の一覧に1行足し、実装した場所をその番号のスイッチで囲む\n"
