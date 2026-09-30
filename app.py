@@ -25,6 +25,7 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
     🫧 技術分布               … 出願年×FIのバブル、出願人×技術のヒートマップ、出願の推移とランキング
   個別ツール
     🐚 2つの請求項を比較 / 🪼 従属請求項を展開
+    🎨 図面で見る             … 請求項の構成要素を、Google Patents から取った公報の図面に色で示す（drawing_tool.py）
   出力
     📤 エクスポート            … Excel／CSV／解析済みデータ（JSON）、人手確認結果の保存と読み込み
 
@@ -50,6 +51,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -70,7 +72,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-28c"
+NEED_PIPELINE = "2026-09-30f"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -109,7 +111,7 @@ SAMPLE_CLAIM = (
 
 for _key, _default in (
     ("reviews", {}), ("workspace", []), ("analysis", None), ("compare_result", None),
-    ("patent_db", None), ("search_results", None), ("dependent_result", None), ("stats_df", None),
+    ("patent_db", None), ("search_results", None), ("dependent_result", None), ("drawing_result", None), ("stats_df", None),
     ("eval_results", None), ("eval_summary", None), ("net_node", None), ("map_patent", None),
     ("review_pid", None), ("dataset", None), ("ingest", None),
 ):
@@ -268,13 +270,13 @@ def duplicate_flags(gpp, info, keys):
             for c in info["cands"]]
 
 
-METHODS = ["最終方式（学習なし）：LLMで構成要素を固定 → GiNZAの規則", "比較用：学習済み選別モデル（実験14）"]
+METHODS = ["最終方式（学習なし）：GiNZAの規則＋LLMで名前を補う・確かめる", "比較用：学習済み選別モデル（実験14）"]
 if "_select_cache" not in st.session_state:
     st.session_state["_select_cache"] = {}
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
-def analyze_llm(text, model, host, accept_min_votes=3, verify=False, fewshot=False):
+def analyze_llm(text, model, host, accept_min_votes=2, verify=False, fewshot=False):
     """最終方式（A2・学習なし）：LLMで構成要素を先に取り出して固定し、GiNZAの規則で関係を取り出す。"""
     gpp = load_pipeline()
     t0 = time.time()
@@ -784,22 +786,14 @@ with st.sidebar:
         ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
     st.markdown("### 🧪 抽出方法")
     extract_method = st.radio("抽出方法", METHODS, key="extract_method", label_visibility="collapsed",
-                              help="最終方式（学習なし）：LLMで構成要素の名前を取り出し、新森らの「名詞まとまり」で境界を確かめ、"
-                                   "GiNZAの解析でその名前を1語に固定してから、GiNZAの規則で関係を取り出す。"
+                              help="最終方式（学習なし）：GiNZAの規則で関係を取り出す。LLMが書き出した部品の名前は、GiNZAが取れなかった名前を"
+                                   "補うときだけ使い（R83）、その名前を含む関係も同じ裏付けの決まりで確かめる。"
                                    "比較用：532件で学習した選別モデル（実験14）。")
     st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
     if extract_method == METHODS[0]:
-        st.markdown("### 🎚️ 自動採用の厳しさ")
-        _AMV = {2: "標準（devでF1が最も高い）", 3: "やや厳しめ（おすすめ）", 4: "厳しめ", 5: "高信頼", 6: "最高信頼"}
-        _AMV_P = {2: (63, 45), 3: (67, 43), 4: (72, 36), 5: (79, 26), 6: (83, 16)}  # test 272件（2026-09-28、R78 まで）
-        accept_min_votes = st.select_slider(
-            "自動で採用する裏付けの数", options=list(_AMV), value=3, key="accept_min_votes",
-            format_func=lambda v: f"{v}以上：{_AMV[v]}",
-            help="裏付け＝ほかの独立した候補の作り方（区間内の組・係り受けの組・文型の規則など）が同じ組を出した数。"
-                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約54%）は変わりません。")
-        _p, _r = _AMV_P[accept_min_votes]
-        st.caption(f"532件のうち規則づくりに使っていない半分（test 272件）で測った目安：自動採用の適合率 約{_p}%・再現率 約{_r}%／"
-                   "採用＋要確認の再現率 約54%")
+        # 自動採用に必要な裏付けの数（R61）は、dev で F1 が最も高い 2 に固定（画面での切り替えはしない）
+        accept_min_votes = 2
+        st.markdown("### 🤖 LLMによる確認（実験）")
         verify_llm = st.checkbox("要確認をLLMに確かめさせる（実験・R63）", value=False, key="verify_llm",
                                  help="要確認の候補（最大30件）について、LLMに「その関係が本文に書かれているか」を はい／いいえ で"
                                       "答えさせ、「はい」を採用にします。LLMは関係を作らず、確かめるだけです。1件あたりLLMの呼び出しが1回増えます。")
@@ -808,7 +802,7 @@ with st.sidebar:
                                        "LLMだけが出した関係は要確認として表に出します。1件あたりLLMの呼び出しが1回増えます"
                                        "（qwen3.5:9b で約1分）。")
     else:
-        accept_min_votes = 3
+        accept_min_votes = 2
         verify_llm = False
         fewshot_llm = False
 
@@ -2132,6 +2126,260 @@ def page_dependent():
 
 
 # ===========================================================================
+# 🎨 図面で見る（請求項の構成要素を公報の図面に色で示す）
+# ===========================================================================
+
+def _drawing_module():
+    try:
+        import drawing_tool
+        return drawing_tool
+    except ImportError as e:
+        st.error(f"図面の機能の部品を読み込めませんでした（{e}）。app.py と同じフォルダに drawing_tool.py を置き、"
+                 "`pip install requests beautifulsoup4 opencv-python-headless` を実行してください。")
+        st.stop()
+
+
+def _drawing_components(pid, include_review):
+    """データの特許の構成要素と色。人手で確定していればその内容、未確定なら採用（＋要確認）の関係から取る。"""
+    p = PATENTS[pid]
+    rv = st.session_state.reviews.get(pid)
+    if rv:
+        rels = [r for r in rv if r.get("keep", True)]
+    else:
+        ok = {PC.STATUS_ACCEPT} | ({PC.STATUS_REVIEW} if include_review else set())
+        rels = [r for r in p.get("relations", []) if r.get("status") in ok]
+    rels = PC.tidy_relations(rels)
+    cols = pp.component_colors(rels)
+    return cols, bool(rv)
+
+
+def _drawing_fetcher(dt):
+    try:
+        return dt.Fetcher(str(APP_DIR / ".drawing_cache"))
+    except OSError:
+        return dt.Fetcher(None)   # アプリのフォルダに書けないとき（Streamlit Cloud など）は一時フォルダ
+
+
+def _drawing_legend_html(res):
+    e = html.escape
+    rows = []
+    for L in res["legend"]:
+        sw = (f"<span style='display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:7px;"
+              f"vertical-align:-1px;background:{L['color']}'></span>" if L["color"] else
+              "<span style='display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:7px;"
+              "vertical-align:-1px;border:1px dashed #9aa0a6'></span>")
+        codes = "、".join(L["codes"]) or "―"
+        names = "、".join(L["names"]) or ("符号の説明に無い" if not L["codes"] else "")
+        basis = L["source"] + ("（請求項に同じ名前）" if L.get("extra") else "")
+        where = "、".join(f.split("：")[0] for f in L["figs"]) if L["figs"] else ("図面で見つからない" if L["codes"] else "")
+        rows.append(f"<tr><td>{sw}{e(L['comp'])}</td><td>{e(codes)}</td><td>{e(names)}</td><td>{e(basis)}</td>"
+                    f"<td>{e(where)}</td></tr>")
+    return ("<table style='border-collapse:collapse;font-size:.9rem;width:100%'>"
+            "<tr style='text-align:left'><th>請求項の構成要素</th><th>符号</th><th>符号の説明の名前</th><th>対応の根拠</th>"
+            "<th>出てくる図</th></tr>" + "".join(rows).replace("<td>", "<td style='border-top:1px solid rgba(148,163,184,.4);"
+                                                                "padding:4px 8px;vertical-align:top'>") + "</table>")
+
+
+def _show_drawing_result(dt, state):
+    res, claim = state["res"], state["claim"]
+    if not res.get("ok"):
+        st.error(res.get("error", "図面を作れませんでした。"))
+        if res.get("tried"):
+            st.caption("試した番号：" + "、".join(res["tried"]))
+        st.info("「公報のファイルを読み込む」を選ぶと、自分で用意した公報の PDF や図面の画像と【符号の説明】で色付けできます。")
+        return
+    d = res["doc"]
+    c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 1.2])
+    if d.get("url"):
+        c1.markdown(f"**公報：[{d['id']}]({d['url']})**　{html.escape(d.get('title') or '')}")
+    else:
+        c1.markdown("**読み込んだファイル**")
+    c2.metric("構成要素と符号の対応", f"{sum(1 for L in res['legend'] if L['codes'])} / {len(res['legend'])}")
+    c3.metric("色を付けた図", f"{sum(1 for f in res['figures'] if f['claim_codes'])} / {len(res['figures'])}")
+    if res.get("sim") is not None:
+        c4.metric("請求項の近さ", f"{res['sim']:.2f}", help="データの請求項と、見つけた公報の請求項の文字の重なり（1 が同じ）。"
+                  "特許公報（B）の請求項は、補正で公開公報（A）と変わっていることがあります。")
+    src = [f"見つけ方：{res['found_by']}"]
+    if res.get("image_doc"):
+        src.append(f"図面：{res['image_doc']}")
+    if res.get("fugo_doc") or res.get("fugo_src"):
+        src.append(f"符号の説明：{res.get('fugo_doc') or ''} {res.get('fugo_src') or ''}".strip())
+    src.append("符号の位置：Google Patents の読み取り" + ("＋OCR" if res.get("ocr") else ""))
+    st.caption("／".join(src))
+    for n in res["notes"]:
+        st.warning(n, icon="📝")
+
+    st.markdown("#### 構成要素と符号の対応")
+    st.markdown(_drawing_legend_html(res), unsafe_allow_html=True)
+    st.caption("枠と塗りの色＝請求項の構成要素（SAO の図・本文のマークと同じ色）。灰色の枠＝請求項に出てこない部品。"
+               "橙の点線の枠＝符号の説明に無い数字。塗りは引き出し線の先の閉じた領域を自動で探したもので、"
+               "部品の一部だけのことや、塗れないこともあります。")
+
+    st.markdown("#### 図面")
+    only = st.checkbox("請求項の構成要素が写っている図だけ表示", value=True, key="dr_only")
+    figs = [f for f in res["figures"] if f["claim_codes"] or not only]
+    if not figs:
+        st.info("請求項の構成要素の符号が見つかった図はありません。上のチェックを外すと、すべての図を表示します。")
+    cols = st.columns(2)
+    for i, f in enumerate(figs):
+        with cols[i % 2]:
+            st.image(f["png"], use_container_width=True,
+                     caption=f"{f['label']}　構成要素の符号：{'、'.join(f['claim_codes']) or 'なし'}")
+
+    if res["unknown"]:
+        st.markdown("#### 図面にあるのに【符号の説明】に無い符号")
+        st.caption("書き漏れの手がかり（明細書の本文には出てくることがあります）。OCR の読み違いのこともあります。")
+        st.dataframe(pd.DataFrame([{"符号": c, "出てくる図": "、".join(x.split("：")[0] for x in u["figs"]),
+                                    "本文での名前": u.get("body_name") or "", "Google の英語ラベル": u.get("label") or ""}
+                                   for c, u in res["unknown"].items()]), hide_index=True, use_container_width=True)
+    if res["others"]:
+        with st.expander(f"請求項に出てこない符号（実施形態だけの部品 {len(res['others'])} 個）"):
+            st.write("、".join(f"{c} {n}" for c, n in res["others"]))
+    fname = f"図面の構成要件_{d.get('id') or 'file'}.html"
+    st.download_button("📥 この結果を HTML で保存（画像込み・1ファイル）", dt.report_html(res, claim, only_claim_figs=only),
+                       file_name=fname, mime="text/html")
+
+
+def page_drawing():
+    st.title("🎨 図面で見る")
+    st.caption("請求項の構成要素（SAO の部品）が、公報の図面のどの部品に当たるかを色で示します。公報は Google Patents から"
+               "自動で探し、図面の画像・【符号の説明】・明細書の本文を読みます（インターネットへの接続が必要です）。")
+    dt = _drawing_module()
+    st.info(dt.NOTE, icon="ℹ️")
+    modes = ["データの特許から選ぶ", "文献番号と請求項を入力する", "公報のファイルを読み込む"]
+    mode = st.radio("請求項の選び方", modes, horizontal=True, index=0 if DATA else 1, key="dr_mode")
+    o1, o2, o3 = st.columns(3)
+    fill = o1.checkbox("部品の領域を塗る", value=True, key="dr_fill",
+                       help="引き出し線をたどって、先にある閉じた領域を塗ります。外すと符号を枠で囲むだけになります。")
+    has_ocr = dt.ocr_available()
+    use_ocr = o2.checkbox("図面の文字を OCR で読む", value=has_ocr, disabled=not has_ocr, key="dr_ocr",
+                          help="Google Patents が読み取っていない符号（30a のような英字つきなど）も探します。1図に数秒かかります。"
+                          if has_ocr else "Tesseract（OCR）が入っていないので使えません。入れ方はページの下にあります。")
+    include_review = o3.checkbox("要確認の関係の部品も含める", value=True, key="dr_review",
+                                 help="人手で確定していない特許では、採用の関係に加えて要確認の関係の部品も色付けします。")
+
+    claim, comps, colors, pid, title, applicant = "", [], {}, "", "", ""
+    if mode == modes[0]:
+        if not DATA or not DATA.get("patents"):
+            st.warning("データがありません。「データの読み込み」ページで特許リストを読み込むか、ほかの選び方を使ってください。")
+            return
+        ids = [p["id"] for p in DATA["patents"] if p.get("text") and p.get("relations")]
+        if not ids:
+            st.warning("解析済みの請求項がある特許がありません。")
+            return
+        pid = st.selectbox("特許", ids, format_func=patent_label, key="dr_pid")
+        p = PATENTS[pid]
+        cols, reviewed = _drawing_components(pid, include_review)
+        claim, title, applicant = p["text"], p.get("title") or "", p.get("applicant") or p.get("company") or ""
+        comps, colors = list(cols), {k: v["border"] for k, v in cols.items()}
+        st.caption(("人手で確定した関係" if reviewed else "AI の判定（採用" + ("＋要確認" if include_review else "") + "）")
+                   + f"の構成要素 {len(comps)} 個を使います。")
+        with st.expander("請求項（構成要素を色でマーク）", expanded=False):
+            st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(claim, cols)}</div>",
+                        unsafe_allow_html=True)
+    elif mode == modes[1]:
+        c1, c2 = st.columns([1, 2])
+        pid = c1.text_input("文献番号", placeholder="例：特開2022-144957／特許7800720／WO2024/084656", key="dr_pid_in")
+        title = c1.text_input("発明の名称（番号で見つからないときの検索用・任意）", key="dr_title_in")
+        applicant = c1.text_input("出願人（任意）", key="dr_app_in")
+        claim = c2.text_area("請求項の本文", height=220, key="dr_claim_in")
+    else:
+        _drawing_local(dt, fill, use_ocr, include_review)
+        return
+
+    if st.button("🎨 公報を探して図面に色を付ける", type="primary", disabled=not (pid and claim.strip()), key="dr_go"):
+        try:
+            if mode == modes[1]:
+                with st.spinner("請求項を解析しています…"):
+                    _, rels = llm_extract(claim)
+                cols = pp.component_colors(PC.tidy_relations(rels))
+                comps, colors = list(cols), {k: v["border"] for k, v in cols.items()}
+            bar = st.progress(0.0, text="公報を探しています…")
+
+            def prog(msg, frac=None):
+                bar.progress(min(1.0, max(0.0, frac or 0.0)), text=msg)
+
+            res = dt.build(_drawing_fetcher(dt), pid, claim, comps, colors, title=title, applicant=applicant,
+                           use_ocr=use_ocr, fill=fill, progress=prog)
+            bar.empty()
+            st.session_state.drawing_result = {"res": res, "claim": claim, "key": (mode, pid)}
+        except dt.FetchError as e:
+            st.error(str(e))
+            st.session_state.drawing_result = None
+        except Exception as e:  # noqa: BLE001
+            st.error(f"図面の処理中にエラーが発生しました：{e}")
+            st.session_state.drawing_result = None
+    state = st.session_state.get("drawing_result")
+    if state and state.get("key") == (mode, pid):
+        _show_drawing_result(dt, state)
+    _drawing_help(dt)
+
+
+def _drawing_local(dt, fill, use_ocr, include_review):
+    """公報を自分で用意したとき：PDF か図面の画像＋【符号の説明】を貼り付ける。"""
+    st.caption("自動で見つからない公報は、J-PlatPat などから公報の PDF（または図面の画像）を保存して読み込みます。"
+               "符号の位置は OCR で読むので、Tesseract が必要です。")
+    files = st.file_uploader("公報の PDF または図面の画像（複数可）", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
+                             accept_multiple_files=True, key="dr_files")
+    c1, c2 = st.columns(2)
+    fugo_text = c1.text_area("【符号の説明】（明細書からコピーして貼り付け）", height=200, key="dr_fugo",
+                             placeholder="１、１０１  半導体装置\n５  電力変換装置\n３０ａ  第１ヘッダ …")
+    opts = ["（貼り付ける）"] + ([p["id"] for p in DATA["patents"] if p.get("text")] if DATA else [])
+    src = c2.selectbox("請求項", opts, format_func=lambda x: x if x == opts[0] else patent_label(x), key="dr_local_pid")
+    claim = c2.text_area("請求項の本文", value=PATENTS[src]["text"] if src in PATENTS else "", height=140,
+                         key=f"dr_local_claim_{src}")
+    if st.button("🎨 図面に色を付ける", type="primary", disabled=not (files and claim.strip()), key="dr_go_local"):
+        try:
+            if src in PATENTS:
+                cols, _ = _drawing_components(src, include_review)
+            else:
+                with st.spinner("請求項を解析しています…"):
+                    _, rels = llm_extract(claim)
+                cols = pp.component_colors(PC.tidy_relations(rels))
+            tmp = Path(tempfile.mkdtemp())
+            pages = []
+            for f in files:
+                path = tmp / f.name
+                path.write_bytes(f.getvalue())
+                if f.name.lower().endswith(".pdf"):
+                    pages += [q for q in dt.pdf_to_images(str(path)) if dt.looks_like_drawing(q)]
+                else:
+                    pages.append(str(path))
+            bar = st.progress(0.0, text="図面に色を付けています…")
+            res = dt.build_local(pages, claim, list(cols), fugo_text, {k: v["border"] for k, v in cols.items()},
+                                 use_ocr=use_ocr, fill=fill,
+                                 progress=lambda m, fr=None: bar.progress(min(1.0, fr or 0.0), text=m))
+            bar.empty()
+            if not res["fugo"]:
+                st.warning("【符号の説明】を読み取れませんでした。「１０  冷却器」のように、符号と名前を並べて貼り付けてください。")
+            st.session_state.drawing_result = {"res": res, "claim": claim, "key": ("local", src)}
+        except Exception as e:  # noqa: BLE001
+            st.error(f"図面の処理中にエラーが発生しました：{e}")
+            st.session_state.drawing_result = None
+    state = st.session_state.get("drawing_result")
+    if state and state.get("key") == ("local", src):
+        _show_drawing_result(dt, state)
+    _drawing_help(dt)
+
+
+def _drawing_help(dt):
+    with st.expander("しくみと注意"):
+        st.markdown(
+            "- **公報の探し方**：文献番号（特開・特表・特許・再表・WO）を Google Patents の番号に変えて開きます。"
+            "見つからないときは、発明の名称と出願人で検索し、請求項の本文がいちばん近い公報を選びます。\n"
+            "- **図面や符号の説明が無い公報**（新しい特許公報など）は、ファミリーの公報（再表・WO など）のものを使います。"
+            "番号の付け方は同じ出願なら同じです。\n"
+            "- **構成要素と符号の対応**：構成要素の名前と【符号の説明】の名前を比べます。「多穴管」は「第1多穴管」「第2多穴管」に"
+            "当たるとし、「第1ヘッダ」と「第2ヘッダ」は別の部品とします。符号の説明に無いときは、明細書の本文の「管１１２」の"
+            "ような書き方から補います。\n"
+            "- **符号の位置**：Google Patents が図面から読み取った数字の位置を使い、OCR（Tesseract）が入っていれば、"
+            "英字つきの符号（30a など）も読みます。\n"
+            "- 取得した公報と図面は、アプリのフォルダの `.drawing_cache` に保存し、2回目からはすぐに表示します。\n"
+            "- **OCR（Tesseract）の入れ方（Windows）**：https://github.com/UB-Mannheim/tesseract/wiki から"
+            "インストーラーを入れ、`pip install pytesseract` を実行します（標準の場所に入れれば自動で見つけます）。")
+
+
+# ===========================================================================
 # 📤 エクスポート
 # ===========================================================================
 
@@ -2219,7 +2467,8 @@ nav = st.navigation({
                    st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution"),
                    st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
     "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
-                st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
+                st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent"),
+                st.Page(page_drawing, title="図面で見る", icon="🎨", url_path="drawing")],
     "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export"),
             st.Page(page_rules, title="規則の一覧", icon="📏", url_path="rules")],
     "ヘルプ": [st.Page(page_llm_setup, title="ローカルLLMの準備", icon="🛠️", url_path="setup")],
