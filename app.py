@@ -2209,7 +2209,7 @@ def page_dependent():
 
 
 # ===========================================================================
-# 🎨 図面で見る（請求項の構成要素を公報の図面に色で示す）
+# 🎨 図面で見る（公報の図面の符号を部品の名前に置きかえる）
 # ===========================================================================
 
 def _drawing_module():
@@ -2247,15 +2247,12 @@ def _drawing_legend_html(res):
     e = html.escape
     rows = []
     for L in res["legend"]:
-        sw = (f"<span style='display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:7px;"
-              f"vertical-align:-1px;background:{L['color']}'></span>" if L["color"] else
-              "<span style='display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:7px;"
-              "vertical-align:-1px;border:1px dashed #9aa0a6'></span>")
+        sw = ""
         codes = "、".join(L["codes"]) or "―"
         names = "、".join(L["names"]) or ("符号の説明に無い" if not L["codes"] else "")
         basis = L["source"] + ("（請求項に同じ名前）" if L.get("extra") else "")
         where = "、".join(f.split("：")[0] for f in L["figs"]) if L["figs"] else ("図面で見つからない" if L["codes"] else "")
-        rows.append(f"<tr><td>{sw}{e(L['comp'])}</td><td>{e(codes)}</td><td>{e(names)}</td><td>{e(basis)}</td>"
+        rows.append(f"<tr><td>{sw}<b>{e(L['comp'])}</b></td><td>{e(codes)}</td><td>{e(names)}</td><td>{e(basis)}</td>"
                     f"<td>{e(where)}</td></tr>")
     return ("<table style='border-collapse:collapse;font-size:.9rem;width:100%'>"
             "<tr style='text-align:left'><th>請求項の構成要素</th><th>符号</th><th>符号の説明の名前</th><th>対応の根拠</th>"
@@ -2269,7 +2266,7 @@ def _show_drawing_result(dt, state):
         st.error(res.get("error", "図面を作れませんでした。"))
         if res.get("tried"):
             st.caption("試した番号：" + "、".join(res["tried"]))
-        st.info("「公報のファイルを読み込む」を選ぶと、自分で用意した公報の PDF や図面の画像と【符号の説明】で色付けできます。")
+        st.info("「公報のファイルを読み込む」を選ぶと、自分で用意した公報の PDF や図面の画像と【符号の説明】で、符号を名前に置きかえられます。")
         return
     d = res["doc"]
     c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 1.2])
@@ -2278,7 +2275,7 @@ def _show_drawing_result(dt, state):
     else:
         c1.markdown("**読み込んだファイル**")
     c2.metric("構成要素と符号の対応", f"{sum(1 for L in res['legend'] if L['codes'])} / {len(res['legend'])}")
-    c3.metric("色を付けた図", f"{sum(1 for f in res['figures'] if f['claim_codes'])} / {len(res['figures'])}")
+    c3.metric("構成要素が写っている図", f"{sum(1 for f in res['figures'] if f['claim_codes'])} / {len(res['figures'])}")
     if res.get("sim") is not None:
         c4.metric("請求項の近さ", f"{res['sim']:.2f}", help="データの請求項と、見つけた公報の請求項の文字の重なり（1 が同じ）。"
                   "特許公報（B）の請求項は、補正で公開公報（A）と変わっていることがあります。")
@@ -2294,9 +2291,8 @@ def _show_drawing_result(dt, state):
 
     st.markdown("#### 構成要素と符号の対応")
     st.markdown(_drawing_legend_html(res), unsafe_allow_html=True)
-    st.caption("枠と塗りの色＝請求項の構成要素（SAO の図・本文のマークと同じ色）。灰色の枠＝請求項に出てこない部品。"
-               "橙の点線の枠＝符号の説明に無い数字。塗りは引き出し線の先の閉じた領域を自動で探したもので、"
-               "部品の一部だけのことや、塗れないこともあります。")
+    st.caption("図面の符号の数字を、【符号の説明】（無いときは明細書の本文）の名前に置きかえています。"
+               "太字＋下線＝請求項の構成要素に当たる部品。名前が分からない符号は、数字のまま残しています。")
 
     st.markdown("#### 図面")
     only = st.checkbox("請求項の構成要素が写っている図だけ表示", value=True, key="dr_only")
@@ -2325,21 +2321,22 @@ def _show_drawing_result(dt, state):
 
 def page_drawing():
     st.title("🎨 図面で見る")
-    st.caption("請求項の構成要素（SAO の部品）が、公報の図面のどの部品に当たるかを色で示します。公報は Google Patents から"
-               "自動で探し、図面の画像・【符号の説明】・明細書の本文を読みます（インターネットへの接続が必要です）。")
+    st.caption("公報の図面の符号（数字）を、部品の名前に置きかえて表示します。請求項の構成要素に当たる部品は太字にします。"
+               "公報は Google Patents から自動で探し、図面の画像・【符号の説明】・明細書の本文を読みます（インターネットへの接続が必要です）。")
     dt = _drawing_module()
     st.info(dt.NOTE, icon="ℹ️")
     modes = ["データの特許から選ぶ", "文献番号と請求項を入力する", "公報のファイルを読み込む"]
     mode = st.radio("請求項の選び方", modes, horizontal=True, index=0 if DATA else 1, key="dr_mode")
     o1, o2, o3 = st.columns(3)
-    fill = o1.checkbox("部品の領域を塗る", value=True, key="dr_fill",
-                       help="引き出し線をたどって、先にある閉じた領域を塗ります。外すと符号を枠で囲むだけになります。")
+    only_claim = o1.checkbox("請求項の構成要素だけ名前にする", value=False, key="dr_only_claim",
+                             help="チェックすると、請求項に出てくる部品の符号だけを名前に置きかえ、ほかの符号は数字のまま残します。")
+    fill = False
     has_ocr = dt.ocr_available()
     use_ocr = o2.checkbox("図面の文字を OCR で読む", value=has_ocr, disabled=not has_ocr, key="dr_ocr",
                           help="Google Patents が読み取っていない符号（30a のような英字つきなど）も探します。1図に数秒かかります。"
                           if has_ocr else "Tesseract（OCR）が入っていないので使えません。入れ方はページの下にあります。")
     include_review = o3.checkbox("要確認の関係の部品も含める", value=True, key="dr_review",
-                                 help="人手で確定していない特許では、採用の関係に加えて要確認の関係の部品も色付けします。")
+                                 help="人手で確定していない特許では、採用の関係に加えて要確認の関係の部品も、請求項の構成要素として太字にします。")
 
     claim, comps, colors, pid, title, applicant = "", [], {}, "", "", ""
     if mode == modes[0]:
@@ -2367,10 +2364,10 @@ def page_drawing():
         applicant = c1.text_input("出願人（任意）", key="dr_app_in")
         claim = c2.text_area("請求項の本文", height=220, key="dr_claim_in")
     else:
-        _drawing_local(dt, fill, use_ocr, include_review)
+        _drawing_local(dt, fill, use_ocr, include_review, only_claim)
         return
 
-    if st.button("🎨 公報を探して図面に色を付ける", type="primary", disabled=not (pid and claim.strip()), key="dr_go"):
+    if st.button("🎨 公報を探して図面の符号を名前にする", type="primary", disabled=not (pid and claim.strip()), key="dr_go"):
         try:
             if mode == modes[1]:
                 with st.spinner("請求項を解析しています…"):
@@ -2383,7 +2380,7 @@ def page_drawing():
                 bar.progress(min(1.0, max(0.0, frac or 0.0)), text=msg)
 
             res = dt.build(_drawing_fetcher(dt), pid, claim, comps, colors, title=title, applicant=applicant,
-                           use_ocr=use_ocr, fill=fill, progress=prog)
+                           use_ocr=use_ocr, fill=fill, progress=prog, style="names", only_claim=only_claim)
             bar.empty()
             st.session_state.drawing_result = {"res": res, "claim": claim, "key": (mode, pid)}
         except dt.FetchError as e:
@@ -2402,7 +2399,7 @@ def page_drawing():
     _drawing_help(dt)
 
 
-def _drawing_local(dt, fill, use_ocr, include_review):
+def _drawing_local(dt, fill, use_ocr, include_review, only_claim=False):
     """公報を自分で用意したとき：PDF か図面の画像＋【符号の説明】を貼り付ける。"""
     st.caption("自動で見つからない公報は、J-PlatPat などから公報の PDF（または図面の画像）を保存して読み込みます。"
                "符号の位置は OCR で読むので、Tesseract が必要です。")
@@ -2415,7 +2412,7 @@ def _drawing_local(dt, fill, use_ocr, include_review):
     src = c2.selectbox("請求項", opts, format_func=lambda x: x if x == opts[0] else patent_label(x), key="dr_local_pid")
     claim = c2.text_area("請求項の本文", value=PATENTS[src]["text"] if src in PATENTS else "", height=140,
                          key=f"dr_local_claim_{src}")
-    if st.button("🎨 図面に色を付ける", type="primary", disabled=not (files and claim.strip()), key="dr_go_local"):
+    if st.button("🎨 図面の符号を名前にする", type="primary", disabled=not (files and claim.strip()), key="dr_go_local"):
         try:
             if src in PATENTS:
                 cols, _ = _drawing_components(src, include_review)
@@ -2432,9 +2429,9 @@ def _drawing_local(dt, fill, use_ocr, include_review):
                     pages += [q for q in dt.pdf_to_images(str(path)) if dt.looks_like_drawing(q)]
                 else:
                     pages.append(str(path))
-            bar = st.progress(0.0, text="図面に色を付けています…")
+            bar = st.progress(0.0, text="図面の符号を名前にしています…")
             res = dt.build_local(pages, claim, list(cols), fugo_text, {k: v["border"] for k, v in cols.items()},
-                                 use_ocr=use_ocr, fill=fill,
+                                 use_ocr=use_ocr, fill=fill, style="names", only_claim=only_claim,
                                  progress=lambda m, fr=None: bar.progress(min(1.0, fr or 0.0), text=m))
             bar.empty()
             if not res["fugo"]:

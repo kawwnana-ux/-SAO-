@@ -659,6 +659,27 @@ def ocr_numerals(path):
         if area > 0 and ring.sum() / area > 0.18:
             continue
         keep.append(t)
+    # 「30ap1」を「30ap」と「1」のように2つに分けて読んだものは、すぐ隣にあれば1つにつなぐ
+    keep.sort(key=lambda t: (t["box"][1], t["box"][0]))
+    merged = True
+    while merged:
+        merged = False
+        for a in keep:
+            for b in keep:
+                if a is b:
+                    continue
+                ah = a["box"][3] - a["box"][1]
+                gap = b["box"][0] - a["box"][2]
+                same_row = abs((a["box"][1] + a["box"][3]) / 2 - (b["box"][1] + b["box"][3]) / 2) < 0.35 * ah
+                txt = a["text"] + b["text"]
+                if same_row and -2 <= gap < 0.45 * ah and re.fullmatch(CODE, txt):
+                    a["box"] = (a["box"][0], min(a["box"][1], b["box"][1]), b["box"][2], max(a["box"][3], b["box"][3]))
+                    a["text"], a["conf"] = txt, min(a["conf"], b["conf"])
+                    keep.remove(b)
+                    merged = True
+                    break
+            if merged:
+                break
     # 「112」の一部だけを「12」と読んだもののように、ほかの読みの枠の中にある短い読みは捨てる
     def inside(a, b):
         return a["box"][0] >= b["box"][0] - 3 and a["box"][2] <= b["box"][2] + 3 and \
@@ -1046,6 +1067,106 @@ def render(path, hits, code_colors, fill=True, no_fill=(), unknown=()):
     return out, filled
 
 
+# =============================================================== 符号を名前に置きかえて描く
+FONT_PATHS = ["C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/msgothic.ttc",
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+              "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+              "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "/Library/Fonts/Arial Unicode.ttf"]
+_FONT_CACHE = {}
+
+
+def japanese_font_path():
+    for f in FONT_PATHS:
+        if os.path.exists(f):
+            return f
+    return None
+
+
+def _font(size):
+    from PIL import ImageFont
+    key = int(size)
+    if key not in _FONT_CACHE:
+        f = japanese_font_path()
+        _FONT_CACHE[key] = ImageFont.truetype(f, key) if f else ImageFont.load_default()
+    return _FONT_CACHE[key]
+
+
+def _leader_side(ink, box):
+    """符号のどちら側から引き出し線が出ているか（左・右・上・下のうち、すぐ外に黒い画素が多い側）。"""
+    h, w = ink.shape
+    x0, y0, x1, y1 = [int(v) for v in box]
+    band = 10
+    sides = {
+        "left": ink[max(0, y0 - 4):min(h, y1 + 4), max(0, x0 - band):max(0, x0 - 2)].sum(),
+        "right": ink[max(0, y0 - 4):min(h, y1 + 4), min(w, x1 + 2):min(w, x1 + band)].sum(),
+        "top": ink[max(0, y0 - band):max(0, y0 - 2), max(0, x0 - 4):min(w, x1 + 4)].sum(),
+        "bottom": ink[min(h, y1 + 2):min(h, y1 + band), max(0, x0 - 4):min(w, x1 + 4)].sum(),
+    }
+    side = max(sides, key=sides.get)
+    return side if sides[side] > 0 else "none"
+
+
+def render_names(path, hits, names, bold_codes=(), keep_unknown=True):
+    """図面の符号の数字を消し、その場所に部品の名前を書く。名前が分からない符号は数字のまま残す。
+    bold_codes（請求項の構成要素に当たる符号）は太字にする。色は使わない。"""
+    base = Image.open(path).convert("RGB")
+    ink = np.array(base.convert("L")) < 140
+    W, H = base.size
+    draw = ImageDraw.Draw(base)
+    placed, done = [], []
+    for hct in sorted(hits, key=lambda z: (z["box"][1], z["box"][0])):
+        code = hct["code"]
+        name = names.get(code)
+        if not name:
+            continue
+        x0, y0, x1, y1 = [int(v) for v in hct["box"]]
+        hgt = max(12, y1 - y0)
+        size = int(hgt * 1.0)
+        font = _font(size)
+        tw = draw.textlength(name, font=font)
+        maxw = W * 0.28
+        if tw > maxw:                                   # 長い名前は字を小さくする
+            size = max(10, int(size * maxw / tw))
+            font = _font(size)
+            tw = draw.textlength(name, font=font)
+        th = size * 1.15
+        side = _leader_side(ink, (x0, y0, x1, y1))
+        cy = (y0 + y1) / 2
+        # 引き出し線と反対の向きへ名前をのばす（線が左から来ていれば右へ、右から来ていれば左へ）
+        if side == "left":
+            lx = x0
+        elif side == "right":
+            lx = x1 - tw
+        else:
+            lx = (x0 + x1) / 2 - tw / 2
+        ly = cy - th / 2
+        if side == "top":
+            ly = y0
+        elif side == "bottom":
+            ly = y1 - th
+        lx = min(max(2, lx), W - tw - 2)
+        ly = min(max(2, ly), H - th - 2)
+        # ほかの名前と重なるときは、上下に少しずらす
+        for k in (0, 1, -1, 2, -2, 3, -3):
+            ry = ly + k * (th + 3)
+            rect = (lx - 3, ry - 2, lx + tw + 3, ry + th + 2)
+            if 0 <= rect[1] and rect[3] <= H and not any(
+                    not (rect[2] < r[0] or r[2] < rect[0] or rect[3] < r[1] or r[3] < rect[1]) for r in placed):
+                ly = ry
+                break
+        # もとの数字を消して、白い下地の上に名前を書く
+        draw.rectangle((x0 - 3, y0 - 3, x1 + 3, y1 + 3), fill=(255, 255, 255))
+        rect = (lx - 3, ly - 2, lx + tw + 3, ly + th + 2)
+        draw.rectangle(rect, fill=(255, 255, 255))
+        bold = code in bold_codes
+        draw.text((lx, ly), name, font=font, fill=(0, 0, 0), stroke_width=1 if bold else 0, stroke_fill=(0, 0, 0))
+        if bold:
+            draw.line((lx, ly + th + 1, lx + tw, ly + th + 1), fill=(0, 0, 0), width=max(2, size // 12))
+        placed.append(rect)
+        done.append(code)
+    return base, done
+
+
 def png_bytes(img):
     b = io.BytesIO()
     img.save(b, "PNG", optimize=True)
@@ -1134,7 +1255,7 @@ def link_components(comps, fugo, body):
 
 # =============================================================== まとめて実行
 def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", use_ocr=True, fill=True,
-          progress=None, max_figures=40, fugo_override=None):
+          progress=None, max_figures=40, fugo_override=None, style="names", only_claim=False):
     """文献番号と請求項（と構成要素の名前・色）から、色を付けた図面と対応表を作る。"""
     log = progress or (lambda *a, **k: None)
     log("公報を探しています…", 0.05)
@@ -1204,6 +1325,8 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
         return {"ok": False, "error": "図面の画像が見つかりませんでした。", "doc": doc, "tried": found["tried"],
                 "legend": legend, "fugo": fugo}
 
+    if style == "names" and not japanese_font_path():
+        notes.append("日本語のフォントが見つからないので、名前が正しく表示されないことがあります。")
     ocr = use_ocr and ocr_available()
     if use_ocr and not ocr:
         notes.append("OCR（Tesseract）が入っていないので、Google Patents が読み取った符号の位置だけを使いました。"
@@ -1225,6 +1348,12 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
                     return not (a[2] < b[0] - 5 or b[2] < a[0] - 5 or a[3] < b[1] - 5 or b[3] < a[1] - 5)
                 dup = [h for h in hits if _over(h["box"], box)]
                 if dup:
+                    # Google が「30ap1」の最後の「1」だけを符号として読んでいることがある。OCR の方が長く、
+                    # Google の符号を含んでいれば、OCR の読みを使う
+                    t_code = code or (t["text"] if re.fullmatch(CODE, t["text"]) else None)
+                    for h in dup:
+                        if t_code and h["src"] == "google" and len(t_code) > len(h["code"]) and h["code"] in t_code:
+                            h["code"], h["box"], h["src"] = t_code, box, "ocr"
                     # Google の枠は矢印まで含んで大きいことがあるので、同じ符号なら OCR の小さい枠に置きかえる
                     for h in dup:
                         if code and h["code"] == code and (box[2] - box[0]) * (box[3] - box[1]) < \
@@ -1238,7 +1367,13 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
                 elif re.fullmatch(r"[0-9]{1,4}[a-z]?", t["text"]) and t["conf"] >= 85:
                     unknown.setdefault(t["text"], {"figs": [], "label": ""})["figs"].append(pg["label"])
                     hits.append({"code": t["text"], "box": box, "src": "ocr"})
-        img, filled = render(pg["path"], hits, code_colors, fill=fill, no_fill=no_fill, unknown=set(unknown))
+        if style == "names":
+            nm = {**body, **fugo}
+            if only_claim:
+                nm = {c: n for c, n in nm.items() if c in code_colors}
+            img, filled = render_names(pg["path"], hits, nm, bold_codes=set(code_colors))
+        else:
+            img, filled = render(pg["path"], hits, code_colors, fill=fill, no_fill=no_fill, unknown=set(unknown))
         codes = sorted({h["code"] for h in hits}, key=lambda z: (len(z), z))
         claim_codes = [c for c in codes if c in code_colors]
         for row in legend:
@@ -1260,7 +1395,8 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
             "notes": notes, "ocr": ocr, "tried": found["tried"]}
 
 
-def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=True, fill=True, progress=None):
+def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=True, fill=True, progress=None,
+                style="names", only_claim=False):
     """公報を自分で用意したとき（PDF・図面の画像＋貼り付けた符号の説明）。"""
     log = progress or (lambda *a, **k: None)
     fugo = parse_fugo_text(fugo_text) if fugo_text else {}
@@ -1291,7 +1427,11 @@ def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=
                 elif re.fullmatch(r"[0-9]{1,4}[a-z]?", t["text"]) and t["conf"] >= 85:
                     unknown.setdefault(t["text"], {"figs": [], "label": "", "body_name": ""})["figs"].append(label)
                     hits.append({"code": t["text"], "box": t["box"], "src": "ocr"})
-        img, filled = render(p, hits, code_colors, fill=fill, no_fill=no_fill, unknown=set(unknown))
+        if style == "names":
+            nm = {c: n for c, n in fugo.items() if c in code_colors} if only_claim else fugo
+            img, filled = render_names(p, hits, nm, bold_codes=set(code_colors))
+        else:
+            img, filled = render(p, hits, code_colors, fill=fill, no_fill=no_fill, unknown=set(unknown))
         codes = sorted({h["code"] for h in hits}, key=lambda z: (len(z), z))
         claim_codes = [c for c in codes if c in code_colors]
         for row in legend:
@@ -1312,7 +1452,7 @@ def report_html(res, claim="", only_claim_figs=True):
     e = _html.escape
     rows = []
     for L in res["legend"]:
-        sw = (f'<span class="sw" style="background:{L["color"]}"></span>' if L["color"] else '<span class="sw none"></span>')
+        sw = ""
         codes = "、".join(L["codes"]) or "―"
         names = "、".join(L["names"])
         src = L["source"] + ("（請求項に同じ名前）" if L.get("extra") else "")
@@ -1338,7 +1478,7 @@ figure{{margin:18px 0}}img{{max-width:100%;border:1px solid #ccd2da}}.note{{colo
 .claim{{white-space:pre-wrap;border:1px solid #ccd2da;border-radius:6px;padding:10px;font-size:14px}}</style>
 <h1>{e(title)}：構成要件と図面の対応</h1>
 <p>公報：{src}　図面：{e(res.get("image_doc") or "")}　符号の説明：{e(res.get("fugo_doc") or res.get("fugo_src") or "")}</p>
-<p class="note">色つきの枠と塗り＝請求項の構成要素に当たる部品。灰色の枠＝請求項には出てこない部品（実施形態だけの部品）。{e(NOTE)}</p>
+<p class="note">図面の符号の数字を、部品の名前に置きかえています。太字＋下線＝請求項の構成要素に当たる部品。名前が分からない符号は数字のまま。{e(NOTE)}</p>
 {('<ul class="note">' + notes + '</ul>') if notes else ''}
 {('<div class="claim">' + e(claim) + '</div>') if claim else ''}
 <table><tr><th>請求項の構成要素</th><th>符号</th><th>符号の説明の名前</th><th>対応の根拠</th><th>図面</th></tr>{''.join(rows)}</table>
