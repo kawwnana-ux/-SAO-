@@ -288,6 +288,114 @@ class Fetcher:
 
 
 # =============================================================== 公報のページを読む
+# =============================================================== HTML を読む（標準ライブラリだけ・bs4 は使わない）
+from html.parser import HTMLParser as _HTMLParser
+
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+
+class _Node:
+    """HTML の要素（BeautifulSoup の find / find_all / get_text と同じ使い方ができる小さな木）。"""
+
+    def __init__(self, tag, attrs=None, parent=None):
+        self.name, self.attrs, self.parent, self.children = tag, dict(attrs or {}), parent, []
+
+    def get(self, k, default=None):
+        return self.attrs.get(k, default)
+
+    def __getitem__(self, k):
+        return self.attrs[k]
+
+    def _match(self, tag, attrs, class_):
+        if tag and self.name != tag:
+            return False
+        for k, v in (attrs or {}).items():
+            if self.attrs.get(k) != v:
+                return False
+        if class_ and class_ not in (self.attrs.get("class") or "").split():
+            return False
+        return True
+
+    def _iter(self):
+        for c in self.children:
+            if isinstance(c, _Node):
+                yield c
+                yield from c._iter()
+
+    def find_all(self, tag=None, attrs=None, class_=None):
+        return [n for n in self._iter() if n._match(tag, attrs, class_)]
+
+    def find(self, tag=None, attrs=None, class_=None):
+        for n in self._iter():
+            if n._match(tag, attrs, class_):
+                return n
+        return None
+
+    def select(self, sel):
+        tag, _, cls = sel.partition(".")
+        return self.find_all(tag or None, class_=cls or None)
+
+    def find_parent(self, tag=None, class_=None):
+        p = self.parent
+        while p is not None:
+            if p._match(tag, None, class_):
+                return p
+            p = p.parent
+        return None
+
+    def _texts(self):
+        for c in self.children:
+            if isinstance(c, str):
+                yield c
+            elif c.name == "br":
+                yield "\n"
+            else:
+                yield from c._texts()
+
+    def get_text(self, sep="", strip=False):
+        ts = list(self._texts())
+        if strip:
+            ts = [t.strip() for t in ts if t.strip()]
+        return sep.join(ts)
+
+    @property
+    def title(self):
+        return self.find("title")
+
+
+class _TreeBuilder(_HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _Node("[document]")
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        n = _Node(tag, [(k, v if v is not None else "") for k, v in attrs], self.stack[-1])
+        self.stack[-1].children.append(n)
+        if tag not in _VOID:
+            self.stack.append(n)
+
+    def handle_startendtag(self, tag, attrs):
+        n = _Node(tag, [(k, v if v is not None else "") for k, v in attrs], self.stack[-1])
+        self.stack[-1].children.append(n)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].name == tag:
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+def _parse_html(page):
+    b = _TreeBuilder()
+    b.feed(page)
+    b.close()
+    return b.root
+
+
 def _meta(el, prop):
     m = el.find("meta", attrs={"itemprop": prop})
     return m.get("content") if m else None
@@ -295,8 +403,7 @@ def _meta(el, prop):
 
 def parse_patent_html(page, gid=""):
     """Google Patents の公報ページ（HTML）から、名称・請求項・符号の説明・図面・ファミリーを取り出す。"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(page, "html.parser")
+    soup = _parse_html(page)
     doc = {"id": gid, "url": f"{GOOGLE}/patent/{gid}/ja" if gid else "", "title": "", "claims": [],
            "fugo": {}, "fugo_src": "", "body_signs": {}, "images": [], "figrefs": [], "family": [], "pdf": ""}
     t = soup.find("meta", attrs={"name": "DC.title"})
@@ -317,8 +424,6 @@ def parse_patent_html(page, gid=""):
     # 明細書
     ds = soup.find("section", attrs={"itemprop": "description"})
     if ds:
-        for br in ds.find_all("br"):
-            br.replace_with("\n")
         rsl = ds.find("reference-signs-list")
         if rsl is not None:
             tab, _, _ = parse_sign_list(rsl.get_text("\n"), min_items=1)
@@ -728,8 +833,157 @@ def _leader_end_isolated(ink, box, pad=16, win=700):
     return (ex, ey), (vx / nn, vy / nn)
 
 
+def _arc_runs(ink, p, v, r, span=75, step=5):
+    """点 p から向き v のまわり ±span 度・半径 r の弧の上で、黒い画素がある角度のまとまりを返す。"""
+    h, w = ink.shape
+    base = np.arctan2(v[1], v[0])
+    hits = []
+    for a in range(-span, span + 1, step):
+        t = base + np.radians(a)
+        x, y = p[0] + r * np.cos(t), p[1] + r * np.sin(t)
+        xi, yi = int(round(x)), int(round(y))
+        on = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                yy, xx = yi + dy, xi + dx
+                if 0 <= yy < h and 0 <= xx < w and ink[yy, xx]:
+                    on = True
+        hits.append((a, on))
+    runs, cur = [], []
+    for a, on in hits:
+        if on:
+            cur.append(a)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _walk_leader(ink, box, max_len=3000):
+    """引き出し線を、符号の近くから曲がりに沿ってたどる。線が途中でほかの線と交わるときは乗り越え、
+    部品の線に当たって終わるときは、その線の向こう側の点を返す。
+    返り値：(塗り始める点, 向き) または None"""
+    h, w = ink.shape
+    x0, y0, x1, y1 = [int(v) for v in box]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    # 符号の枠のすぐ外（3〜18px の帯）にある黒い画素のかたまりを、線の出だしの候補にする
+    pad = 18
+    X0, Y0, X1, Y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    band = ink[Y0:Y1, X0:X1].copy()
+    band[max(0, y0 - 3 - Y0):y1 + 3 - Y0, max(0, x0 - 3 - X0):x1 + 3 - X0] = False
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(band.astype(np.uint8), connectivity=8)
+    best = None
+    for L in range(1, n):
+        if stats[L, cv2.CC_STAT_AREA] < 4:
+            continue
+        sx, sy = cents[L][0] + X0, cents[L][1] + Y0
+        vx, vy = sx - cx, sy - cy
+        nn = (vx * vx + vy * vy) ** 0.5
+        if nn < 1:
+            continue
+        res = _walk_from(ink, (sx, sy), (vx / nn, vy / nn), max_len)
+        if res is None:
+            continue
+        length, end, v, kind = res
+        if length < 30:
+            continue
+        # 出だしが符号に近く、長くたどれたものを選ぶ
+        dx = max(x0 - sx, 0, sx - x1)
+        dy = max(y0 - sy, 0, sy - y1)
+        score = length - 6 * (dx * dx + dy * dy) ** 0.5
+        if best is None or score > best[0]:
+            best = (score, end, v, kind)
+    if best is None:
+        return None
+    _, end, v, kind = best
+    if x0 - 15 <= end[0] <= x1 + 15 and y0 - 15 <= end[1] <= y1 + 15:
+        return None
+    return end, v, kind
+
+
+def _walk_from(ink, start, v, max_len):
+    h, w = ink.shape
+    p = (float(start[0]), float(start[1]))
+    vx, vy = v
+    length = 0
+    r = 9
+    first = True
+    while length < max_len:
+        runs = _arc_runs(ink, p, (vx, vy), r, span=90 if first else 75)
+        if not runs:
+            return length, p, (vx, vy), "free"          # 線の先端（部品の面の中で終わる）
+        runs.sort(key=lambda ru: min(abs(a) for a in ru))
+        ru = runs[0]
+        wide = (max(ru) - min(ru)) > 55 and not first
+        first = False
+        if wide:
+            # ほかの線に当たった。少し先（半径 14〜26px）に、同じ向きの細い線（引き出し線の続き）があれば乗り越える
+            jumped = False
+            for rr in (14, 20, 26):
+                cand = [c for c in _arc_runs(ink, p, (vx, vy), rr, span=40)
+                        if (max(c) - min(c)) <= 30 and abs(sum(c) / len(c)) <= 25]
+                if not cand:
+                    continue
+                c = min(cand, key=lambda c: abs(sum(c) / len(c)))
+                a = np.radians(sum(c) / len(c))
+                base = np.arctan2(vy, vx)
+                q = (p[0] + rr * np.cos(base + a), p[1] + rr * np.sin(base + a))
+                if _walk_probe(ink, q, (np.cos(base + a), np.sin(base + a))):
+                    # 乗り越えた先と今の点のあいだに白い画素があること（同じ太い線の上を進んだだけではないこと）
+                    p, length, jumped = q, length + rr, True
+                    break
+            if jumped:
+                continue
+            # 部品の線に当たって終わった：線を横切った向こう側を返す
+            q = p
+            for k in range(20):
+                q = (q[0] + vx, q[1] + vy)
+                if not (0 <= q[0] < w and 0 <= q[1] < h):
+                    return length, p, (vx, vy), "edge"
+                if k >= 2 and not ink[int(q[1]), int(q[0])]:
+                    break
+            return length, (q[0] + vx * 2, q[1] + vy * 2), (vx, vy), "edge"
+        a = np.radians(sum(ru) / len(ru))
+        base = np.arctan2(vy, vx)
+        nx, ny = np.cos(base + a), np.sin(base + a)
+        p = (p[0] + r * nx, p[1] + r * ny)
+        if not (0 <= p[0] < w and 0 <= p[1] < h):
+            return None
+        vx, vy = 0.6 * vx + 0.4 * nx, 0.6 * vy + 0.4 * ny
+        nn = (vx * vx + vy * vy) ** 0.5
+        vx, vy = vx / nn, vy / nn
+        length += r
+    return None
+
+
+def _walk_probe(ink, q, v, steps=4):
+    """横切った先で、細い線が数歩ぶん続くか（部品の面の模様ではなく、引き出し線の続きか）。"""
+    p, vx, vy = q, v[0], v[1]
+    for _ in range(steps):
+        runs = [c for c in _arc_runs(ink, p, (vx, vy), 9, span=35)
+                if (max(c) - min(c)) <= 40 and abs(sum(c) / len(c)) <= 25]
+        if not runs:
+            return False
+        ru = min(runs, key=lambda c: abs(sum(c) / len(c)))
+        a = np.radians(sum(ru) / len(ru))
+        base = np.arctan2(vy, vx)
+        vx, vy = np.cos(base + a), np.sin(base + a)
+        p = (p[0] + 9 * vx, p[1] + 9 * vy)
+        if not (0 <= p[0] < ink.shape[1] and 0 <= p[1] < ink.shape[0]):
+            return False
+    return True
+
+
 def region_from_leader(gray, box, segs):
     ink = gray < 140
+    r = _walk_leader(ink, box)
+    if r is not None:
+        (ex, ey), v, kind = r
+        reg = _fill_at_end(gray, box, (ex, ey), v)
+        if reg is not None:
+            return reg
     r = _leader_end_isolated(ink, box)
     if r is not None:
         reg = _fill_at_end(gray, box, r[0], r[1])

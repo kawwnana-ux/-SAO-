@@ -2212,7 +2212,7 @@ def _drawing_module():
         return drawing_tool
     except ImportError as e:
         st.error(f"図面の機能の部品を読み込めませんでした（{e}）。app.py と同じフォルダに drawing_tool.py を置き、"
-                 "`pip install requests beautifulsoup4 opencv-python-headless` を実行してください。")
+                 "`pip install requests opencv-python-headless` を実行してください。")
         st.stop()
 
 
@@ -2383,6 +2383,10 @@ def page_drawing():
         except dt.FetchError as e:
             st.error(str(e))
             st.session_state.drawing_result = None
+        except ImportError as e:
+            st.error(f"図面の機能に必要な部品（{e.name}）が、このアプリを動かしている Python に入っていません。"
+                     f"`python -m pip install {e.name}` を実行してから、アプリを起動し直してください。")
+            st.session_state.drawing_result = None
         except Exception as e:  # noqa: BLE001
             st.error(f"図面の処理中にエラーが発生しました：{e}")
             st.session_state.drawing_result = None
@@ -2430,6 +2434,10 @@ def _drawing_local(dt, fill, use_ocr, include_review):
             if not res["fugo"]:
                 st.warning("【符号の説明】を読み取れませんでした。「１０  冷却器」のように、符号と名前を並べて貼り付けてください。")
             st.session_state.drawing_result = {"res": res, "claim": claim, "key": ("local", src)}
+        except ImportError as e:
+            st.error(f"図面の機能に必要な部品（{e.name}）が、このアプリを動かしている Python に入っていません。"
+                     f"`python -m pip install {e.name}` を実行してから、アプリを起動し直してください。")
+            st.session_state.drawing_result = None
         except Exception as e:  # noqa: BLE001
             st.error(f"図面の処理中にエラーが発生しました：{e}")
             st.session_state.drawing_result = None
