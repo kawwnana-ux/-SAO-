@@ -9628,6 +9628,10 @@ RULES = [
     {"id": "R78", "stage": "構成要素", "name": "題名が取れないときは冒頭か「を特徴とする」の後から取る",
      "desc": "「Ｘにおいて、…である。」のように最後が名詞で終わらず題名が取れないときは、「…を特徴とするＸ。」か、冒頭の「Ｘであって、」「Ｘにおいて、」のＸを題名にする",
      "example": "内輪と、外輪と、…を備える転がり軸受において、…である。→ 題名＝転がり軸受", "llm": False},
+    {"id": "R83", "stage": "構成要素", "name": "部品の名前を GiNZA と LLM で融合する",
+     "desc": "関係の土台は GiNZA の名前で解析した関係（規則だけのときと同じ決まりで確かめる）。LLM が書き出した名前（R05・R04 で確かめたもの）は、"
+             "GiNZA が取れなかった名前を補うときだけ使い、その名前を含む関係を同じ裏付けの決まりで確かめて足す（LLM を使うときだけ働く）",
+     "example": "GiNZA が「第１封止層の線熱膨張係数」を1つの名前として取れないとき、LLM の名前で補う", "llm": True},
     {"id": "R68", "stage": "SAO", "name": "連体修飾の組を本文の文型で補う",
      "desc": "GiNZAが係り先を取り違えやすい形を本文の文字の並びで拾う。「XとAとの間に…するB」「Aを…するとともに…されたB」は採用、"
              "「A＋格助詞＋動詞の連体形＋B」（動詞はすぐ後ろの名詞にかかる）は要確認として出す",
@@ -9701,6 +9705,8 @@ EFFECTS = {
     "R76": {"f1_delta": 0.05, "review_delta": 0.0, "note": "2026-09-28 追加（他分野の請求項62件から）。dev で誤った採用 8件を要確認に"},
     "R77": {"f1_delta": 0.75, "review_delta": 0.71, "note": "2026-09-28 追加（他分野の請求項62件から）。dev で採用 142件を追加し、うち 71件が正解"},
     "R78": {"f1_delta": 0.07, "review_delta": 0.04, "note": "2026-09-28 追加（他分野の請求項62件から）"},
+    "R83": {"f1_delta": 2.6, "review_delta": -0.2, "note": "2026-09-30 追加。dev 256件・ELECTRA 版・R64 あり：今の方式 A2（LLM の名前を土台にする）55.6 → 融合 58.2。"
+                                                 "規則だけ＋R64（58.2）とは同じで、採用＋要確認の再現率が +0.7"},
     "R60": {"f1_delta": 0.0, "note": "採用には影響しない。候補の再現率（dev）49.5% → 91.5%（run_recall_check.bat で測る）"},
     "R64": {"f1_delta": 4.1, "note": "LLM が必要。dev 10件だけの予備の測定（R65 の前）：規則だけ 58.8 → 62.9（完全一致）。"
                                    "要確認→採用にした関係の 75% が正解。本番の数字は run_r64_check.bat で測る"},
@@ -16938,7 +16944,7 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
     use_gf = info["mode"] == "llm" and any(x.startswith("GF:") for c in info["cands"] for x in c["srcs"])
     # 列挙「A、B及びCから構成されるX」の展開（R20：LLM の構成要素どうし）
     usedset = set(used)
-    seed_prefix = "GF:" if use_gf else "G:"
+    seed_prefix = "GF:" if use_gf and not enabled("R83") else "G:"
     seeds = [c for c in info["cands"] if any(x.startswith(seed_prefix) for x in c["srcs"])]
     clean_t = pp._clean_claim_text(text)
     nrm = pp._normalize_node_text_lenient
@@ -16957,14 +16963,33 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
     flat_t = re.sub(r"\s", "", clean_t)
     info["cands"] = normalize_candidates(distribute_topics(info, info["cands"], flat_t), info)
     judged = []
+    fuse = use_gf and enabled("R83")
+    gnames = {nrm(x) for c in info["cands"] if any(y.startswith("G:") for y in c["srcs"])
+              for x in (c["source"], c["target"])}
     for c in info["cands"]:
         g = any(x.startswith("G:") for x in c["srcs"])
         gf = any(x.startswith("GF:") for x in c["srcs"])
         enum_ = "ST:列挙A2" in c["srcs"]
         st_ = "ST:工程" in c["srcs"] or enum_
-        base = (gf if use_gf else g) or st_
-        c["base"] = base
-        weak = _weak_link(c, info.get("title"), use_gf, flat_t) if base and not st_ else None
+        if fuse:
+            # 【R83】名前の融合：土台は GiNZA の名前で解析した関係（規則だけのときと同じ決まりで確かめる）。
+            # LLM の名前（R05・R04 で確かめた名前）は、GiNZA が取れなかった名前を補うときだけ使い、
+            # その名前を含む関係（GF だけが出したもの）を、同じ裏付けの決まりで確かめて足す
+            if g or st_:
+                base = True
+                weak = _weak_link(c, info.get("title"), False, flat_t) if not st_ else None
+            elif gf and (nrm(c["source"]) not in gnames or nrm(c["target"]) not in gnames):
+                mark(c, "R83")
+                base = True
+                weak = _weak_link(c, info.get("title"), True, flat_t)
+            else:
+                base = False
+                weak = None
+            c["base"] = base
+        else:
+            base = (gf if use_gf else g) or st_
+            c["base"] = base
+            weak = _weak_link(c, info.get("title"), use_gf, flat_t) if base and not st_ else None
         if weak:
             mark(c, weak)
             judged.append({"selected": False, "score": 0.4, "status": "要確認",
@@ -17923,7 +17948,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-28c"
+PIPELINE_VERSION = "2026-09-30f"  # ELECTRA 版の GiNZA＋名前の融合（R83）＋R64。新しい50件で最終確認する版
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -17931,10 +17956,10 @@ DEFAULT_BANDS = {
               "正解の所在": {"採用": 0.3799, "要確認": 0.1907, "除外": 0.2288, "候補なし": 0.2005}},
 }
 METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
-METHOD_SCORE = ("学習データを使わない最終方式。LLMの呼び出しは1件あたり1回（構成要素の書き出し）。"
-                "参考（LLMなし・規則だけ）：トリプル完全一致 F1 は、規則を作るのに使った dev の半分で 53.4%（適合率 64.4%・再現率 45.7%）、"
-                "規則づくりに使っていない test の半分で 52.2%。意味が伝われば正解とする意味一致では dev 57.1%・test 56.3%。"
-                "精度はローカルのOllamaで評価コマンドを実行して測る")
+METHOD_SCORE = ("学習データを使わない最終方式。関係は GiNZA の規則で取り出し、ローカル LLM は部品の名前の補い（R83）と、"
+                "規則の結果の確認（R64・チェックを入れたとき）に使う。dev（規則づくりに使った半分）でのトリプル完全一致 F1："
+                "規則だけ 53.4%、ELECTRA 版の GiNZA＋名前の融合＋R64 で 58.2%。"
+                "最終的な精度は、532件に含まれない新しい請求項50件で1回だけ測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
                       "分野を丸ごと隠しても F1 の低下は0〜2ポイント")
