@@ -1089,8 +1089,7 @@ def finish_ingest(ing, partial=False):
 # ===========================================================================
 
 def analyze_body():
-    st.caption(f"請求項を1件、{PC.METHOD_NAME if extract_method == METHODS[0] else PC.MODEL_METHOD_NAME}で解析し、処理の各段階とAIの判定（採用／要確認／除外）を表示します。"
-               "結果は表で修正してから確定できます。")
+    st.caption("請求項を貼り付けて「解析する」を押すと、AI が部品どうしの関係を取り出します。表で直してから保存できます。")
     col1, col2 = st.columns([3, 1])
     with col2:
         opts = ["（使わない）"] + ([p["id"] for p in DATA["patents"]] if DATA else [])
@@ -1121,40 +1120,15 @@ def analyze_body():
     res = st.session_state.analysis
     if not res:
         return
-    st.success(f"解析完了（{res['elapsed']:.1f}秒）")
+    counts = Counter(c["status"] for c in res["cands"])
+    st.markdown(f"**解析できました**（{res['elapsed']:.1f}秒）　｜　AIの判定："
+                f"<span style='color:{STATUS_COLORS[PC.STATUS_ACCEPT]};font-weight:700'>採用 {counts.get(PC.STATUS_ACCEPT, 0)}</span>・"
+                f"<span style='color:{STATUS_COLORS[PC.STATUS_REVIEW]};font-weight:700'>要確認 {counts.get(PC.STATUS_REVIEW, 0)}</span>",
+                unsafe_allow_html=True)
+    if res["bands"].get("method") == "a2" and res.get("mode") == "rules":
+        st.warning("LLM（Ollama）を呼べなかったので、GiNZA の規則だけで解析しました。Ollama を起動してからもう一度"
+                   "「解析する」を押すと、LLM も使った最終方式で解析します。", icon="⚠️")
 
-    st.markdown("#### ① 処理の流れ")
-    per_row = 6
-    cols = []
-    for k in range(0, len(res["steps"]), per_row):
-        cols += st.columns(per_row)
-    for i, (col, (name, detail)) in enumerate(zip(cols, res["steps"])):
-        col.markdown(
-            f"<div style='border:1px solid rgba(148,163,184,.5);border-radius:10px;padding:8px;min-height:110px'>"
-            f"<div style='font-size:.75rem;opacity:.7'>STEP {i + 1}</div><div style='font-weight:700;font-size:.9rem'>"
-            f"{html.escape(name)}</div><div style='font-size:.85rem;margin-top:4px'>{html.escape(detail)}</div></div>",
-            unsafe_allow_html=True)
-
-    st.markdown("#### ② AIの判定")
-    status_badges(Counter(c["status"] for c in res["cands"]))
-    if res["bands"].get("method") == "a2":
-        if res.get("mode") == "rules":
-            st.warning("LLM（Ollama）を呼べなかったため、構成要素を固定しない通常のGiNZAの規則で判定しました。Ollamaを起動して"
-                       "（ollama serve／ollama pull qwen3.5:9b）解析し直すと、LLMで構成要素を固定した最終方式で解析されます。")
-        st.caption("採用：LLMで取り出して境界を確かめた構成要素を1語に固定し、GiNZAの規則で取り出した関係（方法の請求項の"
-                   "工程を含む）／要確認：構成要素を固定しない通常のGiNZAの規則だけが出した関係（取りこぼしを防ぐため表に"
-                   "残します。正しければ「採用する」にチェック）／除外：それ以外（表では非表示。下の「全候補」で見られます）。"
-                   "「確からしさ（目安）」は学習した確率ではなく、判定の根拠を数値にしたもの（採用で通常の規則とも一致 1.0／"
-                   "採用 0.8／要確認 0.5／除外 0.1）。")
-        with st.expander("LLMが書き出した構成要素（そのまま）"):
-            st.code(res.get("raw", ""))
-    else:
-        st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」（0〜1、1に近いほど確か）。"
-                   f"採用：確率 {res['bands']['accept']:.2f} 以上で選ばれた関係（正解データでは約8割が正しい）／"
-                   f"要確認：選ばれたがそれ未満、または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外（表では非表示）")
-
-    st.markdown("#### ③ 確認・修正")
-    st.caption("「採用する」のチェックを付け外しし、主語・関係・目的語は直接書き換えられます。表の一番下の行から関係を追加できます。")
     show = [c for c in res["cands"] if c["status"] != PC.STATUS_REJECT]
     kb = "an_" + str(abs(hash((res["text"], tuple((c["source"], c["relation"], c["target"], c["status"])
                                                    for c in show)))) % 10**10)
@@ -1164,15 +1138,36 @@ def analyze_body():
             "主語(S)": c["source"], "関係(A)": c["relation"], "目的語(O)": c["target"], "確率": c["prob"],
             "判定": c["status"], "抽出元": c["origin"]} for c in show]
         st.session_state[kb + "_ver"] = 0
-    df = pd.DataFrame(st.session_state[kb + "_rows"],
-                      columns=["採用する", "主語(S)", "関係(A)", "目的語(O)", "確率", "判定", "抽出元"])
-    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, hide_index=True,
-                            column_config=editor_config(), key=f"{kb}_editor_{st.session_state[kb + '_ver']}")
-    confirmed = [r for r in PC.table_to_review(edited) if r["keep"]]
 
-    st.markdown(f"**構成要素（GiNZA）**：{'、'.join(t for t in res['tags'] if t not in ('一方', '他方', '双方', '両方')) or '―'}")
-    b1, b2, _ = st.columns([1, 1, 3])
-    if b1.button("✅ 確定して保存", type="primary"):
+    # ── 保存（表が長くても押せるよう、表の上に置く。押したら表の内容を読んでから保存する）
+    b1, b2, _ = st.columns([1.6, 1.4, 3])
+    do_save = b1.button("✅ 確定して保存", type="primary", use_container_width=True, key=f"{kb}_save",
+                        help="✔ を付けた関係を保存します。データの特許を選んでいればその特許の確認結果に、"
+                             "選んでいなければワークスペースに保存します（エクスポートページから書き出せます）")
+    csv_box = b2.empty()
+    if st.session_state.get("_an_msg"):
+        st.success(st.session_state.pop("_an_msg"))
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.caption("✔ を付けた行だけが確定されます。要確認の行は、正しければ ✔ を付けてください。"
+                   "文字は直接書き換えられ、いちばん下の行から関係を足せます。")
+        df = pd.DataFrame(st.session_state[kb + "_rows"],
+                          columns=["採用する", "主語(S)", "関係(A)", "目的語(O)", "確率", "判定", "抽出元"])
+        edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, hide_index=True, height=440,
+                                column_config=editor_config(),
+                                column_order=["採用する", "主語(S)", "関係(A)", "目的語(O)", "判定"],
+                                key=f"{kb}_editor_{st.session_state[kb + '_ver']}")
+        confirmed = [r for r in PC.table_to_review(edited) if r["keep"]]
+        colors = pp.component_colors(PC.tidy_relations(confirmed))
+    with right:
+        st.markdown("**請求項**（✔ の関係の部品を色でマーク）")
+        st.markdown(f"<div style='font-size:.92rem;line-height:1.9;border:1px solid rgba(148,163,184,.4);"
+                    f"border-radius:8px;padding:10px;max-height:460px;overflow:auto'>"
+                    f"{PC.highlight_colored(res['text'], colors)}</div>", unsafe_allow_html=True)
+    csv_box.download_button("⬇️ CSV で保存", pd.DataFrame(confirmed).to_csv(index=False).encode("utf-8-sig"),
+                            file_name="sao_confirmed.csv", mime="text/csv", use_container_width=True)
+    if do_save:
         if res.get("pick") in PATENTS:
             pt = PATENTS[res["pick"]]
             if PC.first_claim(res["text"]) != pt.get("text") or not pt.get("analyzed", True):
@@ -1180,34 +1175,45 @@ def analyze_body():
                 pt["text"] = PC.first_claim(res["text"])
                 PC.apply_analysis(pt, res["cands"])
             st.session_state.reviews[res["pick"]] = PC.table_to_review(edited)
-            st.success(f"{res['pick']} の確認結果として保存しました（分析ページに反映されます）。")
+            st.session_state["_an_msg"] = f"{res['pick']} の確認結果として保存しました（分析のページに反映されます）。"
         else:
             st.session_state.workspace.append({"id": f"解析{len(st.session_state.workspace) + 1}",
                                                "text": res["text"], "relations": confirmed})
-            st.success("ワークスペースに保存しました（エクスポートページから書き出せます）。")
-    b2.download_button("⬇️ CSVで保存", pd.DataFrame(confirmed).to_csv(index=False).encode("utf-8-sig"),
-                       file_name="sao_confirmed.csv", mime="text/csv")
-    st.markdown("**確定予定のSAO構造**")
+            st.session_state["_an_msg"] = "ワークスペースに保存しました（エクスポートページから書き出せます）。"
+        st.rerun()
+
+    st.markdown("**確定すると、こうなります（SAO の図）**")
     edit_mode = st.toggle("✏️ 図で直す", value=False, key=f"{kb}_graphedit",
                           help="図の上で、関係の追加・削除・向きの反転・関係名の変更、部品の名前の変更・親の付け替えができます。"
                                "「表に反映」を押すと、上の表（と保存される内容）に反映されます。")
     if edit_mode:
-        colors = graph_edit_section(edited, kb)
+        graph_edit_section(edited, kb)
     else:
-        colors = sao_graph(confirmed, key="analyze")
-    with st.expander("請求項の本文（構成要素を図と同じ色でマーク）"):
-        st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(res['text'], colors)}</div>",
-                    unsafe_allow_html=True)
+        sao_graph(confirmed, key="analyze", colors=colors)
+
+    # ── 詳しい情報（ふだんは閉じておく）
+    with st.expander("詳しく見る：処理の流れと判定の説明"):
+        for i, (name, detail) in enumerate(res["steps"], 1):
+            st.markdown(f"**{i}. {name}**　{detail}")
+        if res["bands"].get("method") == "a2":
+            st.caption("採用：LLMで取り出して境界を確かめた構成要素を1語に固定し、GiNZAの規則で取り出した関係（方法の請求項の"
+                       "工程を含む）／要確認：構成要素を固定しない通常のGiNZAの規則だけが出した関係（取りこぼしを防ぐため表に"
+                       "残します）／除外：それ以外（表では非表示。下の「全候補」で見られます）。")
+            st.markdown(f"**構成要素**：{'、'.join(t for t in res['tags'] if t not in ('一方', '他方', '双方', '両方')) or '―'}")
+            st.markdown("**LLMが書き出した構成要素（そのまま）**")
+            st.code(res.get("raw", ""))
+        else:
+            st.caption(f"確率＝AI（選別モデル）が見積もった「その関係が正しい見込み」。採用：確率 {res['bands']['accept']:.2f} 以上／"
+                       f"要確認：選ばれたがそれ未満、または確率 {res['bands']['review_low']:.2f} 以上／除外：それ以外。")
     _pl = "確からしさ" if res["bands"].get("method") in ("llm_select", "a2") else "確率"
-    with st.expander(f"除外した候補も含めた全候補（{_pl}の順）"):
+    with st.expander(f"詳しく見る：除外した候補も含めた全候補（{_pl}の順）"):
         st.dataframe(pd.DataFrame([{k: c[k] for k in ("status", "prob", "source", "relation", "target", "origin")}
                                    for c in res["cands"]]).rename(columns={
             "status": "判定", "prob": _pl, "source": "主語", "relation": "関係", "target": "目的語", "origin": "抽出元"}),
             hide_index=True, use_container_width=True)
     if res.get("dropped"):
-        with st.expander(f"規則で除いた関係（{len(res['dropped'])} 件）"):
-            st.caption("分野に依存しない規則（「規則の一覧」ページ）で除いた関係です。正しいものが除かれていたら、"
-                       "その規則の見直しの材料になります。")
+        with st.expander(f"詳しく見る：規則で除いた関係（{len(res['dropped'])} 件）"):
+            st.caption("分野に依存しない規則（「規則の一覧」ページ）で除いた関係です。")
             st.dataframe(pd.DataFrame([{"規則": f"{d['rule']} {pp.rulebook.name(d['rule'])}", "主語": d["source"],
                                         "関係": d["relation"], "目的語": d["target"]} for d in res["dropped"]]),
                          hide_index=True, use_container_width=True)
