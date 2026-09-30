@@ -1399,74 +1399,151 @@ def page_rules():
             pass
 
 
+def flow_steps():
+    """解析と確認の流れ（① 読み込み → ② 請求項 → ③ 解析 → ④ 確認）と、いまの進み具合。次にやることを1つだけ示す。"""
+    ps = DATA["patents"]
+    reviews = st.session_state.reviews
+    n = len(ps)
+    n_text = sum(1 for p in ps if p.get("text"))
+    ready = [p["id"] for p in ps if p.get("text") and not p.get("analyzed", True)]
+    n_an = n_text - len(ready)
+    n_rv = sum(1 for p in ps if p["id"] in reviews and p.get("text"))
+    steps = [("読み込み", f"{n:,} 件", True),
+             ("請求項", f"{n_text:,} / {n:,} 件", n_text == n),
+             ("AIが解析", f"{n_an:,} / {n_text:,} 件", n_text > 0 and not ready),
+             ("人が確認", f"{n_rv:,} / {n_an:,} 件", n_an > 0 and n_rv >= n_an)]
+    cur = next((i for i, s in enumerate(steps) if not s[2] and i != 1), 4)
+    chips = []
+    for i, (name, cnt, done) in enumerate(steps):
+        if done:
+            bg, bd, mark = "rgba(22,163,74,.10)", "#16a34a", "✓"
+        elif i == cur:
+            bg, bd, mark = "rgba(37,99,235,.10)", "#2563eb", "▶"
+        else:
+            bg, bd, mark = "rgba(148,163,184,.08)", "rgba(148,163,184,.6)", str(i + 1)
+        chips.append(f"<div style='flex:1;min-width:120px;border:2px solid {bd};background:{bg};border-radius:10px;"
+                     f"padding:6px 10px'><div style='font-size:.8rem;opacity:.75'>{mark}　{i + 1}. {name}</div>"
+                     f"<div style='font-size:1.1rem;font-weight:700'>{cnt}</div></div>")
+    st.markdown("<div style='display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 10px'>" +
+                "<div style='align-self:center;opacity:.5'>→</div>".join(chips) + "</div>", unsafe_allow_html=True)
+    if ready:
+        c1, c2 = st.columns([3, 2])
+        c1.markdown(f"**次にやること：** 請求項があって、まだ解析していない特許が **{len(ready):,} 件** あります。"
+                    "先に AI で解析してください（1件あたり数秒〜1分）。")
+        if c2.button(f"🚀 {len(ready):,} 件を解析する", type="primary", use_container_width=True, key="flow_analyze"):
+            analyze_dataset_patents(ready)
+    elif n_an == 0:
+        st.info("解析できる請求項がありません。「データの読み込み」ページの「📝 請求項を追加」で請求項を登録してください。")
+    elif n_rv < n_an:
+        st.markdown(f"**次にやること：** 下の表で AI の判定を直し、**「✅ 確定して次へ」** を押します。"
+                    f"残り **{n_an - n_rv:,} 件**。")
+    else:
+        st.success("すべての特許を確認しました。「エクスポート」ページで、確認結果（解析済みデータ）を保存しておきましょう。")
+    if n_text < n:
+        st.caption(f"請求項が無い特許が {n - n_text:,} 件あります（「データの読み込み」→「📝 請求項を追加」で足せます）。")
+    return n_an
+
+
 def review_body():
     if not DATA or not DATA.get("patents"):
-        st.info("確認する特許がありません。「データの読み込み」ページで特許リストを読み込んで解析してください。")
+        st.info("確認する特許がありません。まず「データの読み込み」ページで特許リストを読み込んでください。")
         return
     reviews = st.session_state.reviews
-    st.caption("読み込んだ特許ごとに、AIの判定を確認・修正して確定します。確定した内容は、ネットワーク・類似性マップなど"
-               "すべての分析に反映されます（エクスポートページで保存・読み込みできます）。")
-    n_wait = sum(1 for p in DATA["patents"] if not (p.get("text") and p.get("analyzed", True)))
-    if n_wait:
-        st.info(f"請求項が未登録または未解析の特許が {n_wait} 件あります（ここには出ません）。"
-                "「データの読み込み」の「📝 請求項を追加」で請求項を登録して解析するか、"
-                "上の「請求項を貼り付けて解析する」で1件ずつ解析できます。", icon="📝")
-    f1, f2, f3 = st.columns([2, 2, 1])
-    comp = f1.multiselect("出願人で絞り込む", sorted({p["company"] for p in DATA["patents"]}))
-    order = f2.selectbox("並び順", ["要確認が多い順", "特許番号順", "採用が少ない順"])
-    only_open = f3.checkbox("未確認のみ", value=True)
+    n_an = flow_steps()
+    if not n_an:
+        return
+    with st.expander("絞り込み・並び順", expanded=False):
+        f1, f2, f3 = st.columns([2, 2, 1])
+        comp = f1.multiselect("出願人", sorted({p["company"] for p in DATA["patents"]}), key="rv_comp")
+        order = f2.selectbox("並び順", ["要確認が多い順", "特許番号順", "採用が少ない順"], key="rv_order")
+        only_open = f3.checkbox("未確認だけ", value=True, key="rv_open")
     ps = [p for p in DATA["patents"] if p.get("text") and p.get("analyzed", True)
-          and (not comp or p["company"] in comp) and (not only_open or p["id"] not in reviews)]
+          and (not comp or p["company"] in comp) and (not only_open or p["id"] not in reviews
+                                                        or p["id"] == st.session_state.review_pid)]
     key = {"要確認が多い順": lambda p: -sum(r["status"] == PC.STATUS_REVIEW for r in p["relations"]),
            "特許番号順": lambda p: p["id"],
            "採用が少ない順": lambda p: sum(r["status"] == PC.STATUS_ACCEPT for r in p["relations"])}[order]
     ps = sorted(ps, key=key)
-    n_an = max(1, sum(1 for p in DATA["patents"] if p.get("text") and p.get("analyzed", True)))
-    st.progress(min(1.0, len(reviews) / n_an), text=f"確認済み {len(reviews)} / {n_an} 件（解析済みの特許のうち）")
     if not ps:
-        st.info("条件に合う未確認の特許はありません。")
+        st.success("条件に合う未確認の特許はありません。" + ("（「絞り込み・並び順」で「未確認だけ」を外すと、確定した特許も見直せます）"
+                                                    if only_open else ""))
         return
     ids = [p["id"] for p in ps]
-    default = st.session_state.review_pid if st.session_state.review_pid in ids else ids[0]
-    pid = st.selectbox("確認する特許", ids, index=ids.index(default), format_func=patent_label)
-    st.session_state.review_pid = pid
+    if st.session_state.review_pid not in ids:
+        st.session_state.review_pid = ids[0]
+    pid = st.session_state.review_pid
+    i = ids.index(pid)
+
+    # ── いま確認している特許と、前後への移動
+    n1, n2, n3, n4 = st.columns([1, 1, 3.2, 1.6])
+    if n1.button("◀ 前へ", disabled=i == 0, use_container_width=True, key="rv_prev"):
+        st.session_state.review_pid = ids[i - 1]
+        st.rerun()
+    if n2.button("次へ ▶", disabled=i >= len(ids) - 1, use_container_width=True, key="rv_next"):
+        st.session_state.review_pid = ids[i + 1]
+        st.rerun()
+    done_mark = "　<span style='color:#16a34a'>✓ 確定済み</span>" if pid in reviews else ""
+    n3.markdown(f"<div style='padding-top:6px'><b>{i + 1} / {len(ids)} 件目</b>{done_mark}</div>",
+                unsafe_allow_html=True)
+    jump = n4.selectbox("特許を選ぶ", ids, index=i, format_func=patent_label, key=f"rv_jump_{pid}",
+                        label_visibility="collapsed")
+    if jump != pid:
+        st.session_state.review_pid = jump
+        st.rerun()
+
     p = PATENTS[pid]
     counts = Counter(r["status"] for r in p["relations"])
-    counts[PC.STATUS_REJECT] = p.get("n_rejected", 0)
-    status_badges(counts)
+    link = f"　[公報を開く]({p['url']})" if p.get("url") else ""
+    st.markdown(f"### {p['title'] or '（名称なし）'}")
+    st.markdown(f"{pid}　{p['applicant']}　出願日 {p.get('filing_date') or '―'}{link}　｜　AIの判定："
+                f"<span style='color:{STATUS_COLORS[PC.STATUS_ACCEPT]};font-weight:700'>採用 {counts.get(PC.STATUS_ACCEPT, 0)}</span>・"
+                f"<span style='color:{STATUS_COLORS[PC.STATUS_REVIEW]};font-weight:700'>要確認 {counts.get(PC.STATUS_REVIEW, 0)}</span>",
+                unsafe_allow_html=True)
 
-    left, right = st.columns([2, 3])
+    # ── 確定・スキップ（表が長くても押せるよう、表の上に置く。押したら表の内容を読んでから保存する）
+    b1, b2, b3, _ = st.columns([1.6, 1, 1.3, 2])
+    do_ok = b1.button("✅ 確定して次へ", type="primary", use_container_width=True, key=f"ok_{pid}",
+                      help="✔ を付けた関係を、この特許の確認結果として保存し、次の未確認の特許へ進みます")
+    if b2.button("スキップ", use_container_width=True, key=f"skip_{pid}", disabled=i >= len(ids) - 1,
+                 help="確定せずに次の特許へ進みます（表の変更は保存されません）"):
+        st.session_state.review_pid = ids[i + 1]
+        st.rerun()
+    if pid in reviews and b3.button("↩️ 確定を取り消す", use_container_width=True, key=f"undo_{pid}"):
+        del reviews[pid]
+        st.rerun()
+    if st.session_state.get("_rv_msg"):
+        st.success(st.session_state.pop("_rv_msg"))
+
+    # ── 表で直す（左）と、請求項の本文（右）
+    left, right = st.columns([3, 2])
     with left:
-        st.markdown(f"**{p['title']}**　{p['applicant']}　出願日 {p.get('filing_date') or '―'}")
-        if p.get("url"):
-            st.markdown(f"[公報を開く]({p['url']})")
+        st.caption("✔ を付けた行だけが確定されます。要確認の行は、正しければ ✔ を付けてください。"
+                   "文字は直接書き換えられ、いちばん下の行から関係を足せます。")
         table = PC.review_table(p, reviews)
-        text_box = st.empty()  # 本文は、下の表で確定する構成要素と同じ色でマークする（表の後で描く）
-    with right:
         edited = st.data_editor(table, num_rows="dynamic", use_container_width=True, hide_index=True,
-                                column_config=editor_config(), key=f"rv_{DATA['meta']['uid']}_{pid}")
-        b1, b2, b3 = st.columns(3)
-        if b1.button("✅ 確定する", type="primary", key=f"ok_{pid}"):
-            reviews[pid] = PC.table_to_review(edited)
-            nxt = [i for i in ids if i != pid and i not in reviews]
-            st.session_state.review_pid = nxt[0] if nxt else None
-            st.rerun()
-        if pid in reviews and b2.button("↩️ 確認を取り消す", key=f"undo_{pid}"):
-            del reviews[pid]
-            st.rerun()
-        b3.caption("確定すると次の特許へ進みます")
-    st.markdown("**確定後のSAO構造（プレビュー）**")
-    kept = [r for r in PC.table_to_review(edited) if r["keep"]]
-    colors = pp.component_colors(PC.tidy_relations(kept))
-    text_box.markdown(f"<div style='font-size:.92rem;line-height:1.9;border:1px solid rgba(148,163,184,.4);"
-                      f"border-radius:8px;padding:10px;max-height:420px;overflow:auto'>"
-                      f"{PC.highlight_colored(p['text'], colors)}</div>", unsafe_allow_html=True)
+                                column_config=editor_config(), height=440,
+                                column_order=["採用する", "主語(S)", "関係(A)", "目的語(O)", "判定"],
+                                key=f"rv_{DATA['meta']['uid']}_{pid}")
+        kept = [r for r in PC.table_to_review(edited) if r["keep"]]
+        colors = pp.component_colors(PC.tidy_relations(kept))
+    if do_ok:
+        reviews[pid] = PC.table_to_review(edited)
+        rest = [x for x in ids[i + 1:] + ids[:i] if x not in reviews]
+        st.session_state.review_pid = rest[0] if rest else pid
+        st.session_state["_rv_msg"] = f"{pid} を確定しました。" + ("" if rest else "未確認の特許はもうありません。")
+        st.rerun()
+    with right:
+        st.markdown("**請求項**（✔ の関係の部品を色でマーク）")
+        st.markdown(f"<div style='font-size:.92rem;line-height:1.9;border:1px solid rgba(148,163,184,.4);"
+                    f"border-radius:8px;padding:10px;max-height:460px;overflow:auto'>"
+                    f"{PC.highlight_colored(p['text'], colors)}</div>", unsafe_allow_html=True)
+    st.markdown("**確定すると、こうなります（SAO の図）**")
     sao_graph(kept, key="review", colors=colors)
 
 
 def page_extract():
     st.title("🧪 解析と確認")
-    modes = ["読み込んだ特許を確認する", "請求項を貼り付けて解析する"]
+    modes = ["読み込んだ特許を1件ずつ確認する", "請求項を1件だけ貼り付けて試す"]
     mode = st.radio("やること", modes, index=0 if DATA else 1, horizontal=True, key="extract_mode",
                     label_visibility="collapsed")
     st.divider()
