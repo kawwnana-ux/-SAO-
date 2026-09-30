@@ -1,2 +1,0 @@
-tesseract-ocr
-fonts-noto-cjk
