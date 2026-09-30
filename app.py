@@ -70,7 +70,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-28a"
+NEED_PIPELINE = "2026-09-28c"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -193,8 +193,7 @@ def tidy_candidates(cands):
 def set_dataset(data):
     """表示するデータセットを切り替える（人手確認などの作業状態はリセット）。"""
     data.setdefault("meta", {})["uid"] = data["meta"].get("uid") or uuid.uuid4().hex
-    if not data.get("groups"):
-        PC.assign_groups(data)
+    PC.assign_groups(data)  # 出願人の名寄せ（自動）と色分けのグループは、開くたびに作り直す
     st.session_state.dataset = data
     for k, v in (("reviews", {}), ("review_pid", None), ("net_node", None), ("map_patent", None),
                  ("search_results", None), ("_xlsx", None)):
@@ -792,15 +791,15 @@ with st.sidebar:
     if extract_method == METHODS[0]:
         st.markdown("### 🎚️ 自動採用の厳しさ")
         _AMV = {2: "標準（devでF1が最も高い）", 3: "やや厳しめ（おすすめ）", 4: "厳しめ", 5: "高信頼", 6: "最高信頼"}
-        _AMV_P = {2: (63, 43), 3: (67, 42), 4: (71, 30), 5: (78, 19), 6: (81, 7)}  # test 272件（2026-09-28、規則の整理の後）
+        _AMV_P = {2: (63, 45), 3: (67, 43), 4: (72, 36), 5: (79, 26), 6: (83, 16)}  # test 272件（2026-09-28、R78 まで）
         accept_min_votes = st.select_slider(
             "自動で採用する裏付けの数", options=list(_AMV), value=3, key="accept_min_votes",
             format_func=lambda v: f"{v}以上：{_AMV[v]}",
             help="裏付け＝ほかの独立した候補の作り方（区間内の組・係り受けの組・文型の規則など）が同じ組を出した数。"
-                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約52%）は変わりません。")
+                 "足りない関係は捨てずに「要確認」に回すので、採用＋要確認の再現率（約54%）は変わりません。")
         _p, _r = _AMV_P[accept_min_votes]
         st.caption(f"532件のうち規則づくりに使っていない半分（test 272件）で測った目安：自動採用の適合率 約{_p}%・再現率 約{_r}%／"
-                   "採用＋要確認の再現率 約52%")
+                   "採用＋要確認の再現率 約54%")
         verify_llm = st.checkbox("要確認をLLMに確かめさせる（実験・R63）", value=False, key="verify_llm",
                                  help="要確認の候補（最大30件）について、LLMに「その関係が本文に書かれているか」を はい／いいえ で"
                                       "答えさせ、「はい」を採用にします。LLMは関係を作らず、確かめるだけです。1件あたりLLMの呼び出しが1回増えます。")
@@ -824,6 +823,19 @@ def page_data():
         st.success(st.session_state.pop("_ingest_msg"))
     if DATA:
         st.info(f"現在のデータ：**{DATA['meta'].get('name')}**（{len(DATA['patents']):,} 件）", icon="📂")
+        merges = DATA.get("name_merges") or {}
+        with st.expander(f"🏷️ 出願人の名寄せ（自動）：{len(merges)} 社をまとめました" if merges
+                         else "🏷️ 出願人の名寄せ（自動）：まとめる会社はありませんでした"):
+            st.caption("出願人の名前から「株式会社」などを除き、全角・半角をそろえたうえで、データの中の会社名どうしを比べて自動でまとめます。"
+                       "ある会社名が別の会社名の先頭にそのまま付いているとき（「東芝」と「東芝デバイス＆ストレージ」）と、"
+                       "親会社が「日立製作所」「〇〇ホールディングス」のときに「日立」で始まる会社をまとめます。"
+                       "「三菱電機」と「三菱重工業」のように、どちらも相手の先頭に付いていない会社はまとめません。"
+                       "分析のページの出願人は、まとめた後の名前で表示されます（元の出願人名はエクスポートに残ります）。")
+            if merges:
+                cnt = Counter(PC.company_name(p.get("applicant")) for p in DATA["patents"] if p.get("applicant"))
+                st.dataframe(pd.DataFrame([{"まとめた先": v, "元の会社名": k, "件数": cnt.get(k, 0)}
+                                           for k, v in sorted(merges.items(), key=lambda kv: (kv[1], kv[0]))]),
+                             hide_index=True, use_container_width=True)
     # タブ（st.tabs）は再実行のたびに最初のタブへ戻ることがあるので、選択を覚えるラジオボタンで切り替える
     SECS = ["📄 特許リストを読み込む", "📝 請求項を追加", "💾 解析済みデータを開く"]
     sec = st.radio("操作", SECS, horizontal=True, key="data_section", label_visibility="collapsed")
@@ -2030,7 +2042,8 @@ def page_distribution():
 
 def page_compare():
     st.title("🐚 2つの請求項を比較")
-    st.caption("請求項A・Bを解析し、Jaccard類似度・構造の類似度・クレームの広さ狭さ・意味マッチングで比較します。")
+    st.caption("請求項A・Bを解析し、意味マッチング（三つ組どうしの意味の近さで対応を取る方法）で比較します。"
+               "初回は意味の近さを測るモデルの読み込みに1分程度かかります。")
     col_a, col_b = st.columns(2)
     opts = ["（貼り付ける）"] + ([p["id"] for p in DATA["patents"]] if DATA else [])
     fmt = lambda x: x if x == "（貼り付ける）" else patent_label(x)  # noqa: E731
@@ -2040,7 +2053,6 @@ def page_compare():
     with col_b:
         pb = st.selectbox("請求項B（データセットから選ぶか貼り付け）", opts, format_func=fmt, key="cmp_b")
         text_b = st.text_area("請求項B", value=PATENTS[pb]["text"] if pb in PATENTS else "", height=220, key=f"text_b_{pb}")
-    use_semantic = st.checkbox("②意味マッチングも使う（初回はモデルの読み込みに1分程度かかります）", value=False)
     if st.button("🐚 比較する", type="primary", key="compare_run"):
         if not text_a.strip() or not text_b.strip():
             st.warning("請求項A・Bの両方を入力してください。")
@@ -2050,20 +2062,9 @@ def page_compare():
                 try:
                     _, relations_a = llm_extract(text_a)
                     _, relations_b = llm_extract(text_b)
-                    jaccard_score, common, only_a, only_b = pp.jaccard_similarity(relations_a, relations_b)
-                    structural_score, structural_detail = pp.structural_similarity(relations_a, relations_b)
-                    semantic_score, semantic_matches = None, None
-                    if use_semantic:
-                        try:
-                            semantic_score, semantic_matches = pp.semantic_similarity(relations_a, relations_b)
-                        except Exception as e:  # noqa: BLE001
-                            st.error(f"意味マッチングでエラーが発生しました: {e}")
+                    semantic_score, semantic_matches = pp.semantic_similarity(relations_a, relations_b)
                     st.session_state.compare_result = {
-                        "jaccard_score": jaccard_score, "common": common, "only_a": only_a, "only_b": only_b,
-                        "structural_score": structural_score, "structural_detail": structural_detail,
                         "semantic_score": semantic_score, "semantic_matches": semantic_matches,
-                        "scope_a": pp.compute_claim_scope_score(relations_a),
-                        "scope_b": pp.compute_claim_scope_score(relations_b),
                         "relations_a": relations_a, "relations_b": relations_b,
                     }
                 except Exception as e:  # noqa: BLE001
@@ -2073,41 +2074,20 @@ def page_compare():
     if res is None:
         return
     st.markdown("### 🦪 診断結果")
-    sc = st.columns(3)
-    sc[0].metric("①Jaccard類似度（表記の一致）", f"{res['jaccard_score']:.3f}")
-    sc[1].metric("②意味マッチング類似度", f"{res['semantic_score']:.3f}" if res["semantic_score"] is not None else "―（未使用）")
-    sc[2].metric("③構造の類似度", f"{res['structural_score']:.3f}")
-    with st.expander("③構造比較の内訳を見る"):
-        d = res["structural_detail"]
-        st.write("\n".join(f"- {k}: {v:.3f}" for k, v in d.items() if isinstance(v, (int, float))))
-    st.markdown("### 🐙 クレームの広さ・狭さの比較")
-    ca, cb = st.columns(2)
-    for col, key, name in ((ca, "scope_a", "請求項A"), (cb, "scope_b", "請求項B")):
-        narrowness, breadth, detail = res[key]
-        with col:
-            st.markdown(f"**{name}**")
-            st.metric("広さスコア", f"{breadth:.3f}")
-            st.caption(f"構成要素数: {detail['構成要素数']} / 数値スペック: {detail['数値スペックの数']} / "
-                       f"階層の深さ: {detail['階層の深さ']}")
-    st.caption("※ このスコアは絶対的な尺度ではなく、AとBを相対的に比べるための指標です。")
+    st.metric("意味マッチング類似度", f"{res['semantic_score']:.3f}")
+    st.markdown("### 🐙 SAOの図")
     ga, gb = st.columns(2)
     with ga:
+        st.markdown("**請求項A**")
         sao_graph(res["relations_a"], key="dep_a")
     with gb:
+        st.markdown("**請求項B**")
         sao_graph(res["relations_b"], key="dep_b")
-    st.markdown("### 🧩 ①Jaccard：トリプルの一致・不一致")
-    c1, c2, c3 = st.columns(3)
-    for col, key, name in ((c1, "common", "共通トリプル"), (c2, "only_a", "Aだけにあるトリプル"), (c3, "only_b", "Bだけにあるトリプル")):
-        with col:
-            st.markdown(f"**{name}（{len(res[key])}件）**")
-            for t in sorted(res[key]):
-                st.write(t)
-    if res["semantic_matches"] is not None:
-        st.markdown("### 🫧 ②意味マッチング：対応付けの詳細")
-        st.dataframe([{"類似度": round(sim, 2), "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
-                       "トリプルA": " / ".join(ta), "トリプルB": " / ".join(tb)}
-                      for ta, tb, sim in sorted(res["semantic_matches"], key=lambda x: -x[2])],
-                     use_container_width=True, hide_index=True)
+    st.markdown("### 🫧 意味マッチング：対応付けの詳細")
+    st.dataframe([{"類似度": round(sim, 2), "判定": "完全一致" if ta == tb else ("意味が近い" if sim >= 0.6 else "対応薄い"),
+                   "トリプルA": " / ".join(ta), "トリプルB": " / ".join(tb)}
+                  for ta, tb, sim in sorted(res["semantic_matches"] or [], key=lambda x: -x[2])],
+                 use_container_width=True, hide_index=True)
 
 
 # ===========================================================================
@@ -2146,10 +2126,6 @@ def page_dependent():
     c1, c2 = st.columns([3, 2])
     with c1:
         sao_graph(rels)
-        narrowness, breadth, _ = pp.compute_claim_scope_score(rels)
-        m = st.columns(2)
-        m[0].metric("広さスコア", f"{breadth:.3f}")
-        m[1].metric("狭さスコア", f"{narrowness:.3f}")
     with c2:
         st.dataframe([{"主語": r["source"], "関係": r["relation"], "目的語": r["target"]} for r in rels],
                      use_container_width=True, hide_index=True)

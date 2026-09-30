@@ -9595,6 +9595,39 @@ RULES = [
      "desc": "要確認の候補（1件あたり最大30件）について、LLM に「その関係が本文に書かれているか」を はい／いいえ で答えさせ、"
              "「はい」を採用にする。LLM は関係を作らず、規則が作った候補を確かめるだけ（--llm-verify のときだけ使う）",
      "example": "要確認 第１のトランス｜受ける｜第１の送信信号 → LLM：はい → 採用", "llm": True},
+    {"id": "R69", "stage": "SAO", "name": "方法の請求項の「…することを含む」から工程の目的語を取る",
+     "desc": "「前記方法が、ＡとＢとを、Ｃに対して投与することを含む」のように工程の名前が無い方法の請求項で、"
+             "題名｜投与する｜Ａ・Ｂ、題名｜に対して投与する｜Ｃ を採用する。題名が工程の目的語以外の部品を「有する」とした関係は要確認にする",
+     "example": "障害の治療方法｜投与する｜抗ＣＤ２０抗体", "llm": False},
+    {"id": "R70", "stage": "SAO", "name": "「である」の相手の並びを全部つなぐ",
+     "desc": "「前記障害が、がんまたは自己免疫疾患であり」のように「である」の相手が並んでいるとき、全部に関係を作る",
+     "example": "障害｜である｜がん、障害｜である｜自己免疫疾患", "llm": False},
+    {"id": "R71", "stage": "選ぶ", "name": "中身の動詞が無い関係は要確認",
+     "desc": "関係が「する」「される」「ある」だけの採用は、要確認にする",
+     "example": "患者｜する｜治療（「前記治療を必要とする患者」）→ 要確認", "llm": False},
+    {"id": "R72", "stage": "構成要素", "name": "長い化学名は呼び名にする",
+     "desc": "長い化学名の後ろに「（化合物Ｉ−２６３ａ）」のような呼び名が付いているときは、呼び名だけにしてから解析する",
+     "example": "［（１Ｒ，２Ｓ，４Ｒ）−４−…］メチルスルファメート（化合物Ｉ−２６３ａ）→ 化合物Ｉ−２６３ａ", "llm": False},
+    {"id": "R73", "stage": "整理", "name": "漢語だけの関係に「する」を補う",
+     "desc": "関係が「変換」「接続」のような漢語だけのときは、本文に「変換し」「接続され」などがあれば「変換する」「接続される」にする",
+     "example": "変換部｜変換｜ビット数 → 変換部｜変換する｜ビット数", "llm": False},
+    {"id": "R74", "stage": "構造の分割", "name": "但し書きを外す",
+     "desc": "「（但し、…を除く。）」「（ただし…）」は、発明に含まれないものの説明なので、関係を取る前に外す",
+     "example": "（ただし、…ビタミンＥを含むものを除く。）→ ビタミンＥ｜含む｜… を作らない", "llm": False},
+    {"id": "R75", "stage": "SAO", "name": "マーカッシュ形式の要素をつなぐ",
+     "desc": "「Ａ、Ｂ及びＣからなる群から選ばれる少なくとも１種のＹ」「Ｘが、…からなる群より選択される」を、Ｙ（Ｘ）｜から選ばれる｜Ａ・Ｂ・Ｃ にする。"
+             "「群」「何れ」を主語・目的語にした関係は要確認にする",
+     "example": "リン酸、有機酸…からなる群より選ばれる少なくとも１つの酸性物質 → 酸性物質｜から選ばれる｜リン酸", "llm": False},
+    {"id": "R76", "stage": "選ぶ", "name": "指示語や数値だけの名前は要確認",
+     "desc": "「その塩」のような指示語で始まる名前と、比較・範囲以外の関係で数値だけの名前（「１９０ＭＰａ」「１００質量部」）は、自動では採用しない",
+     "example": "化粧料｜有する｜１９０ＭＰａ → 要確認", "llm": False},
+    {"id": "R77", "stage": "SAO", "name": "冒頭の「Ａと、Ｂとを含み、」を題名につなぐ",
+     "desc": "請求項で最初の「Ａと、Ｂと、Ｃとを含み（有し・備え・含有し）、…題名。」「Ａと、Ｂと、を含むことを特徴とする題名。」の並びを、"
+             "題名｜含む｜Ａ・Ｂ・Ｃ にする（各要素は修飾を除いた最後の名詞のまとまり）。並びが「前記Ｘは、」の文の中にあれば、題名ではなくＸにつなぐ",
+     "example": "エポキシ樹脂と、硬化剤と、硬化促進剤とを含み、…エポキシ樹脂組成物 → エポキシ樹脂組成物｜含む｜硬化剤", "llm": False},
+    {"id": "R78", "stage": "構成要素", "name": "題名が取れないときは冒頭か「を特徴とする」の後から取る",
+     "desc": "「Ｘにおいて、…である。」のように最後が名詞で終わらず題名が取れないときは、「…を特徴とするＸ。」か、冒頭の「Ｘであって、」「Ｘにおいて、」のＸを題名にする",
+     "example": "内輪と、外輪と、…を備える転がり軸受において、…である。→ 題名＝転がり軸受", "llm": False},
     {"id": "R68", "stage": "SAO", "name": "連体修飾の組を本文の文型で補う",
      "desc": "GiNZAが係り先を取り違えやすい形を本文の文字の並びで拾う。「XとAとの間に…するB」「Aを…するとともに…されたB」は採用、"
              "「A＋格助詞＋動詞の連体形＋B」（動詞はすぐ後ろの名詞にかかる）は要確認として出す",
@@ -9658,6 +9691,16 @@ EFFECTS = {
     "R66": {"f1_delta": 0.26, "review_delta": 0.29},
     "R67": {"f1_delta": 0.03, "review_delta": -0.02, "note": "F1 を上げる規則ではなく、関係を正解データと同じ辞書形にそろえる規則"},
     "R68": {"f1_delta": 0.14, "review_delta": 0.46},
+    "R69": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加。医薬の方法の請求項（特許7352582）をきっかけに作った。半導体の532件では一度も働かない"},
+    "R70": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加。特許7352582 がきっかけ。532件では働かない（主語が「一方」の1件は除くようにした）"},
+    "R71": {"f1_delta": 0.10, "review_delta": 0.0, "note": "2026-09-28 追加。特許7352582 がきっかけ。dev で誤った採用 16件を要確認にした（正解は減らない）"},
+    "R72": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加。特許7352582 がきっかけ。532件には長い化学名＋呼び名の書き方が無い"},
+    "R73": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加（他分野の請求項62件から）。評価の値は変わらない（関係の一致は漢字部分で見るため）。関係の書き方をそろえる規則"},
+    "R74": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加（他分野の請求項62件から）。半導体の532件には但し書きが無い"},
+    "R75": {"f1_delta": 0.0, "review_delta": 0.0, "note": "2026-09-28 追加（他分野の請求項62件から）。半導体の532件にはマーカッシュ形式が無い"},
+    "R76": {"f1_delta": 0.05, "review_delta": 0.0, "note": "2026-09-28 追加（他分野の請求項62件から）。dev で誤った採用 8件を要確認に"},
+    "R77": {"f1_delta": 0.75, "review_delta": 0.71, "note": "2026-09-28 追加（他分野の請求項62件から）。dev で採用 142件を追加し、うち 71件が正解"},
+    "R78": {"f1_delta": 0.07, "review_delta": 0.04, "note": "2026-09-28 追加（他分野の請求項62件から）"},
     "R60": {"f1_delta": 0.0, "note": "採用には影響しない。候補の再現率（dev）49.5% → 91.5%（run_recall_check.bat で測る）"},
     "R64": {"f1_delta": 4.1, "note": "LLM が必要。dev 10件だけの予備の測定（R65 の前）：規則だけ 58.8 → 62.9（完全一致）。"
                                    "要確認→採用にした関係の 75% が正解。本番の数字は run_r64_check.bat で測る"},
@@ -15808,7 +15851,25 @@ def structure_fixes(pp, text, info):
     if enabled("R31") and any("ST:工程" in c["srcs"] for c in cands):
         cands = _drop_where(info, cands, lambda c: c["source"] in BARE_STEPS_ls or c["target"] in BARE_STEPS_ls, "R31")
     title = info.get("title")
+    if not title and enabled("R78"):
+        # 【R78】題名が取れないとき（「Ｘにおいて、…である。」のように最後が名詞で終わらない書き方など）は、
+        # 冒頭の「Ｘであって、」「Ｘにおいて、」か、最後の「…を特徴とするＸ。」のＸを題名にする
+        flat78 = re.sub(r"\s", "", clean)
+        m78 = (re.search(r"(?:を特徴とする|からなる|を備えた|を有する)、?([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9・−]{2,30})。", flat78)
+               or re.match(r"^([^、。]{2,40}?)(?:であって|において|に於いて)[、，]", flat78))
+        if m78:
+            mm78 = re.search(r"([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9・−]{2,30})$", m78.group(1))
+            if mm78:
+                info["title"] = title = clean_node(mm78.group(1))
     if title and enabled("R33"):
+        # 題名が「前記方法」のように前の言い方を指しているときは、冒頭の「〜方法であって、」の言い方にする
+        anaph = re.match(r"^(前記|該|当該|上記)", title)
+        if anaph and len(title) > anaph.end():
+            base = title[anaph.end():]
+            m0 = re.match(r"^\s*([^、。，\s]{0,40}?" + re.escape(base) + r")(?:であって|において|に於いて)", clean)
+            newt = m0.group(1) if m0 else base
+            fixes[title], fix_rule[title] = newt, "R33"
+            info["title"] = title = newt
         ext = claim_final_title(clean, title)
         if ext != title:
             fixes[title], fix_rule[title] = ext, "R33"
@@ -16612,6 +16673,223 @@ def relative_clause_triples(pp, text, nodes):
     return [(b, r, a, ok) for b, r, a, ok in out if not _R68_BADV.match(r)]
 
 
+# 【R69】方法の請求項の「前記方法が、ＡとＢとを、Ｃに対して…投与することを含む」（工程の名前が無い書き方）。
+#  題名｜動詞｜Ａ、題名｜動詞｜Ｂ、題名｜に対して動詞｜Ｃ を作る。「ＡまたはＢ」は最初のものだけ、「その〜」は除く
+_R69_SPLIT = re.compile(r"と、|と|、|及び|および|並びに|ならびに")
+_R69_NAME = re.compile(r"^(?!.*(?:を|には|とを|から|まで|により|によって|こと|する|した|され))"
+                       r"[一-龥々ぁ-んァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9−\-・（）()]{2,50}$")
+
+
+def _r69_clean(x):
+    x = re.split(r"または|又は|若しくは|もしくは", x)[0]
+    return clean_node(re.sub(r"^(?:前記|該|当該|上記)", "", x.strip("、")))
+
+
+def method_step_triples(pp, text, title):
+    """【R69】(主語, 関係, 目的語) のリストと、その目的語の名前の集合"""
+    t = re.sub(r"\s", "", pp._clean_claim_text(text))
+    out, objs = [], set()
+    if not title:
+        return out, objs
+    for m in re.finditer(r"(?:前記|該)?(?:方法|工程)(?:は|が)、(.{1,300}?)ことを(?:含む|含み|備える|備え|有する|有し)", t):
+        body = m.group(1)
+        k = body.find("とを") + 1 if "とを" in body else body.find("を")
+        if k <= 0:
+            continue
+        mv = re.search(r"([一-龥]+(?:する|させる|される))$", body)
+        if not mv:
+            continue
+        rel = dict_form(mv.group(1))
+        for item in _R69_SPLIT.split(body[:k]):
+            if not item or item.startswith("その"):
+                continue
+            x = _r69_clean(item)
+            if _R69_NAME.match(x) and x != title:
+                out.append((title, rel, x))
+                objs.add(x)
+        mr = re.search(r"([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9]{2,20})(?:に対して|に対し)", body[k:])
+        if mr:
+            x = _r69_clean(mr.group(1))
+            out.append((title, "に対して" + rel, x))
+            objs.add(x)
+    return list(dict.fromkeys(out)), objs
+
+
+# 【R70】「前記障害が、がんまたは自己免疫疾患であり」のように、「である」の相手が並んでいるときは、全部に関係を作る
+_R70_RE = re.compile(r"(?:前記|該)?([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9]{2,20})(?:は|が)、?"
+                     r"([^、。]{2,60}?)(?:であり|である|であって|であること)")
+_R70_OR = re.compile(r"または|又は|若しくは|もしくは|及び|および|並びに|ならびに|、")
+
+
+def coordinated_copula_triples(pp, text):
+    t = re.sub(r"\s", "", pp._clean_claim_text(text))
+    out = []
+    for m in _R70_RE.finditer(t):
+        items = [_r69_clean(x) for x in _R70_OR.split(m.group(2)) if x]
+        if len(items) < 2 or not all(_R69_NAME.match(x) for x in items):
+            continue
+        s0 = _r69_clean(m.group(1))
+        if s0 in _R51_WORDS or s0 in NON_NODES or not _R69_NAME.match(s0):
+            continue  # 「一方が、」のように主語が構成要素でないときは作らない
+        out += [(s0, "である", x) for x in items if x != s0]
+    return list(dict.fromkeys(out))
+
+
+# 【R71】関係が「する」「される」だけ（中身の動詞が無い）なら、自動では採用しない
+_R71_BARE = {"する", "される", "し", "した", "された", "させる", "させた", "なる", "ある", "あり"}
+
+
+# 【R72】長い化学名の後ろに「（化合物Ｉ−２６３ａ）」のような呼び名が付いているときは、呼び名だけにしてから解析する
+#  （化学名の中の括弧・読点・数字で、係り受けの解析が崩れるため）
+_R72_RE = re.compile(r"[\[\]［］｛｝{}()（）,，\-−－‐0-9０-９A-Za-zＡ-Ｚａ-ｚ一-龥ァ-ヴー・'’]{25,}?（((?:化合物|式)[^（）]{1,20})）")
+
+
+def chem_alias(text):
+    def rep(m):
+        name = m.group(0)
+        if len(re.findall(r"[\[\]［］｛｝{}()（）,，\-−－]", name)) < 4:
+            return name
+        return m.group(1)
+    return _R72_RE.sub(rep, text or "")
+
+
+# 【R74】但し書き「（但し、…を除く。）」「（ただし…）」は、発明に含まれないものの説明なので、関係を取る前に外す
+_R74_RE = re.compile(r"[（(]\s*(?:但し|ただし|但)[、，]?[^（）()]*(?:[（(][^（）()]*[）)][^（）()]*)*[）)]")
+
+
+def strip_provisos(text):
+    return _R74_RE.sub("", text or "")
+
+
+# 【R73】関係が「変換」「接続」のような漢語だけのときは、本文の書き方に合わせて「変換する」「接続される」にする
+_R73_KEEP = {"以上", "以下", "未満", "超", "平行", "反対側", "非対称", "対称", "同一", "一体", "直列", "並列", "垂直", "近傍"}
+
+
+def verbal_noun_form(rel, text):
+    if not re.fullmatch(r"[一-龥]{2,}", rel or "") or rel in _R73_KEEP:
+        return rel
+    act = re.search(re.escape(rel) + r"(?:する|し|した|して|させ)", text)
+    pas = re.search(re.escape(rel) + r"(?:され|された|される)", text)
+    if act:
+        return rel + "する"
+    if pas:
+        return rel + "される"
+    return rel
+
+
+# 【R75】マーカッシュ形式「Ａ、Ｂ及びＣからなる群から選ばれる少なくとも１種の Ｙ」「Ｘが、Ａ…からなる群より選択される１以上である」
+#  → Ｙ（または Ｘ）｜から選ばれる｜Ａ・Ｂ・Ｃ。「群」「何れ」を主語・目的語にした関係は要確認にする
+_R75_GROUP = re.compile(r"(?:からなる|から成る|よりなる)群(?:から|より)(?:選ばれる|選ばれた|選択される|選択された)")
+_R75_ITEM_SPLIT = re.compile(r"及び|および|並びに|ならびに|又は|または|若しくは|もしくは|、|，|と")
+_R75_AFTER = re.compile(r"^(?:少なくとも)?(?:[0-9０-９一二三]+(?:(?:または|又は|〜|～)[0-9０-９一二三]+)?(?:種|つ|個)?(?:以上)?|いずれか|何れか|一種|１種|1種)?"
+                        r"(?:以上)?(?:の|である|であって)?([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9（）()・−]{2,30}|[一-龥](?=[と、，をがはでにの]|である))?")
+_R75_NODES = {"群", "何れ", "いずれか", "何れか", "いずれ", "少なくとも１種", "少なくとも1種", "１種", "1種", "一種"}
+
+
+def _markush_items(head):
+    """「…、Ａ、Ｂ及びＣ」の末尾から、並んでいる名前だけを取り出す（右から見て、名前でないところで止める）"""
+    parts = re.split(r"及び|および|並びに|ならびに|又は|または|若しくは|もしくは|、|，", head)
+    items = []
+    for x in reversed(parts):
+        if not x:
+            continue
+        lab = re.match(r"^[（(][Ａ-ＺA-Za-zａ-ｚ0-9０-９]{1,2}[）)]", x)
+        y = x[lab.end():] if lab else x
+        y = _r69_clean(y)
+        if re.search(r"(?:が|は|を|に|で)$", y):
+            break
+        if y and len(y) <= 25 and (_R69_NAME.match(y) or re.fullmatch(r"[一-龥]|[Ａ-ＺA-Z][ａ-ｚa-z]?", y)) and not y.startswith("その") \
+                and "）" not in y[:1]:
+            items.append(y)
+            if lab:
+                break
+            continue
+        mm = re.search(r"(?:[（(][Ａ-ＺA-Za-zａ-ｚ0-9０-９]{1,2}[）)])?([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9・−]{2,20})$", x)
+        if mm and not items:
+            items.append(_r69_clean(mm.group(1)))
+        elif mm and re.search(r"(?:^|[をにがはでと、])$", x[:mm.start()]) and len(mm.group(1)) <= 20:
+            items.append(_r69_clean(mm.group(1)))
+        break
+    return list(reversed(items))
+
+
+def markush_triples(pp, text):
+    t = re.sub(r"\s", "", pp._clean_claim_text(text))
+    out = []
+    for m in _R75_GROUP.finditer(t):
+        head = t[:m.start()]
+        subj = None
+        ma = _R75_AFTER.match(t[m.end():])
+        ms = re.search(r"([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9（）()・−]{2,30})(?:は|が)[、，][^。]*$", head)
+        if ma and ma.group(1) and not re.match(r"^(?:であ|を|に|が|は|で)", ma.group(1)):
+            subj = ma.group(1)
+            # 「Ｘが、…から選ばれる少なくとも１種の酸化物である」は、Ｘ（主語）の方を使う
+            if ms and t[m.end() + ma.end():].startswith("であ"):
+                subj = ms.group(1)
+        if not subj:
+            subj = ms.group(1) if ms else None
+        if not subj:
+            continue
+        subj = _r69_clean(subj)
+        items = [x for x in _markush_items(head) if x and x != subj]
+        if len(items) >= 2 and (_R69_NAME.match(subj) or re.fullmatch(r"[一-龥]", subj)):
+            out += [(subj, "から選ばれる", x) for x in items]
+    return list(dict.fromkeys(out))
+
+
+# 【R76】「その塩」「その処理物」のような指示語で始まる名前と、数値だけの名前（比較・範囲以外の関係）は、自動では採用しない
+_R76_NUM = re.compile(r"^[0-9０-９.．,，〜～\-−]+(?:[a-zA-Zａ-ｚＡ-Ｚμ℃%％°/／·・]+|質量部|重量部|質量％|重量％|体積％|モル％|秒間?|分間?|時間|倍|個|本|枚)?$")
+_R76_OK_REL = re.compile(r"以上|以下|未満|超|より|である|範囲|等しい|同じ")
+
+
+def weak_node(rel, name):
+    x = name or ""
+    return x.startswith("その") or (bool(_R76_NUM.match(x)) and not _R76_OK_REL.search(rel or ""))
+
+
+# 【R77】「Ａと、Ｂと、Ｃとを含み（有し・備え・含有し）、…題名。」「…Ａと、Ｂと、を含むことを特徴とする題名。」の並びを、
+#  題名の構成要素にする（請求項の中で最初の「を含む・有する・備える」の並びだけ。各要素は、修飾を除いた最後の名詞のまとまり）
+_R77_VERB = re.compile(r"と?[、，]?を(?:少なくとも)?(含み|含有し|有し|備え|具備し|含む|含有する|有する|備える|具備する)"
+                       r"(?=[、，]|ことを特徴とする|$|[^。]{0,3}。)")
+_R77_VERBMAP = {"含み": "含む", "含有し": "含有する", "有し": "有する", "備え": "備える", "具備し": "具備する"}
+
+
+def head_enumeration_triples(pp, text, title):
+    t = re.sub(r"\s", "", pp._clean_claim_text(text))
+    if not title:
+        return []
+    m = _R77_VERB.search(t)
+    if not m:
+        return []
+    head = t[:m.start()]
+    cut = max(head.rfind("であって、"), head.rfind("において、"), head.rfind("であって，"), head.rfind("。"))
+    seg = head[cut + 1:] if cut >= 0 else head
+    seg = re.sub(r"^(?:であって|において)[、，]?", "", seg)
+    k = max(seg.rfind("は、"), seg.rfind("が、"), seg.rfind("は，"), seg.rfind("が，"))
+    subject = title
+    if k >= 0:
+        # 「前記Ｘは、Ａと、Ｂとを有し」の並びは、題名ではなくＸ（主題）の構成要素
+        mt = re.search(r"([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9（）()・−]{2,40})$", seg[:k])
+        subject = _r69_clean(mt.group(1)) if mt else None
+        seg = seg[k + 2:]
+        if not subject or not _R69_NAME.match(subject):
+            return []
+    parts = [x for x in re.split(r"と[、，]", seg) if x]
+    if len(parts) < 2 or any(re.match(r"^(?:に|を|で|から|より|の|へ|が|は)", x) for x in parts[1:]):
+        return []  # 「ＡとＢと、に基づいて…」のような並びは、構成要素の並びではない
+    verb = _R77_VERBMAP.get(m.group(1), m.group(1))
+    out = []
+    for x in parts:
+        x = re.sub(r"と$", "", x)
+        mm = re.search(r"([一-龥々ァ-ヴーＡ-Ｚａ-ｚ０-９A-Za-z0-9（）()・−]{2,50})$", x)
+        if not mm:
+            continue
+        name = _r69_clean(mm.group(1))
+        if name and name != subject and _R69_NAME.match(name) and not _not_component(pp, name):
+            out.append((subject, verb, name))
+    return out if len(out) >= 2 else []
+
+
 _HAS_FAMILY = ("有する", "備える", "具備", "含む", "含め")
 
 
@@ -16638,6 +16916,10 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
     LLM を呼べないとき・use_llm=False のときは、通常の GiNZA の規則の結果を土台にする（mode="rules"。規則の確認用の評価も
     これを使う）。
     戻り値：(info, 判定, LLM の出力 または エラー)"""
+    if enabled("R72"):
+        text = chem_alias(text)
+    if enabled("R74"):
+        text = strip_provisos(text)
     info = build_rule_and_llm_candidates(ts, pp, text, model=model, host=host, llm_output="", pool="standard")
     raw = ""
     info["mode"], info["components_used"], info["component_error"] = "rules", [], None
@@ -16745,7 +17027,11 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
                     if v >= R62_MIN_VOTES or (v >= 3 and ev in ("rel", "topic")) or (v >= 4 and typ == "verb"):
                         add.append((v, s0, r0, t0))
                         shown |= {k, (k[1], k[0])}
+                ttl = info.get("title")
                 for v, s0, r0, t0 in sorted(add, reverse=True)[:30]:
+                    if ttl and enabled("R33"):  # 題名の短い言い方（「方法」）は題名にそろえる
+                        s0 = ttl if s0 != ttl and ttl.endswith(s0) else s0
+                        t0 = ttl if t0 != ttl and ttl.endswith(t0) else t0
                     c = {"source": s0, "relation": r0, "target": t0, "srcs": ["RC:裏付け"], "rules": ["R62"], "base": False}
                     info["cands"].append(c)
                     judged.append({"selected": False, "score": 0.35, "status": "要確認",
@@ -16790,6 +17076,86 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
                 shown.setdefault(k, []).append("採用" if adopt else "要確認")
         except Exception as exc:  # noqa: BLE001
             info["relcl_error"] = str(exc)[:200]
+    if enabled("R69") or enabled("R70"):
+        try:
+            nrm = pp._normalize_node_text_lenient
+            have = {(nrm(c["source"]), c["relation"], nrm(c["target"])): i for i, c in enumerate(info["cands"])}
+            title = info.get("title")
+            add = []
+            objs = set()
+            if enabled("R69"):
+                trip, objs = method_step_triples(pp, text, title)
+                add += [(x, "R69", "方法の工程（「…することを含む」）の目的語（R69）") for x in trip]
+            if enabled("R70"):
+                add += [(x, "R70", "「である」の相手の並び（R70）") for x in coordinated_copula_triples(pp, text)]
+            for (s0, r0, o0), rid, basis in add:
+                k = (nrm(s0), r0, nrm(o0))
+                if k in have:
+                    j = judged[have[k]]
+                    if j["status"] != "採用":
+                        mark(info["cands"][have[k]], rid)
+                        j.update(selected=True, status="採用", score=max(j["score"], 0.7), basis=j["basis"] + "→" + basis)
+                    continue
+                c = {"source": s0, "relation": r0, "target": o0, "srcs": ["RC:" + rid], "rules": [rid], "base": False}
+                info["cands"].append(c)
+                have[k] = len(info["cands"]) - 1
+                judged.append({"selected": True, "score": 0.7, "status": "採用", "basis": basis, "rules": [rid]})
+            if objs and title:
+                # 工程の名前の無い方法の請求項で、題名が部品を「有する」とした関係は、工程の目的語でなければ要確認
+                for c, j in zip(info["cands"], judged):
+                    if (j["status"] == "採用" and c["source"] == title and "R69" not in (c.get("rules") or [])
+                            and c["relation"].startswith(("有", "備", "含", "具備")) and nrm(c["target"]) not in objs):
+                        mark(c, "R69")
+                        j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                                 basis=j["basis"] + "→方法の請求項で工程の目的語ではない（R69）")
+        except Exception as exc:  # noqa: BLE001
+            info["method_error"] = str(exc)[:200]
+    if enabled("R71"):
+        for c, j in zip(info["cands"], judged):
+            if j["status"] == "採用" and c["relation"] in _R71_BARE:
+                mark(c, "R71")
+                j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                         basis=j["basis"] + "→関係に中身の動詞が無い（R71）")
+    if enabled("R75") or enabled("R77"):
+        try:
+            nrm = pp._normalize_node_text_lenient
+            have = {(nrm(c["source"]), c["relation"], nrm(c["target"])): i for i, c in enumerate(info["cands"])}
+            adopted_pairs = {frozenset((nrm(c["source"]), nrm(c["target"]))) for c, j in zip(info["cands"], judged)
+                             if j["status"] == "採用"}
+            add = []
+            if enabled("R75"):
+                add += [(x, "R75", "マーカッシュ形式（「…からなる群から選ばれる」）の要素（R75）") for x in markush_triples(pp, text)]
+            if enabled("R77"):
+                add += [(x, "R77", "冒頭の「Ａと、Ｂとを含み、」の並び（R77）") for x in head_enumeration_triples(pp, text, info.get("title"))]
+            for (s0, r0, o0), rid, basis in add:
+                if frozenset((nrm(s0), nrm(o0))) in adopted_pairs:
+                    continue
+                k = (nrm(s0), r0, nrm(o0))
+                if k in have:
+                    j = judged[have[k]]
+                    mark(info["cands"][have[k]], rid)
+                    j.update(selected=True, status="採用", score=max(j["score"], 0.7), basis=j["basis"] + "→" + basis)
+                else:
+                    c = {"source": s0, "relation": r0, "target": o0, "srcs": ["RC:" + rid], "rules": [rid], "base": False}
+                    info["cands"].append(c)
+                    have[k] = len(info["cands"]) - 1
+                    judged.append({"selected": True, "score": 0.7, "status": "採用", "basis": basis, "rules": [rid]})
+                adopted_pairs.add(frozenset((nrm(s0), nrm(o0))))
+            if enabled("R75"):
+                for c, j in zip(info["cands"], judged):
+                    if j["status"] == "採用" and (c["source"] in _R75_NODES or c["target"] in _R75_NODES
+                                                or (c["relation"].endswith("少ない") and "少なくとも" in text)):
+                        mark(c, "R75")
+                        j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                                 basis=j["basis"] + "→「群」「何れ」などを含む（R75）")
+        except Exception as exc:  # noqa: BLE001
+            info["markush_error"] = str(exc)[:200]
+    if enabled("R76"):
+        for c, j in zip(info["cands"], judged):
+            if j["status"] == "採用" and (weak_node(c["relation"], c["source"]) or weak_node(c["relation"], c["target"])):
+                mark(c, "R76")
+                j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                         basis=j["basis"] + "→指示語や数値だけの名前（R76）")
     if enabled("R65"):
         # 【R65】構成要素ではない語（「面」「直列」「位置」「第１導電型」「第１方向」「平面視」など）が主語・目的語の関係は、
         # 自動では採用せず要確認にする
@@ -16859,8 +17225,11 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
         order = {"採用": 0, "要確認": 1, "除外": 2}
         nrm = pp._normalize_node_text_lenient
         keep, pos = [], {}
+        flat_r67 = re.sub(r"\s", "", text)
         for c, j in zip(info["cands"], judged):
             c["relation"] = dict_form(c["relation"])
+            if enabled("R73"):
+                c["relation"] = verbal_noun_form(c["relation"], flat_r67)
             k = (nrm(c["source"]), c["relation"], nrm(c["target"]))
             if k in pos:
                 i = pos[k]
@@ -16928,6 +17297,7 @@ import io
 import json
 import math
 import re
+import unicodedata
 from collections import Counter, defaultdict
 import pathlib as _pathlib
 
@@ -17553,7 +17923,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-28a"
+PIPELINE_VERSION = "2026-09-28c"
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -17562,8 +17932,8 @@ DEFAULT_BANDS = {
 }
 METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
 METHOD_SCORE = ("学習データを使わない最終方式。LLMの呼び出しは1件あたり1回（構成要素の書き出し）。"
-                "参考（LLMなし・規則だけ）：トリプル完全一致 F1 は、規則を作るのに使った dev の半分で 52.6%（適合率 64.6%・再現率 44.3%）、"
-                "規則づくりに使っていない test の半分で 51.2%。意味が伝われば正解とする意味一致では dev 56.0%・test 55.0%。"
+                "参考（LLMなし・規則だけ）：トリプル完全一致 F1 は、規則を作るのに使った dev の半分で 53.4%（適合率 64.4%・再現率 45.7%）、"
+                "規則づくりに使っていない test の半分で 52.2%。意味が伝われば正解とする意味一致では dev 57.1%・test 56.3%。"
                 "精度はローカルのOllamaで評価コマンドを実行して測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
@@ -17673,15 +18043,52 @@ def first_claim(text):
     return t
 
 
-_CORP_RE = re.compile(r"(株式会社|有限会社|合同会社|一般社団法人|国立大学法人|学校法人|独立行政法人|\(株\)|（株）|"
-                      r"Co\.,?\s*Ltd\.?|Corporation|Inc\.?|CO\.,?\s*LTD\.?)", re.IGNORECASE)
+_CORP_RE = re.compile(r"(株式会社|有限会社|合同会社|合資会社|合名会社|一般社団法人|一般財団法人|公益社団法人|公益財団法人|"
+                      r"国立研究開発法人|国立大学法人|学校法人|独立行政法人|\(株\)|（株）|㈱|\(有\)|（有）|"
+                      r"インコーポレイテッド|インコーポレーテッド|コーポレイション|コーポレーション|リミテッド|エルエルシー|ゲーエムベーハー|"
+                      r"Co\.,?\s*Ltd\.?|Corporation|Corp\.?|Inc\.?|Limited|Ltd\.?|GmbH|LLC|CO\.,?\s*LTD\.?)", re.IGNORECASE)
 
 
 def company_name(applicant):
-    """筆頭出願人を、会社の種類（株式会社など）を除いた短い名前にする。"""
+    """筆頭出願人を、会社の種類（株式会社など）を除いた短い名前にする（全角・半角と空白の違いもそろえる）。"""
     first = re.split(r"[;；、,\n]", str(applicant or ""))[0].strip()
-    short = _CORP_RE.sub("", first).strip(" 　・")
+    first = unicodedata.normalize("NFKC", first)
+    short = re.sub(r"\s+", "", _CORP_RE.sub("", first)).strip(" 　・.,")
     return short or first or "不明"
+
+
+def auto_name_merges(names):
+    """出願人の名寄せ（自動）。データに出てくる会社名だけを使い、手で作る一覧は使わない。
+    ある会社名 A（2字以上）が、別の会社名 B の先頭にそのまま付いているとき（「東芝」と「東芝デバイス＆ストレージ」、
+    「三菱電機」と「三菱電機ビルソリューションズ」）、B を A にまとめる。候補が複数あれば一番短い A にまとめる。
+    親会社の名前が「日立製作所」「〇〇ホールディングス」のときは、「日立」で始まる会社もまとめる。
+    「三菱電機」と「三菱重工業」、「富士電機」と「富士通」のように、どちらも相手の先頭に付いていない会社はまとめない。
+    戻り値：{元の会社名: まとめた先の会社名}（まとめたものだけ）"""
+    uniq = sorted({n for n in names if n and n not in ("不明", "その他")}, key=lambda x: (len(x), x))
+    # 「日立製作所」「〇〇ホールディングス」のように、親会社の名前の後ろに会社を表す語が付いているときは、
+    # その語を除いた部分（「日立」）を先頭に持つ会社（「日立パワーデバイス」）もまとめる
+    stems = {}
+    for a in uniq:
+        m = re.match(r"^(.{2,}?)(製作所|ホールディングス|ホールディング|グループ|HD)$", a)
+        if m:
+            stems.setdefault(m.group(1), a)
+    merges = {}
+    for b in uniq:
+        parent = None
+        for a in uniq:
+            if len(a) >= len(b):
+                break
+            if len(a) >= 2 and b.startswith(a):
+                parent = a
+                break
+        if parent is None:
+            for stem, a in sorted(stems.items(), key=lambda kv: (len(kv[0]), kv[0])):
+                if a != b and b.startswith(stem):
+                    parent = a
+                    break
+        if parent:
+            merges[b] = merges.get(parent, parent)
+    return merges
 
 
 def fi_parts(fi):
@@ -17784,8 +18191,15 @@ def new_dataset(name, patents, bands=None):
             "bands": dict(bands or DEFAULT_BANDS), "patents": patents}
 
 
-def assign_groups(corpus, top=7):
-    """出願人（会社）ごとの色分け用グループ。件数の多い上位 top 社と「その他」。"""
+def assign_groups(corpus, top=7, merge_names=True):
+    """出願人（会社）ごとの色分け用グループ。件数の多い上位 top 社と「その他」。
+    merge_names=True のときは、先に出願人の名寄せ（auto_name_merges）を自動で行う。まとめた結果は corpus["name_merges"]"""
+    for p in corpus["patents"]:
+        p["company"] = company_name(p.get("applicant")) if p.get("applicant") else "不明"
+    merges = auto_name_merges([p["company"] for p in corpus["patents"]]) if merge_names else {}
+    for p in corpus["patents"]:
+        p["company"] = merges.get(p["company"], p["company"])
+    corpus["name_merges"] = merges
     cnt = Counter(p["company"] for p in corpus["patents"])
     tops = [c for c, _ in cnt.most_common() if c not in ("不明", "その他")][:top]
     for p in corpus["patents"]:
@@ -19415,8 +19829,8 @@ comp_first = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS, COMPONENT_SYSTEM=COMP
 recall_gen = _types.SimpleNamespace(CASES=CASES_rg, FLAG_7B=FLAG_7B, HAS=HAS_rg, HASLAB=HASLAB, LINK=LINK, NEAR_SUB=NEAR_SUB, NONN=NONN, NOUNISH_POS=NOUNISH_POS, POSW=POSW, RELF=RELF, _after=_after, chunks=chunks, extra_nodes=extra_nodes, generate=generate, is_nounish=is_nounish, node_candidates=node_candidates, txt=txt)
 llm_fewshot = _types.SimpleNamespace(FEWSHOT_EXAMPLES=FEWSHOT_EXAMPLES, FEWSHOT_GUIDE=FEWSHOT_GUIDE, FEWSHOT_IDS=FEWSHOT_IDS, NUM_PREDICT=NUM_PREDICT, TIMEOUT_SECONDS=TIMEOUT_SECONDS, _DROP_PREFIX_RE=_DROP_PREFIX_RE, _LEAD_RE=_LEAD_RE, _SEP_RE=_SEP_RE, _SPACE_RE=_SPACE_RE, _chat=_chat, extract=extract, parse=parse, system_prompt=system_prompt)
 llm_simplify = _types.SimpleNamespace(HAS=HAS_simp, NUM_PREDICT=NUM_PREDICT_simp, SIMPLIFY_EXAMPLES=SIMPLIFY_EXAMPLES, SIMPLIFY_GUIDE=SIMPLIFY_GUIDE, SIMPLIFY_IDS=SIMPLIFY_IDS, TIMEOUT_SECONDS=TIMEOUT_SECONDS_simp, _MOD_RE=_MOD_RE, _POS=_POS, _chat=_chat_simp, _clean=_clean_simp, _dict_form=_dict_form, _split_modifier=_split_modifier, parse_sentence=parse_sentence, parse_text=parse_text, simplify=simplify, split_list=split_list, system_prompt=system_prompt_simp)
-llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, R61_MIN_VOTES=R61_MIN_VOTES, R62_MIN_VOTES=R62_MIN_VOTES, SELECT_SYSTEM=SELECT_SYSTEM, VERIFY_SYSTEM=VERIFY_SYSTEM, _HAS_FAMILY=_HAS_FAMILY, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _R65_RES=_R65_RES, _R65_WORDS=_R65_WORDS, _R66_AD=_R66_AD, _R66_ADJ=_R66_ADJ, _R66_NB=_R66_NB, _R66_Q=_R66_Q, _R66_RES=_R66_RES, _R67_ADJ=_R67_ADJ, _R67_ENDS=_R67_ENDS, _R67_I=_R67_I, _R67_N=_R67_N, _R67_T=_R67_T, _R68_BADV=_R68_BADV, _R68_POS=_R68_POS, _R68_QP=_R68_QP, _R68_VEND=_R68_VEND, _SUPPORT_PRI=_SUPPORT_PRI, _SUPPORT_W=_SUPPORT_W, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _fewshot_rel_ok=_fewshot_rel_ok, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _not_component=_not_component, _r66_name=_r66_name, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, claim_final_title=claim_final_title, clean_node=clean_node, comparison_triples=comparison_triples, dict_form=dict_form, distribute_topics=distribute_topics, families=families, group_pairs=group_pairs, has_evidence=has_evidence, is_base=is_base, judge=judge, llm_verify=llm_verify, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, relative_clause_triples=relative_clause_triples, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, structure_fixes=structure_fixes, support_votes=support_votes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence)
-platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, TERM_SOURCES=TERM_SOURCES, TEXT_KEYS=TEXT_KEYS, THERMO_STOPS=THERMO_STOPS, TITLE_STOP=TITLE_STOP, _ABS_NUM_RE=_ABS_NUM_RE, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _TITLE_SPLIT_RE=_TITLE_SPLIT_RE, _TITLE_TOKEN_RE=_TITLE_TOKEN_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, base_term=base_term, basic_explain=basic_explain, basic_features=basic_features, build_cooccurrence_network=build_cooccurrence_network, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_abstract=clean_abstract, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, default_source=default_source, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, has_sao=has_sao, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_map_basic=layout_map_basic, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patent_terms=patent_terms, patents_from_table=patents_from_table, patents_with_node=patents_with_node, patents_with_term=patents_with_term, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_share=sao_share, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, similarity_matrix_basic=similarity_matrix_basic, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, text_label=text_label, thermo_color=thermo_color, tidy_relations=tidy_relations, title_terms=title_terms, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
+llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, R61_MIN_VOTES=R61_MIN_VOTES, R62_MIN_VOTES=R62_MIN_VOTES, SELECT_SYSTEM=SELECT_SYSTEM, VERIFY_SYSTEM=VERIFY_SYSTEM, _HAS_FAMILY=_HAS_FAMILY, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _R65_RES=_R65_RES, _R65_WORDS=_R65_WORDS, _R66_AD=_R66_AD, _R66_ADJ=_R66_ADJ, _R66_NB=_R66_NB, _R66_Q=_R66_Q, _R66_RES=_R66_RES, _R67_ADJ=_R67_ADJ, _R67_ENDS=_R67_ENDS, _R67_I=_R67_I, _R67_N=_R67_N, _R67_T=_R67_T, _R68_BADV=_R68_BADV, _R68_POS=_R68_POS, _R68_QP=_R68_QP, _R68_VEND=_R68_VEND, _R69_NAME=_R69_NAME, _R69_SPLIT=_R69_SPLIT, _R70_OR=_R70_OR, _R70_RE=_R70_RE, _R71_BARE=_R71_BARE, _R72_RE=_R72_RE, _R73_KEEP=_R73_KEEP, _R74_RE=_R74_RE, _R75_AFTER=_R75_AFTER, _R75_GROUP=_R75_GROUP, _R75_ITEM_SPLIT=_R75_ITEM_SPLIT, _R75_NODES=_R75_NODES, _R76_NUM=_R76_NUM, _R76_OK_REL=_R76_OK_REL, _R77_VERB=_R77_VERB, _R77_VERBMAP=_R77_VERBMAP, _SUPPORT_PRI=_SUPPORT_PRI, _SUPPORT_W=_SUPPORT_W, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _fewshot_rel_ok=_fewshot_rel_ok, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _markush_items=_markush_items, _not_component=_not_component, _r66_name=_r66_name, _r69_clean=_r69_clean, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, chem_alias=chem_alias, claim_final_title=claim_final_title, clean_node=clean_node, comparison_triples=comparison_triples, coordinated_copula_triples=coordinated_copula_triples, dict_form=dict_form, distribute_topics=distribute_topics, families=families, group_pairs=group_pairs, has_evidence=has_evidence, head_enumeration_triples=head_enumeration_triples, is_base=is_base, judge=judge, llm_verify=llm_verify, markush_triples=markush_triples, method_step_triples=method_step_triples, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, relative_clause_triples=relative_clause_triples, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, strip_provisos=strip_provisos, structure_fixes=structure_fixes, support_votes=support_votes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence, verbal_noun_form=verbal_noun_form, weak_node=weak_node)
+platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, TERM_SOURCES=TERM_SOURCES, TEXT_KEYS=TEXT_KEYS, THERMO_STOPS=THERMO_STOPS, TITLE_STOP=TITLE_STOP, _ABS_NUM_RE=_ABS_NUM_RE, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _TITLE_SPLIT_RE=_TITLE_SPLIT_RE, _TITLE_TOKEN_RE=_TITLE_TOKEN_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, auto_name_merges=auto_name_merges, base_term=base_term, basic_explain=basic_explain, basic_features=basic_features, build_cooccurrence_network=build_cooccurrence_network, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_abstract=clean_abstract, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, default_source=default_source, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, has_sao=has_sao, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_map_basic=layout_map_basic, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patent_terms=patent_terms, patents_from_table=patents_from_table, patents_with_node=patents_with_node, patents_with_term=patents_with_term, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_share=sao_share, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, similarity_matrix_basic=similarity_matrix_basic, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, text_label=text_label, thermo_color=thermo_color, tidy_relations=tidy_relations, title_terms=title_terms, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _cand_recall_hits=_cand_recall_hits, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, split_of=split_of, ts=ts)
 
 
