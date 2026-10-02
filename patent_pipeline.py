@@ -9628,6 +9628,13 @@ RULES = [
     {"id": "R78", "stage": "構成要素", "name": "題名が取れないときは冒頭か「を特徴とする」の後から取る",
      "desc": "「Ｘにおいて、…である。」のように最後が名詞で終わらず題名が取れないときは、「…を特徴とするＸ。」か、冒頭の「Ｘであって、」「Ｘにおいて、」のＸを題名にする",
      "example": "内輪と、外輪と、…を備える転がり軸受において、…である。→ 題名＝転がり軸受", "llm": False},
+    {"id": "R85", "stage": "選ぶ", "name": "名前が「…側」の途中で切れた関係を直して要確認にする",
+     "desc": "関係が「側に接続される」のように「側に」「側で」で始まるのは、目的語の名前が「直流電源の正極側」の途中（「直流電源」「正極」）で切れたとき。"
+             "本文の「…側に」の句で目的語の名前を直し、関係から「側に」を外す。直しても正解になりにくいので、自動では採用せず要確認にする",
+     "example": "スイッチング素子｜側に接続される｜直流電源 → スイッチング素子｜接続される｜直流電源の正極側（要確認）", "llm": False},
+    {"id": "R86", "stage": "選ぶ", "name": "条件（…する場合に）の説明の動詞は要確認",
+     "desc": "関係の動詞が、本文でいつも「…する場合に」「…するとき」「…する際」の形で出てくるなら、条件の説明で部品どうしの関係ではないので、自動では採用しない",
+     "example": "交流を停止する場合に、…相短絡信号 → 相短絡信号｜停止する｜交流（要確認）", "llm": False},
     {"id": "R83", "stage": "構成要素", "name": "部品の名前を GiNZA と LLM で融合する",
      "desc": "関係の土台は GiNZA の名前で解析した関係（規則だけのときと同じ決まりで確かめる）。LLM が書き出した名前（R05・R04 で確かめたもの）は、"
              "GiNZA が取れなかった名前を補うときだけ使い、その名前を含む関係を同じ裏付けの決まりで確かめて足す（LLM を使うときだけ働く）",
@@ -9707,6 +9714,9 @@ EFFECTS = {
     "R78": {"f1_delta": 0.07, "review_delta": 0.04, "note": "2026-09-28 追加（他分野の請求項62件から）"},
     "R83": {"f1_delta": 2.6, "review_delta": -0.2, "note": "2026-09-30 追加。dev 256件・ELECTRA 版・R64 あり：今の方式 A2（LLM の名前を土台にする）55.6 → 融合 58.2。"
                                                  "規則だけ＋R64（58.2）とは同じで、採用＋要確認の再現率が +0.7"},
+    "R85": {"f1_delta": 0.19, "review_delta": 0.27, "note": "2026-09-30 追加（特開2025-175399 の「直流電源の正極側に…接続される」がきっかけ・dev）。"
+                                                  "dev 256件（ELECTRA 版・R83・R64）：「側に…」の関係 155件（うち採用 68件）の名前を直して要確認に（直した後に正解になったのは 16件）。F1 58.20 → 58.39"},
+    "R86": {"f1_delta": 0.02, "review_delta": 0.0, "note": "2026-09-30 追加（同じ請求項の「交流を停止する場合に」がきっかけ）。dev で誤った採用 3件を要確認に（正解は減らない）"},
     "R60": {"f1_delta": 0.0, "note": "採用には影響しない。候補の再現率（dev）49.5% → 91.5%（run_recall_check.bat で測る）"},
     "R64": {"f1_delta": 4.1, "note": "LLM が必要。dev 10件だけの予備の測定（R65 の前）：規則だけ 58.8 → 62.9（完全一致）。"
                                    "要確認→採用にした関係の 75% が正解。本番の数字は run_r64_check.bat で測る"},
@@ -15513,6 +15523,7 @@ import hashlib
 import os
 import sys
 import re
+import unicodedata
 
 pass  # （統合済み）import claim_segmenter as CS
 pass  # （統合済み）import sao_selector as S
@@ -16909,6 +16920,22 @@ def _fewshot_rel_ok(pp, a, b):
     return (a == "の" or any(h in a for h in _HAS_FAMILY)) and (b == "の" or any(h in b for h in _HAS_FAMILY))
 
 
+# 【R85】目的語の名前が「直流電源の正極側」の途中（「直流電源」「正極」）で切れ、「側に」が関係に入ったもの
+_R85_W = r"[一-龥々ァ-ヴーA-Za-z0-9Ａ-Ｚａ-ｚ０-９]"
+_R85_SPAN = re.compile(rf"((?:{_R85_W}+の)?{_R85_W}*側)(?=[にで])")
+# 【R86】「交流を停止する場合に」のような条件の説明の動詞
+_R86_TAIL = re.compile(r"^(?:する|される|させる|し|され|させ|れる|る|た|ている|ていない|ない)?(?:場合|とき|時|際)")
+
+
+def _r86_conditional(text, rel):
+    t = unicodedata.normalize("NFKC", text)
+    stem = re.sub(r"(する|される|させる|れる|る)$", "", unicodedata.normalize("NFKC", rel))
+    if len(stem) < 2:
+        return False
+    ends = [m.end() for m in re.finditer(re.escape(stem), t)]
+    return bool(ends) and all(_R86_TAIL.match(t[e:e + 12]) for e in ends)
+
+
 def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=True, recall_cands=False,
                      accept_min_votes=None, verify=False, verify_promote=True, fewshot=False, fewshot_cache=None,
                      fewshot_review=True):
@@ -17270,6 +17297,39 @@ def analyze_claim_a2(ts, pp, text, cache=None, model=None, host=None, use_llm=Tr
         for rid in ("R61", "R63", "R64"):
             if rid in (c.get("rules") or []) and rid not in j["rules"]:
                 j["rules"] = list(j["rules"]) + [rid]
+    if enabled("R85"):
+        # 【R85】関係が「側に…」「側で…」で始まるのは、目的語の名前が「Ａの正極側」の途中で切れたとき。
+        # 本文の「…Ａ…側に」の句で目的語を直し、関係から「側に」を外す。直しても当たりにくいので、自動では採用しない
+        _t = text.replace("前記", "")
+        for c, j in zip(info["cands"], judged):
+            m = re.match(r"^側[にで](.+)$", c["relation"])
+            if not m or j["status"] not in ("採用", "要確認"):
+                continue
+            # 目的語を含む「…側」の句のうち、主語の名前のすぐ前にあるもの（「直流電源の負極側に…接続される負極側のスイッチング素子」）
+            best = None
+            for mm in _R85_SPAN.finditer(_t):
+                sp = mm.group(1)
+                if c["target"] not in sp:
+                    continue
+                k = _t.find(c["source"], mm.end())
+                d = (k - mm.end()) if k >= 0 else 10 ** 6
+                if best is None or (d, len(sp)) < best[0]:
+                    best = ((d, len(sp)), sp)
+            if best is not None:
+                c["target"], c["relation"] = best[1], m.group(1)
+            mark(c, "R85")
+            j["rules"] = list(j.get("rules") or []) + ["R85"]
+            if j["status"] == "採用":
+                j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                         basis=j["basis"] + "→名前が「…側」の途中で切れた関係（R85）")
+    if enabled("R86"):
+        # 【R86】動詞が本文でいつも「…する場合に」「…するとき」の形で出てくる関係は、条件の説明で、部品どうしの関係ではない
+        for c, j in zip(info["cands"], judged):
+            if j["status"] == "採用" and _r86_conditional(text, c["relation"]):
+                mark(c, "R86")
+                j["rules"] = list(j.get("rules") or []) + ["R86"]
+                j.update(selected=False, status="要確認", score=min(j["score"], 0.4),
+                         basis=j["basis"] + "→条件（…する場合）の説明の動詞（R86）")
     if recall_cands and enabled("R60"):
         # 【R60】網羅候補：採用・要確認には入れず、「除外」の候補として足す（再現率の上限を上げ、あとで選ぶための材料）
         try:
@@ -17948,7 +18008,7 @@ def relations_csv(corpus, reviews=None):
 
 # 実験13の選別モデルを532件の5分割交差検証で較正した帯（新しいデータにも同じ基準を使う）
 # app.py と組で使う版。app.py 側の NEED_PIPELINE と一致しないときは、片方だけ差し替えたことを知らせる
-PIPELINE_VERSION = "2026-09-30f"  # ELECTRA 版の GiNZA＋名前の融合（R83）＋R64。新しい50件で最終確認する版
+PIPELINE_VERSION = "2026-09-30g"  # 2026-09-30f に R85（名前が「…側」で切れた関係）・R86（条件の動詞）を足した版。新しい50件で最終確認する版
 
 DEFAULT_BANDS = {
     "accept": 0.57, "threshold": 0.3, "review_low": 0.2, "target_precision": 0.8,
@@ -17958,7 +18018,7 @@ DEFAULT_BANDS = {
 METHOD_NAME = "最終方式（学習なし：LLMで構成要素を固定 → GiNZAの規則 → 構造の整理）"
 METHOD_SCORE = ("学習データを使わない最終方式。関係は GiNZA の規則で取り出し、ローカル LLM は部品の名前の補い（R83）と、"
                 "規則の結果の確認（R64・チェックを入れたとき）に使う。dev（規則づくりに使った半分）でのトリプル完全一致 F1："
-                "規則だけ 53.4%、ELECTRA 版の GiNZA＋名前の融合＋R64 で 58.2%。"
+                "規則だけ 53.4%、ELECTRA 版の GiNZA＋名前の融合＋R64 で 58.2%、R85・R86 を足して 58.4%。"
                 "最終的な精度は、532件に含まれない新しい請求項50件で1回だけ測る")
 MODEL_METHOD_NAME = "実験14（区間内のノード拡張の組＋係り受け候補＋区間の主役の候補＋2段階選別）"
 MODEL_METHOD_SCORE = ("比較用。532件の正解データで学習した選別モデル。トリプル完全一致 F1 56.6%（適合率 65.2%・再現率 50.0%）。"
@@ -19854,7 +19914,7 @@ comp_first = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS, COMPONENT_SYSTEM=COMP
 recall_gen = _types.SimpleNamespace(CASES=CASES_rg, FLAG_7B=FLAG_7B, HAS=HAS_rg, HASLAB=HASLAB, LINK=LINK, NEAR_SUB=NEAR_SUB, NONN=NONN, NOUNISH_POS=NOUNISH_POS, POSW=POSW, RELF=RELF, _after=_after, chunks=chunks, extra_nodes=extra_nodes, generate=generate, is_nounish=is_nounish, node_candidates=node_candidates, txt=txt)
 llm_fewshot = _types.SimpleNamespace(FEWSHOT_EXAMPLES=FEWSHOT_EXAMPLES, FEWSHOT_GUIDE=FEWSHOT_GUIDE, FEWSHOT_IDS=FEWSHOT_IDS, NUM_PREDICT=NUM_PREDICT, TIMEOUT_SECONDS=TIMEOUT_SECONDS, _DROP_PREFIX_RE=_DROP_PREFIX_RE, _LEAD_RE=_LEAD_RE, _SEP_RE=_SEP_RE, _SPACE_RE=_SPACE_RE, _chat=_chat, extract=extract, parse=parse, system_prompt=system_prompt)
 llm_simplify = _types.SimpleNamespace(HAS=HAS_simp, NUM_PREDICT=NUM_PREDICT_simp, SIMPLIFY_EXAMPLES=SIMPLIFY_EXAMPLES, SIMPLIFY_GUIDE=SIMPLIFY_GUIDE, SIMPLIFY_IDS=SIMPLIFY_IDS, TIMEOUT_SECONDS=TIMEOUT_SECONDS_simp, _MOD_RE=_MOD_RE, _POS=_POS, _chat=_chat_simp, _clean=_clean_simp, _dict_form=_dict_form, _split_modifier=_split_modifier, parse_sentence=parse_sentence, parse_text=parse_text, simplify=simplify, split_list=split_list, system_prompt=system_prompt_simp)
-llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, R61_MIN_VOTES=R61_MIN_VOTES, R62_MIN_VOTES=R62_MIN_VOTES, SELECT_SYSTEM=SELECT_SYSTEM, VERIFY_SYSTEM=VERIFY_SYSTEM, _HAS_FAMILY=_HAS_FAMILY, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _R65_RES=_R65_RES, _R65_WORDS=_R65_WORDS, _R66_AD=_R66_AD, _R66_ADJ=_R66_ADJ, _R66_NB=_R66_NB, _R66_Q=_R66_Q, _R66_RES=_R66_RES, _R67_ADJ=_R67_ADJ, _R67_ENDS=_R67_ENDS, _R67_I=_R67_I, _R67_N=_R67_N, _R67_T=_R67_T, _R68_BADV=_R68_BADV, _R68_POS=_R68_POS, _R68_QP=_R68_QP, _R68_VEND=_R68_VEND, _R69_NAME=_R69_NAME, _R69_SPLIT=_R69_SPLIT, _R70_OR=_R70_OR, _R70_RE=_R70_RE, _R71_BARE=_R71_BARE, _R72_RE=_R72_RE, _R73_KEEP=_R73_KEEP, _R74_RE=_R74_RE, _R75_AFTER=_R75_AFTER, _R75_GROUP=_R75_GROUP, _R75_ITEM_SPLIT=_R75_ITEM_SPLIT, _R75_NODES=_R75_NODES, _R76_NUM=_R76_NUM, _R76_OK_REL=_R76_OK_REL, _R77_VERB=_R77_VERB, _R77_VERBMAP=_R77_VERBMAP, _SUPPORT_PRI=_SUPPORT_PRI, _SUPPORT_W=_SUPPORT_W, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _fewshot_rel_ok=_fewshot_rel_ok, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _markush_items=_markush_items, _not_component=_not_component, _r66_name=_r66_name, _r69_clean=_r69_clean, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, chem_alias=chem_alias, claim_final_title=claim_final_title, clean_node=clean_node, comparison_triples=comparison_triples, coordinated_copula_triples=coordinated_copula_triples, dict_form=dict_form, distribute_topics=distribute_topics, families=families, group_pairs=group_pairs, has_evidence=has_evidence, head_enumeration_triples=head_enumeration_triples, is_base=is_base, judge=judge, llm_verify=llm_verify, markush_triples=markush_triples, method_step_triples=method_step_triples, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, relative_clause_triples=relative_clause_triples, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, strip_provisos=strip_provisos, structure_fixes=structure_fixes, support_votes=support_votes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence, verbal_noun_form=verbal_noun_form, weak_node=weak_node)
+llm_select = _types.SimpleNamespace(BARE_STEPS=BARE_STEPS_ls, LLM_SRCS=LLM_SRCS, MAX_PAIRS_PER_CALL=MAX_PAIRS_PER_CALL, MAX_VARIANTS=MAX_VARIANTS, NON_NODES=NON_NODES, POOLS=POOLS, R40_MODE=R40_MODE, R61_MIN_VOTES=R61_MIN_VOTES, R62_MIN_VOTES=R62_MIN_VOTES, SELECT_SYSTEM=SELECT_SYSTEM, VERIFY_SYSTEM=VERIFY_SYSTEM, _HAS_FAMILY=_HAS_FAMILY, _ITEM_RE=_ITEM_RE, _NOUN_CHAR_RE=_NOUN_CHAR_RE, _QUANT_PREFIX_RE=_QUANT_PREFIX_RE, _R40_COORD_RE=_R40_COORD_RE, _R40_MAIN_RES=_R40_MAIN_RES, _R40_TOPIC_RE=_R40_TOPIC_RE, _R45_END=_R45_END, _R45_HV=_R45_HV, _R45_LEAD=_R45_LEAD, _R45_REL_FORMS=_R45_REL_FORMS, _R45_TOPIC=_R45_TOPIC, _R46_ARG=_R46_ARG, _R46_VERB_END=_R46_VERB_END, _R48_ORDINAL_ONLY_RE=_R48_ORDINAL_ONLY_RE, _R48_SUFFIX_RE=_R48_SUFFIX_RE, _R51_WORDS=_R51_WORDS, _R65_RES=_R65_RES, _R65_WORDS=_R65_WORDS, _R66_AD=_R66_AD, _R66_ADJ=_R66_ADJ, _R66_NB=_R66_NB, _R66_Q=_R66_Q, _R66_RES=_R66_RES, _R67_ADJ=_R67_ADJ, _R67_ENDS=_R67_ENDS, _R67_I=_R67_I, _R67_N=_R67_N, _R67_T=_R67_T, _R68_BADV=_R68_BADV, _R68_POS=_R68_POS, _R68_QP=_R68_QP, _R68_VEND=_R68_VEND, _R69_NAME=_R69_NAME, _R69_SPLIT=_R69_SPLIT, _R70_OR=_R70_OR, _R70_RE=_R70_RE, _R71_BARE=_R71_BARE, _R72_RE=_R72_RE, _R73_KEEP=_R73_KEEP, _R74_RE=_R74_RE, _R75_AFTER=_R75_AFTER, _R75_GROUP=_R75_GROUP, _R75_ITEM_SPLIT=_R75_ITEM_SPLIT, _R75_NODES=_R75_NODES, _R76_NUM=_R76_NUM, _R76_OK_REL=_R76_OK_REL, _R77_VERB=_R77_VERB, _R77_VERBMAP=_R77_VERBMAP, _R85_SPAN=_R85_SPAN, _R85_W=_R85_W, _R86_TAIL=_R86_TAIL, _SUPPORT_PRI=_SUPPORT_PRI, _SUPPORT_W=_SUPPORT_W, _add=_add, _chat_cached=_chat_cached, _coordinated_with_head=_coordinated_with_head, _drop_where=_drop_where, _enum_ok=_enum_ok, _family=_family, _fewshot_rel_ok=_fewshot_rel_ok, _main_has_verb_end=_main_has_verb_end, _main_region_end=_main_region_end, _markush_items=_markush_items, _not_component=_not_component, _r66_name=_r66_name, _r69_clean=_r69_clean, _r86_conditional=_r86_conditional, _segment_supported=_segment_supported, _single_owner=_single_owner, _topic_clauses=_topic_clauses, _weak_link=_weak_link, analyze_claim=analyze_claim_ls, analyze_claim_a2=analyze_claim_a2, build_rule_and_llm_candidates=build_rule_and_llm_candidates, chem_alias=chem_alias, claim_final_title=claim_final_title, clean_node=clean_node, comparison_triples=comparison_triples, coordinated_copula_triples=coordinated_copula_triples, dict_form=dict_form, distribute_topics=distribute_topics, families=families, group_pairs=group_pairs, has_evidence=has_evidence, head_enumeration_triples=head_enumeration_triples, is_base=is_base, judge=judge, llm_verify=llm_verify, markush_triples=markush_triples, method_step_triples=method_step_triples, nested_owner_fix=nested_owner_fix, normalize_candidates=normalize_candidates, parse_answer=parse_answer, parse_selection=parse_selection, relative_clause_triples=relative_clause_triples, resolve_one_other=resolve_one_other, select_prompt=select_prompt, select_with_llm=select_with_llm, strip_provisos=strip_provisos, structure_fixes=structure_fixes, support_votes=support_votes, tidy=tidy, top_level_items=top_level_items, topic_names=topic_names, translate_relations=translate_relations, verb_evidence=verb_evidence, verbal_noun_form=verbal_noun_form, weak_node=weak_node)
 platform_core = _types.SimpleNamespace(COLUMN_ALIASES=COLUMN_ALIASES, CORPUS_FILE=CORPUS_FILE, CORPUS_NAME=CORPUS_NAME, DEFAULT_BANDS=DEFAULT_BANDS, FI_LEVELS=FI_LEVELS, GROUP_PALETTE=GROUP_PALETTE, HAS_WORDS=HAS_WORDS, HERE=HERE, METHOD_NAME=METHOD_NAME, METHOD_SCORE=METHOD_SCORE, MODEL_METHOD_NAME=MODEL_METHOD_NAME, MODEL_METHOD_SCORE=MODEL_METHOD_SCORE, OTHER_COLOR=OTHER_COLOR, PIPELINE_VERSION=PIPELINE_VERSION, RADAR_AXES=RADAR_AXES, STATUS_ACCEPT=STATUS_ACCEPT, STATUS_ORDER=STATUS_ORDER, STATUS_REJECT=STATUS_REJECT, STATUS_REVIEW=STATUS_REVIEW, TERM_SOURCES=TERM_SOURCES, TEXT_KEYS=TEXT_KEYS, THERMO_STOPS=THERMO_STOPS, TITLE_STOP=TITLE_STOP, _ABS_NUM_RE=_ABS_NUM_RE, _CLAIM_HEAD_RE=_CLAIM_HEAD_RE, _CONJ_RULES=_CONJ_RULES, _CORP_RE=_CORP_RE, _LEAD_PARTICLE_RE=_LEAD_PARTICLE_RE, _NODE_PREFIX_RE=_NODE_PREFIX_RE, _NUM=_NUM, _NUMERIC_RE=_NUMERIC_RE, _ORD_RE=_ORD_RE, _ORIGIN=_ORIGIN, _OZ_CSS=_OZ_CSS, _OZ_JS=_OZ_JS, _PREFIX_RE=_PREFIX_RE, _SUFFIX_RE=_SUFFIX_RE, _TAIL_RE=_TAIL_RE, _TITLE_SPLIT_RE=_TITLE_SPLIT_RE, _TITLE_TOKEN_RE=_TITLE_TOKEN_RE, _WC_NUMERIC_RE=_WC_NUMERIC_RE, _embed=_embed, _longest_path=_longest_path, _norm_col=_norm_col, _text_width=_text_width, apply_analysis=apply_analysis, assign_groups=assign_groups, auto_name_merges=auto_name_merges, base_term=base_term, basic_explain=basic_explain, basic_features=basic_features, build_cooccurrence_network=build_cooccurrence_network, build_network=build_network, claims_from_table=claims_from_table, classify=classify, clean_abstract=clean_abstract, clean_relation=clean_relation, company_name=company_name, company_tech_matrix=company_tech_matrix, company_year_bubble=company_year_bubble, default_source=default_source, detect_columns=detect_columns, display_node=display_node, effective_relations=effective_relations, export_excel=export_excel, feature_table=feature_table, fi_codes=fi_codes, fi_parts=fi_parts, fi_radar_data=fi_radar_data, finalize_dataset=finalize_dataset, find_corpus_file=find_corpus_file, first_claim=first_claim, group_colors=group_colors, has_sao=has_sao, highlight=highlight, highlight_colored=highlight_colored, is_has=is_has, layout_map=layout_map, layout_map_basic=layout_map_basic, layout_network=layout_network, layout_world=layout_world, load_corpus=load_corpus, make_patent=make_patent, new_dataset=new_dataset, norm_pid=norm_pid, origin_label=origin_label, oz_world_html=oz_world_html, patent_terms=patent_terms, patents_from_table=patents_from_table, patents_with_node=patents_with_node, patents_with_term=patents_with_term, percentile_scores=percentile_scores, read_table=read_table, relations_csv=relations_csv, review_table=review_table, reviews_from_csv=reviews_from_csv, reviews_to_csv=reviews_to_csv, sample_world_edges=sample_world_edges, sao_share=sao_share, sao_tokens=sao_tokens, similarity_explain=similarity_explain, similarity_matrix=similarity_matrix, similarity_matrix_basic=similarity_matrix_basic, status_counts=status_counts, structural_features=claim_structure_features, table_to_review=table_to_review, text_label=text_label, thermo_color=thermo_color, tidy_relations=tidy_relations, title_terms=title_terms, wordcloud_heat=wordcloud_heat, wordcloud_layout=wordcloud_layout, wordcloud_svg=wordcloud_svg, wordcloud_terms=wordcloud_terms)
 eval_translate_sao = _types.SimpleNamespace(_FALLBACK_TYPES_FOR_TABLE=_FALLBACK_TYPES_FOR_TABLE, _aggregate=_aggregate, _aggregate_type_relation=_aggregate_type_relation, _cand_recall_hits=_cand_recall_hits, _lenient_match_details=_lenient_match_details, _load_llm_cache=_load_llm_cache, _record_rules_history=_record_rules_history, _save=_save, _save_llm_cache=_save_llm_cache, main=main_eval, retrain_with_extra=retrain_with_extra, split_of=split_of, ts=ts)
 
