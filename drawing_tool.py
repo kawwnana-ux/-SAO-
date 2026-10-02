@@ -177,8 +177,9 @@ def parse_sign_list(text, min_items=3):
 def parse_fugo_text(text):
     """貼り付けた【符号の説明】（見出しがあってもなくてもよい）を {符号: 名前} にする。"""
     t = nfkc(text)
-    m = re.search(r"符号の説明[】\]]?(.*?)(?:【(?!符号)|$)", t, re.S)
+    m = re.search(r"符号の説明[】\]]?(.*?)(?:【(?![0-9]+】|符号)|$)", t, re.S)
     body = m.group(1) if m else t
+    body = re.sub(r"【[0-9]+】", "\n", body)
     table, _, _ = parse_sign_list(body, min_items=1)
     return table
 
@@ -646,11 +647,29 @@ def ocr_available():
     return _OCR_OK
 
 
-def _ocr_tokens(img):
+_WHITELIST = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ()"
+
+
+def _split_token(t):
+    """「26(20)」のように括弧つきで2つの符号を書いたものを、文字の割合で枠を分けて2つにする。"""
+    txt, (x0, y0, x1, y1) = t["text"], t["box"]
+    parts = [p for p in re.split(r"[()]+", txt) if p]
+    if len(parts) <= 1:
+        return [dict(t, text=parts[0] if parts else txt)]
+    out, pos, n = [], 0, max(1, len(txt))
+    for p in parts:
+        k = txt.index(p, pos)
+        a, b = x0 + (x1 - x0) * k / n, x0 + (x1 - x0) * (k + len(p)) / n
+        out.append(dict(t, text=p, box=(int(a), y0, int(b), y1)))
+        pos = k + len(p)
+    return out
+
+
+def _ocr_tokens(img, scale=1.0):
     import pytesseract
     data = pytesseract.image_to_data(
         img, lang="eng", output_type=pytesseract.Output.DICT,
-        config="--psm 11 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        config="--psm 11 -c tessedit_char_whitelist=" + _WHITELIST)
     out = []
     for i, txt in enumerate(data["text"]):
         t = (txt or "").strip()
@@ -662,13 +681,32 @@ def _ocr_tokens(img):
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         if w * h > 0 and h < img.height * 0.06:
-            out.append({"text": canon_code(t), "box": (x, y, x + w, y + h), "conf": conf})
+            box = tuple(int(v / scale) for v in (x, y, x + w, y + h))
+            out += _split_token({"text": canon_code(t), "box": box, "conf": conf})
     return out
 
 
-def ocr_numerals(path):
-    """図面の中の文字のかたまり（符号の候補）を読む。引き出し線が触れていると読めないことがあるので、
-    長い直線を消した画像でも読み、合わせる。まわりが線で混んでいるもの（図の模様の読み違い）は捨てる。"""
+def _rotated_tokens(img, angle):
+    """図面を回して読む（縦書きの数字・回った図用）。読んだ枠は、もとの図の向きに戻して返す。"""
+    w, h = img.size
+    r = img.rotate(angle, expand=True, fillcolor=255)
+    out = []
+    for t in _ocr_tokens(r):
+        x0, y0, x1, y1 = t["box"]
+        if angle == 90:      # 反時計回りに回した図の (x, y) は、もとの (w - y, x)
+            box = (w - y1, x0, w - y0, x1)
+        else:                # 270：時計回り。(x, y) は、もとの (y, h - x)
+            box = (y0, h - x1, y1, h - x0)
+        out.append(dict(t, box=tuple(int(v) for v in box), rotated=angle))
+    return out
+
+
+def ocr_numerals(path, known=None):
+    """図面の中の文字のかたまり（符号の候補）を読む。
+    ・引き出し線が触れていると読めないことがあるので、長い直線を消した画像でも読む
+    ・「26(20)」のような括弧つきの書き方は2つに分ける
+    ・known（符号の表）があれば、図を90度・270度回しても読み、縦書きの符号も拾う（表にある符号に合うものだけ）
+    ・まわりが線で混んでいるもの（図の模様の読み違い）は、表にある符号でなければ捨てる"""
     img = Image.open(path).convert("L")
     toks = _ocr_tokens(img)
     arr = np.array(img)
@@ -683,6 +721,13 @@ def ocr_numerals(path):
                 if not any(o["text"] == t["text"] and abs(o["box"][0] - t["box"][0]) < 30 and abs(o["box"][1] - t["box"][1]) < 30
                            for o in toks):
                     toks.append(t)
+    if known:
+        for ang in (90, 270):
+            for t in _rotated_tokens(img, ang):
+                c = match_code(t["text"], known)
+                if c and len(c) >= 2 and not any(abs((o["box"][0] + o["box"][2]) / 2 - (t["box"][0] + t["box"][2]) / 2) < 25 and
+                                                 abs((o["box"][1] + o["box"][3]) / 2 - (t["box"][1] + t["box"][3]) / 2) < 25 for o in toks):
+                    toks.append(dict(t, text=c))
     ink = arr < 140
     keep = []
     for t in toks:
@@ -690,25 +735,36 @@ def ocr_numerals(path):
         m = max(8, (y1 - y0) // 2)
         X0, Y0, X1, Y1 = max(0, x0 - m), max(0, y0 - m), min(ink.shape[1], x1 + m), min(ink.shape[0], y1 + m)
         ring = ink[Y0:Y1, X0:X1].copy()
-        ring[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0] = False
+        ring[max(0, y0 - Y0):max(0, y1 - Y0), max(0, x0 - X0):max(0, x1 - X0)] = False
         area = ring.size - (y1 - y0) * (x1 - x0)
-        if area > 0 and ring.sum() / area > 0.18:
+        dense = area > 0 and ring.sum() / area > 0.18
+        if dense and not (known and match_code(t["text"], known)):
             continue
+        if len(t["text"]) == 1 and (t["conf"] < 85 or not t["text"].isdigit() or (y1 - y0) < 0.8 * (x1 - x0)):
+            continue          # 1文字だけの読みは、線のかけらのことが多い
+        if len(t["text"]) == 1 and cv2 is not None and _walk_leader(ink, t["box"]) is None:
+            continue          # 1文字の符号は、引き出し線があるものだけ（「【図１】」の「１」などを除く）
+        if y1 < 0.05 * ink.shape[0]:
+            continue          # いちばん上の余白（公報の番号・ページの見出し）
         keep.append(t)
-    # 「30ap1」を「30ap」と「1」のように2つに分けて読んだものは、すぐ隣にあれば1つにつなぐ
+    # 「30ap1」を「30ap」と「1」のように2つに分けて読んだもの、「124₁」の下付きの数字は、すぐ隣にあれば1つにつなぐ
     keep.sort(key=lambda t: (t["box"][1], t["box"][0]))
     merged = True
     while merged:
         merged = False
         for a in keep:
             for b in keep:
-                if a is b:
+                if a is b or a.get("rotated") or b.get("rotated"):
                     continue
                 ah = a["box"][3] - a["box"][1]
+                bh = b["box"][3] - b["box"][1]
                 gap = b["box"][0] - a["box"][2]
-                same_row = abs((a["box"][1] + a["box"][3]) / 2 - (b["box"][1] + b["box"][3]) / 2) < 0.35 * ah
+                dy = abs((a["box"][1] + a["box"][3]) / 2 - (b["box"][1] + b["box"][3]) / 2)
+                same_row = dy < 0.35 * ah
+                subscript = bh < 0.85 * ah and b["box"][3] >= a["box"][3] - 0.2 * ah and dy < 0.6 * ah
                 txt = a["text"] + b["text"]
-                if same_row and -2 <= gap < 0.45 * ah and re.fullmatch(CODE, txt):
+                ok_known = (not known) or match_code(txt, known)
+                if (same_row or subscript) and -2 <= gap < 0.45 * ah and re.fullmatch(CODE, txt) and ok_known:
                     a["box"] = (a["box"][0], min(a["box"][1], b["box"][1]), b["box"][2], max(a["box"][3], b["box"][3]))
                     a["text"], a["conf"] = txt, min(a["conf"], b["conf"])
                     keep.remove(b)
@@ -720,15 +776,72 @@ def ocr_numerals(path):
     def inside(a, b):
         return a["box"][0] >= b["box"][0] - 3 and a["box"][2] <= b["box"][2] + 3 and \
             a["box"][1] >= b["box"][1] - 3 and a["box"][3] <= b["box"][3] + 3
-    return [t for t in keep if not any(o is not t and len(o["text"]) > len(t["text"]) and inside(t, o) for o in keep)]
+    keep = [t for t in keep if not any(o is not t and len(o["text"]) > len(t["text"]) and inside(t, o) for o in keep)]
+    if known:
+        keep = refine_codes(img, keep, known)
+    return keep
+
+
+def read_box(img, box, pad_x=0.6, pad_y=0.3):
+    """符号のまわりだけを切り出して、3倍に拡大して1行として読み直す（ページ全体で読むより正確）。"""
+    import pytesseract
+    x0, y0, x1, y1 = box
+    h = max(8, y1 - y0)
+    X0, Y0 = max(0, int(x0 - pad_x * h)), max(0, int(y0 - pad_y * h))
+    X1, Y1 = min(img.width, int(x1 + pad_x * h)), min(img.height, int(y1 + pad_y * h))
+    crop = img.crop((X0, Y0, X1, Y1))
+    if crop.width < 4 or crop.height < 4:
+        return ""
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    pad = Image.new("L", (crop.width + 40, crop.height + 40), 255)
+    pad.paste(crop, (20, 20))
+    try:
+        t = pytesseract.image_to_string(pad, lang="eng", config="--psm 7 -c tessedit_char_whitelist=" + _WHITELIST)
+    except Exception:  # noqa: BLE001
+        return ""
+    return canon_code(re.sub(r"\s+", "", t))
+
+
+def refine_codes(img, toks, known):
+    """読んだ符号を、まわりを切り出して読み直し、表にあるもっと長い符号（「30c」→「130c」、「30ap」→「30ap1」）なら直す。"""
+    for t in toks:
+        if t.get("rotated"):
+            continue
+        cur = match_code(t["text"], known)
+        txt = read_box(img, t["box"])
+        best = None
+        for part in [p for p in re.split(r"[()]+", txt) if p]:
+            c = match_code(part, known)
+            if c and len(c) >= 2 and (cur is None or (len(c) > len(cur) and cur in c)):
+                if best is None or len(c) > len(best):
+                    best = c
+        if best:
+            t["text"] = best
+    return toks
+
+
+# OCR の読み違いやすい文字（数字と英字）
+_CONFUSE = {"O": "0", "o": "0", "D": "0", "Q": "0", "l": "1", "I": "1", "i": "1", "|": "1", "t": "1", "S": "5", "s": "5",
+            "Z": "2", "z": "2", "B": "8", "G": "6", "b": "6", "q": "9", "g": "9", "A": "4", "T": "7"}
 
 
 def match_code(text, known):
-    """読んだ文字を、符号の表の符号に合わせる（大文字・小文字の違いは許す）。"""
+    """読んだ文字を、符号の表の符号に合わせる。大文字・小文字の違いと、読み違いやすい文字（O と 0、l と 1 など）は許す。"""
+    if not text or not known:
+        return None
     if text in known:
         return text
     low = {k.lower(): k for k in known}
-    return low.get(text.lower())
+    if text.lower() in low:
+        return low[text.lower()]
+    if len(text) < 2:
+        return None          # 1文字の読み違い（線のかけらを「l」「I」と読んだもの）は直さない
+    # 1文字ずつ、読み違いやすい文字を数字に直した形で比べる（符号の側も同じように直す）
+    def fold(x):
+        return "".join(_CONFUSE.get(ch, ch) for ch in x).lower()
+    key = fold(text)
+    hits = [k for k in known if fold(k) == key]
+    return hits[0] if len(hits) == 1 else None
 
 
 # =============================================================== 引き出し線をたどって部品の領域を塗る
@@ -1374,13 +1487,20 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
     for i, pg in enumerate(pages):
         log(f"図面に色を付けています（{i + 1}/{len(pages)}）", 0.5 + 0.48 * i / len(pages))
         hits = []
+        page_img = Image.open(pg["path"]).convert("L") if ocr else None
         for c in pg["callouts"]:
             code = match_code(c["id"], known) or c["id"]
+            if ocr and known:
+                # Google の読みは「30ap1」の「1」だけのことがあるので、まわりを切り出して読み直し、長い符号があれば使う
+                for part in [x for x in re.split(r"[()]+", read_box(page_img, c["box"])) if x]:
+                    m2 = match_code(part, known)
+                    if m2 and len(m2) > len(code) and code in m2:
+                        code = m2
             hits.append({"code": code, "box": c["box"], "src": "google"})
             if code not in fugo:
                 unknown.setdefault(code, {"figs": [], "label": c.get("label", "")})["figs"].append(pg["label"])
         if ocr:
-            for t in ocr_numerals(pg["path"]):
+            for t in ocr_numerals(pg["path"], known):
                 code = match_code(t["text"], known)
                 box = t["box"]
                 def _over(a, b):
@@ -1434,14 +1554,18 @@ def build(fetcher, pid, claim, comps, comp_colors=None, title="", applicant="", 
             "notes": notes, "ocr": ocr, "tried": found["tried"]}
 
 
-def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=True, fill=True, progress=None,
-                style="names", only_claim=False):
-    """公報を自分で用意したとき（PDF・図面の画像＋貼り付けた符号の説明）。"""
+def build_local(pages_paths, claim, comps, fugo_text="", comp_colors=None, use_ocr=True, fill=True, progress=None,
+                style="names", only_claim=False, fugo=None, body=None, labels=None, doc=None, notes=None):
+    """公報を自分で用意したとき（J-PlatPat の PDF・図面の画像＋符号の説明）。"""
     log = progress or (lambda *a, **k: None)
-    fugo = parse_fugo_text(fugo_text) if fugo_text else {}
+    fugo = dict(fugo or {})
+    if fugo_text:
+        fugo.update(parse_fugo_text(fugo_text))           # 貼り付けた符号の説明を優先する
+    body = dict(body or {})
+    names_all = {**body, **fugo}
     comps = list(dict.fromkeys(comps))
     extra = extra_components(claim, fugo, comps) if fugo else []
-    legend = link_components(comps + extra, fugo, {})
+    legend = link_components(comps + extra, fugo, body)
     comp_colors = dict(comp_colors or {})
     for i, row in enumerate(legend):
         comp_colors.setdefault(row["comp"], PALETTE[(len(comp_colors) + i) % len(PALETTE)])
@@ -1451,23 +1575,26 @@ def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=
     for row in legend:
         for c in row["codes"]:
             code_colors.setdefault(c, row["color"])
-    no_fill = {c for c, nm in fugo.items() if re.search(r"(軸|方向|面|線|対象|空間|間隔|距離|角度|中心)$", nm)}
+    no_fill = {c for c, nm in names_all.items() if re.search(r"(軸|方向|面|線|対象|空間|間隔|距離|角度|中心)$", nm)}
+    known = set(names_all)
     ocr = use_ocr and ocr_available()
     figures, unknown = [], {}
     for i, p in enumerate(pages_paths):
-        log(f"図面に色を付けています（{i + 1}/{len(pages_paths)}）", 0.1 + 0.85 * i / len(pages_paths))
-        label = f"図面 {i + 1}"
+        log(f"図面の符号を読んでいます（{i + 1}/{len(pages_paths)}）", 0.3 + 0.65 * i / max(1, len(pages_paths)))
+        label = (labels or {}).get(p) or f"図面 {i + 1}"
         hits = []
         if ocr:
-            for t in ocr_numerals(p):
-                code = match_code(t["text"], set(fugo))
+            for t in ocr_numerals(p, known or None):
+                code = match_code(t["text"], known)
                 if code:
                     hits.append({"code": code, "box": t["box"], "src": "ocr"})
+                    if code not in fugo:
+                        unknown.setdefault(code, {"figs": [], "label": "", "body_name": body.get(code, "")})["figs"].append(label)
                 elif re.fullmatch(r"[0-9]{1,4}[a-z]?", t["text"]) and t["conf"] >= 85:
                     unknown.setdefault(t["text"], {"figs": [], "label": "", "body_name": ""})["figs"].append(label)
                     hits.append({"code": t["text"], "box": t["box"], "src": "ocr"})
         if style == "names":
-            nm = {c: n for c, n in fugo.items() if c in code_colors} if only_claim else fugo
+            nm = {c: n for c, n in names_all.items() if c in code_colors} if only_claim else names_all
             img, filled = render_names(p, hits, nm, bold_codes=set(code_colors))
         else:
             img, filled = render(p, hits, code_colors, fill=fill, no_fill=no_fill, unknown=set(unknown))
@@ -1478,12 +1605,119 @@ def build_local(pages_paths, claim, comps, fugo_text, comp_colors=None, use_ocr=
                 row["figs"].append(label)
         figures.append({"label": label, "png": png_bytes(img), "codes": codes, "claim_codes": claim_codes,
                         "filled": filled, "n_google": 0, "n_ocr": len(hits)})
+    for u in unknown.values():
+        u["figs"] = list(dict.fromkeys(u["figs"]))
     others = [(c, nm) for c, nm in sorted(fugo.items(), key=lambda z: (len(z[0]), z[0])) if c not in code_colors]
-    notes = [] if ocr else ["OCR（Tesseract）が入っていないので、図面の中の符号の位置を読めませんでした。"]
-    return {"ok": True, "doc": {"id": "", "url": "", "title": "", "pdf": ""}, "found_by": "読み込んだファイル", "sim": None,
-            "fugo_doc": None, "fugo_src": "貼り付け", "image_doc": "", "image_url": "", "fugo": fugo, "body": {},
-            "legend": legend, "figures": figures, "unknown": unknown, "others": others, "notes": notes, "ocr": ocr,
-            "tried": []}
+    notes = list(notes or [])
+    if not ocr:
+        notes.append("OCR（Tesseract）が入っていないので、図面の中の符号の位置を読めませんでした。")
+    if not fugo:
+        notes.append("【符号の説明】が見つからないので、明細書の本文の「部品名＋符号」の書き方だけで名前を決めました。"
+                     if body else "【符号の説明】がありません。J-PlatPat の「詳細な説明」の最後にある【符号の説明】を貼り付けてください。")
+    return {"ok": True, "doc": doc or {"id": "", "url": "", "title": "", "pdf": ""}, "found_by": "J-PlatPat の公報（読み込んだファイル）",
+            "sim": None, "fugo_doc": None, "fugo_src": "公報の PDF・貼り付け", "image_doc": "", "image_url": "", "fugo": fugo,
+            "body": body, "legend": legend, "figures": figures, "unknown": dict(sorted(unknown.items(), key=lambda z: (len(z[0]), z[0]))),
+            "others": others, "notes": notes, "ocr": ocr, "tried": []}
+
+
+# =============================================================== J-PlatPat
+JPP = "https://www.j-platpat.inpit.go.jp"
+
+
+def jplatpat_url(pid):
+    """文献番号から J-PlatPat の文献固定アドレスを作る（開くのは人がブラウザで行う。J-PlatPat はプログラムでの自動取得が禁止）。"""
+    s = nfkc(pid).upper()
+    s = re.sub(r"[\s　]", "", s).replace("第", "").replace("号", "").replace("公報", "")
+    m = re.fullmatch(r"(特開|特表|特願)([0-9]{4})[\-/]?([0-9]{1,6})", s)
+    if m:
+        kind = "10" if m.group(1) == "特願" else "11"
+        return f"{JPP}/c1801/PU/JP-{m.group(2)}-{int(m.group(3)):06d}/{kind}/ja"
+    m = re.fullmatch(r"(?:特許)?([0-9]{7})", s)
+    if m:
+        return f"{JPP}/c1801/PU/JP-{m.group(1)}/15/ja"
+    m = re.fullmatch(r"JP([0-9]{4})([0-9]{6})A", s)
+    if m:
+        return f"{JPP}/c1801/PU/JP-{m.group(1)}-{m.group(2)}/11/ja"
+    m = re.fullmatch(r"JP([0-9]{7})B[12]?", s)
+    if m:
+        return f"{JPP}/c1801/PU/JP-{m.group(1)}/15/ja"
+    m = re.fullmatch(r"(?:実登|実用新案登録)([0-9]{7})", s)
+    if m:
+        return f"{JPP}/c1801/PU/JP-{m.group(1)}/25/ja"
+    return None
+
+
+def pdf_text_pages(pdf_path):
+    """PDF の各ページの文字（文字の層があるときだけ）。"""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        out = []
+        for i in range(len(pdf)):
+            tp = pdf[i].get_textpage()
+            out.append(tp.get_text_range() or "")
+        return out
+    except ImportError:
+        pass
+    try:
+        import fitz
+        return [page.get_text() for page in fitz.open(pdf_path)]
+    except ImportError:
+        return []
+
+
+def _ocr_jpn_available():
+    if not ocr_available():
+        return False
+    try:
+        import pytesseract
+        return "jpn" in pytesseract.get_languages(config="")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_from_pdf(pdf_path, claim, comps, fugo_text="", comp_colors=None, use_ocr=True, progress=None,
+                   only_claim=False, pid=""):
+    """J-PlatPat の「文献単位PDF」から、【符号の説明】・明細書の本文・図面のページを取り出し、図面の符号を名前にする。"""
+    log = progress or (lambda *a, **k: None)
+    log("PDF を読んでいます…", 0.05)
+    images = pdf_to_images(pdf_path, dpi=300)
+    texts = pdf_text_pages(pdf_path)
+    notes = []
+    if not any(t.strip() for t in texts):
+        texts = []
+        if _ocr_jpn_available():
+            log("PDF に文字の層が無いので、文字を OCR で読んでいます（1ページ数秒）…", 0.1)
+            import pytesseract
+            for q in images:
+                texts.append(pytesseract.image_to_string(Image.open(q), lang="jpn", config="--psm 6")
+                             if not looks_like_drawing(q) else "")
+            notes.append("PDF に文字の層が無いので、【符号の説明】は OCR で読みました。読み違いがあれば、J-PlatPat の"
+                         "テキスト表示からコピーして貼り付けてください。")
+    full = "\n".join(texts)
+    fugo = parse_fugo_text(full) if "符号の説明" in nfkc(full) else {}
+    body = body_signs(full) if full else {}
+    if texts and not fugo and not fugo_text:
+        notes.append("PDF の中に【符号の説明】が見つかりませんでした。")
+    # 図面のページ：文字の層があれば「【図」があって文の少ないページ、無ければ形で見分ける
+    pages, labels = [], {}
+    for i, q in enumerate(images):
+        t = nfkc(texts[i]) if i < len(texts) else ""
+        if t.strip():
+            kana_kanji = len(re.findall(r"[ぁ-んァ-ヴ一-龥]", re.sub(r"【図[0-9]+】", "", t)))
+            is_draw = ("【図" in t and kana_kanji < 120) or (kana_kanji < 15 and looks_like_drawing(q))
+        else:
+            is_draw = looks_like_drawing(q)
+        if is_draw:
+            pages.append(q)
+            figs = re.findall(r"【(図[0-9]+(?:\([a-z]\))?)】", t)
+            labels[q] = f"PDF {i + 1} ページ" + (f"（{'・'.join(dict.fromkeys(figs))}）" if figs else "")
+    if not pages:
+        return {"ok": False, "error": "PDF の中に図面のページが見つかりませんでした。", "tried": []}
+    url = jplatpat_url(pid) if pid else None
+    doc = {"id": pid or "", "url": url or "", "title": "", "pdf": ""}
+    return build_local(pages, claim, comps, fugo_text, comp_colors, use_ocr=use_ocr, progress=progress, style="names",
+                       only_claim=only_claim, fugo=fugo, body=body, labels=labels, doc=doc, notes=notes)
 
 
 # =============================================================== 報告の HTML（画像を埋め込んだ1ファイル）

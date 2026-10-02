@@ -14,9 +14,9 @@ SAO（主語―関係―目的語）構造を取り出して、人が確認・�
 
 ページ構成（サイドバーのナビゲーション）
   データ
-    📥 データの読み込み       … 特許リストを読み込んで一括解析／解析済みデータ（JSON）を開く
+    📥 読み込みと解析         … ① 特許リストを読み込む ② AI で解析する ③ 1件ずつ確認する（1つのページで上から順に）
   抽出と確認
-    🧪 解析と確認             … 読み込んだ特許のAIの判定を確認・修正して確定する／請求項を1件貼り付けて解析する
+    🧪 請求項を1件だけ試す     … 請求項を貼り付けて解析する
   可視化・分析
     🌍 Patent World           … 発明の名称＋FI から得られる特徴の近さで3次元に配置
     🕸️ ネットワーク            … 構成要素（SAO）または発明の名称の語・FIのつながり
@@ -69,6 +69,10 @@ PC = pp.platform_core                    # 分析・集計・書き出し（旧 
 relations_to_nested_dot = pp.relations_to_nested_dot  # 入れ子の構造図（旧 nested_graph.py）
 
 st.set_page_config(page_title="特許分析プラットフォーム", layout="wide", page_icon="🔬")
+st.markdown("""<style>
+div.stButton > button[kind="primary"], div.stDownloadButton > button {border-radius:10px; padding:.5rem 1.1rem; font-size:1rem}
+div[data-testid="stExpander"] summary p {font-size:.95rem}
+</style>""", unsafe_allow_html=True)
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
@@ -243,7 +247,7 @@ def patent_label(pid):
 
 def need_data():
     if not DATA or not DATA.get("patents"):
-        st.warning("分析するデータがありません。「データの読み込み」ページで特許リストを読み込んでください。")
+        st.warning("分析するデータがありません。「読み込みと解析」ページで特許のリストを読み込んでください。")
         st.stop()
 
 
@@ -772,51 +776,47 @@ def _clicked(event, field="customdata"):
 # ---------------------------------------------------------------------------
 with st.sidebar:
     if DATA:
-        n_done = sum(1 for p in DATA["patents"] if p.get("analyzed", True))
-        st.markdown(f"**📂 {DATA['meta'].get('name', 'データセット')}**")
-        st.caption(f"{len(DATA['patents']):,} 件（解析済み {n_done:,} 件）")
-    st.markdown("### ⚙️ LLMの設定")
-    if BACKEND == "cloud":
-        st.success("🌐 公開デモモード：OpenRouter経由の qwen2.5-7b-instruct を使用", icon="🌐")
-        model_name = st.text_input("モデル名（OpenRouter）", value=CLOUD_MODEL)
-        ollama_host = ""
+        n_done = sum(1 for p in DATA["patents"] if p.get("text") and p.get("analyzed", True))
+        n_rv = len(st.session_state.reviews)
+        st.markdown(f"**📂 {DATA['meta'].get('name', 'データ')}**")
+        st.caption(f"{len(DATA['patents']):,} 件 ／ 解析済み {n_done:,} 件 ／ 確認済み {n_rv:,} 件")
     else:
-        st.info("💻 ローカルモード：このPCのOllamaに接続します", icon="💻")
-        model_name = st.text_input("Ollamaモデル名", value=ts.DEFAULT_MODEL)
-        ollama_host = st.text_input("Ollamaホスト（空欄 = http://localhost:11434）", value="")
-    st.markdown("### 🧪 抽出方法")
-    extract_method = st.radio("抽出方法", METHODS, key="extract_method", label_visibility="collapsed",
-                              help="最終方式（学習なし）：GiNZAの規則で関係を取り出す。LLMが書き出した部品の名前は、GiNZAが取れなかった名前を"
-                                   "補うときだけ使い（R83）、その名前を含む関係も同じ裏付けの決まりで確かめる。"
-                                   "比較用：532件で学習した選別モデル（実験14）。")
-    st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
-    if extract_method == METHODS[0]:
-        # 自動採用に必要な裏付けの数（R61）は、dev で F1 が最も高い 2 に固定（画面での切り替えはしない）
-        accept_min_votes = 2
-        st.markdown("### 🤖 LLMによる確認（実験）")
-        verify_llm = st.checkbox("要確認をLLMに確かめさせる（実験・R63）", value=False, key="verify_llm",
-                                 help="要確認の候補（最大30件）について、LLMに「その関係が本文に書かれているか」を はい／いいえ で"
-                                      "答えさせ、「はい」を採用にします。LLMは関係を作らず、確かめるだけです。1件あたりLLMの呼び出しが1回増えます。")
-        fewshot_llm = st.checkbox("手本つきLLMにも抽出させて照らし合わせる（実験・R64）", value=False, key="fewshot_llm",
-                                  help="書き方の決まりと手本を見せたローカルLLMにもSAOを書き出させ、規則の要確認と同じ関係なら採用にします。"
-                                       "LLMだけが出した関係は要確認として表に出します。1件あたりLLMの呼び出しが1回増えます"
-                                       "（qwen3.5:9b で約1分）。")
-    else:
-        accept_min_votes = 2
-        verify_llm = False
-        fewshot_llm = False
+        st.caption("📂 まだデータがありません。「読み込みと解析」から始めます。")
+    _ai_label = "公開デモ（OpenRouter）" if BACKEND == "cloud" else "このPCの Ollama"
+    with st.expander("⚙️ 詳しい設定（ふつうは変えなくて大丈夫）", expanded=False):
+        if BACKEND == "cloud":
+            st.caption("🌐 公開デモ：OpenRouter 経由の qwen2.5-7b-instruct を使います")
+            model_name = st.text_input("AI のモデル名（OpenRouter）", value=CLOUD_MODEL)
+            ollama_host = ""
+        else:
+            st.caption("💻 このPCの Ollama を使います（データは外に出ません）")
+            model_name = st.text_input("AI のモデル名（Ollama）", value=ts.DEFAULT_MODEL)
+            ollama_host = st.text_input("Ollama の場所（空欄でこのPC）", value="")
+        extract_method = st.radio("取り出し方", METHODS, key="extract_method",
+                                  help="最終方式（学習なし）：GiNZAの規則で関係を取り出し、LLM は部品の名前を補う（R83）。"
+                                       "比較用：532件で学習した選別モデル（実験14）。")
+        st.caption(PC.METHOD_SCORE if extract_method == METHODS[0] else PC.MODEL_METHOD_SCORE)
+        if extract_method == METHODS[0]:
+            accept_min_votes = 2  # 自動採用に必要な裏付けの数（R61）は dev で最も良い 2 に固定
+            verify_llm = st.checkbox("要確認を AI に確かめさせる（実験・R63）", value=False, key="verify_llm",
+                                     help="要確認の候補（最大30件）が本文に書かれているかを AI に はい／いいえ で答えさせ、"
+                                          "「はい」を採用にします。1件あたり AI の呼び出しが1回増えます。")
+            fewshot_llm = st.checkbox("手本つきの AI とも照らし合わせる（実験・R64）", value=False, key="fewshot_llm",
+                                      help="手本を見せた AI にも関係を書き出させ、規則の要確認と同じなら採用にします。"
+                                           "1件あたり AI の呼び出しが1回増えます（qwen3.5:9b で約1分）。")
+        else:
+            accept_min_votes = 2
+            verify_llm = False
+            fewshot_llm = False
+    st.caption(f"AI：{model_name}（{_ai_label}）")
 
 
 # ===========================================================================
-# 📥 データの読み込み
+# 📥 読み込みと解析（① 読み込む）
 # ===========================================================================
 
-def page_data():
-    st.title("📥 データの読み込み")
-    if st.session_state.get("_ingest_msg"):
-        st.success(st.session_state.pop("_ingest_msg"))
-    if DATA:
-        st.info(f"現在のデータ：**{DATA['meta'].get('name')}**（{len(DATA['patents']):,} 件）", icon="📂")
+def name_merge_note():
+    if DATA and DATA.get("name_merges"):
         merges = DATA.get("name_merges") or {}
         with st.expander(f"🏷️ 出願人の名寄せ（自動）：{len(merges)} 社をまとめました" if merges
                          else "🏷️ 出願人の名寄せ（自動）：まとめる会社はありませんでした"):
@@ -830,21 +830,20 @@ def page_data():
                 st.dataframe(pd.DataFrame([{"まとめた先": v, "元の会社名": k, "件数": cnt.get(k, 0)}
                                            for k, v in sorted(merges.items(), key=lambda kv: (kv[1], kv[0]))]),
                              hide_index=True, use_container_width=True)
+
+
+def load_section():
+    """データを読み込む（特許リストの CSV／Excel、保存した解析結果、請求項の貼り付け）。読み込むだけで、解析は次の段階で行う。"""
     # タブ（st.tabs）は再実行のたびに最初のタブへ戻ることがあるので、選択を覚えるラジオボタンで切り替える
-    SECS = ["📄 特許リストを読み込む", "📝 請求項を追加", "💾 解析済みデータを開く"]
-    sec = st.radio("操作", SECS, horizontal=True, key="data_section", label_visibility="collapsed")
-    st.divider()
+    SECS = ["📄 特許のリスト（CSV・Excel）", "💾 前に保存した解析結果（JSON）"]
+    sec = st.radio("読み込むもの", SECS, horizontal=True, key="data_section")
 
     if sec == SECS[0]:
-        st.markdown(
-            "J-PlatPat などから出力した **CSV／Excel** を読み込みます。文献番号・発明の名称・出願人・FI・出願日の列は"
-            "自動で見つけます。解析に使う文は、行ごとに **① 請求項 → ② 要約 → ③ 代替の列** の順で、空でない最初の列を使います"
-            "（要約・代替の列は、【解決手段】の部分を使い、「半導体装置１」の符号などを取り除いてから解析します）。"
-            "どれも無い行は書誌情報だけで読み込み、あとから「📝 請求項を追加」で足して解析できます（書誌情報だけでも、"
-            "可視化・分析の6つの画面はすべて使えます。SAOの代わりに発明の名称の語・FIを使います）。")
+        st.caption("J-PlatPat などから出力した CSV／Excel をそのまま入れてください。文献番号・発明の名称・出願人・請求項などの列は"
+                   "自動で見つけます。請求項が無い行も読み込めます（あとで請求項を足せます）。")
         up = st.file_uploader("特許リスト（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="ds_upload")
-        pasted = st.text_area("または、請求項を「-----」で区切って貼り付け（書誌情報なしで解析）", height=120,
-                              key="ds_paste")
+        with st.expander("ファイルが無いときは、請求項を貼り付けて読み込めます"):
+            pasted = st.text_area("請求項（複数のときは「-----」の行で区切る）", height=120, key="ds_paste")
         df = None
         if up is not None:
             try:
@@ -854,21 +853,22 @@ def page_data():
         elif pasted.strip():
             df = pd.DataFrame({"請求項": [t.strip() for t in pasted.split("-----") if t.strip()]})
         if df is not None:
-            st.caption(f"{len(df):,} 行を読み込みました。列の対応を確認してください。")
+            st.caption(f"{len(df):,} 行あります。下の列の対応が合っているか確かめてください（ふつうはそのままで大丈夫です）。")
             det = PC.detect_columns(df)
             labels = {"id": "文献番号", "title": "発明の名称", "applicant": "出願人", "fi": "FI", "date": "出願日",
                       "url": "URL", "claim": "① 請求項（最優先）", "abstract": "② 要約（請求項が空のとき）",
                       "alt": "③ 代替の列（どちらも空のとき）"}
             opts = ["（なし）"] + list(df.columns)
             cols = {}
-            grid = st.columns(4)
+            colbox = st.expander("列の対応（自動で見つけたもの）", expanded=False)
+            grid = colbox.columns(4)
             for i, (k, lab) in enumerate(labels.items()):
                 cur = det.get(k)
                 cols[k] = grid[i % 4].selectbox(lab, opts, index=opts.index(cur) if cur in opts else 0,
                                                 key=f"col_{k}_{up.name if up is not None else 'paste'}_{len(df.columns)}")
                 cols[k] = None if cols[k] == "（なし）" else cols[k]
             cols["ipc"] = det.get("ipc")
-            st.dataframe(df.head(5), use_container_width=True, hide_index=True)
+            colbox.dataframe(df.head(5), use_container_width=True, hide_index=True)
             c1, c2 = st.columns([2, 1])
             name = c1.text_input("データセットの名前", value=Path(up.name).stem if up is not None else "貼り付けた請求項")
             limit = c2.number_input("読み込む件数の上限（0で全件）", min_value=0, value=0, step=10)
@@ -878,39 +878,11 @@ def page_data():
                 _cnt = Counter(PC.text_label(p).split("（")[0] for p in _prev)
                 st.caption("解析に使う文（先頭の最大200行の内訳）：" + "／".join(
                     f"{k} {_cnt.get(k, 0)} 件" for k in ("請求項", "要約", "代替", "なし")))
-            if not text_cols:
-                st.info("請求項・要約・代替の文の列がありません。書誌情報（文献番号・発明の名称・出願人・FI・出願日）だけで読み込みます。"
-                        "LLMは使わないので、すぐに終わります。", icon="ℹ️")
-                if st.button("📂 書誌情報だけで読み込む", type="primary", disabled=not (cols["id"] or cols["title"])):
-                    ps = PC.patents_from_table(df, cols, limit=int(limit) or None)
-                    finish_ingest({"name": name, "patents": ps, "errors": {}})
-            else:
-                st.caption("請求項のある行は1件あたり数秒〜1分ほどかかります（LLMの呼び出しを含む）。途中で止まっても、"
-                           "同じボタンでもう一度押すと続きから解析します（解析済みの請求項は再計算しません）。"
-                           + ("公開デモ（OpenRouter無料枠）は1日あたりの回数に制限があるため、少ない件数で試してください。"
-                              if BACKEND == "cloud" else ""))
-                if st.button("🚀 読み込んで解析を開始（または続きから）", type="primary"):
-                    ing = st.session_state.ingest
-                    if not ing or ing.get("name") != name or ing.get("n_rows") != len(df):
-                        ing = {"name": name, "n_rows": len(df),
-                               "patents": PC.patents_from_table(df, cols, limit=int(limit) or None), "errors": {}}
-                        st.session_state.ingest = ing
-                    run_ingest(ing)
-        ing = st.session_state.ingest
-        if ing and not all(p["analyzed"] or not p["text"] for p in ing["patents"]):
-            done = sum(p["analyzed"] for p in ing["patents"])
-            todo = sum(bool(p["text"]) for p in ing["patents"])
-            st.warning(f"「{ing['name']}」は、請求項のある {todo} 件のうち {done} 件まで解析済みです。"
-                       "上のボタンで続きから解析するか、ここまでの結果で分析を始められます（残りはあとで解析できます）。")
-            if st.button("ここまでの結果で分析を始める"):
-                finish_ingest(ing, partial=True)
-
+            if st.button("📂 読み込む", type="primary", disabled=not (cols["id"] or cols["title"] or text_cols)):
+                ps = PC.patents_from_table(df, cols, limit=int(limit) or None)
+                finish_ingest({"name": name, "patents": ps, "errors": {}}, partial=True)
     if sec == SECS[1]:
-        add_claims_tab()
-
-    if sec == SECS[2]:
-        st.markdown("以前にこのアプリで解析して保存したデータ（エクスポートページの「解析済みデータ（JSON）」）を開きます。"
-                    "LLMを呼ばずにすぐ分析を始められます。")
+        st.caption("このアプリの「エクスポート」で保存した解析結果（JSON）を開くと、解析し直さずにすぐ続きから使えます。")
         upj = st.file_uploader("解析済みデータ（.json）", type=["json"], key="ds_json")
         if upj is not None and st.button("このデータを開く", type="primary"):
             try:
@@ -964,18 +936,15 @@ def analyze_dataset_patents(pids):
 
 def add_claims_tab():
     if not DATA or not DATA.get("patents"):
-        st.info("先に「📄 特許リストを読み込む」で特許リストを読み込んでください。")
+        st.info("先に特許のリストを読み込んでください。")
         return
     if st.session_state.get("_claims_msg"):
         st.success(st.session_state.pop("_claims_msg"))
     ps = DATA["patents"]
     no_text = [p for p in ps if not p.get("text")]
     ready = [p for p in ps if p.get("text") and not p.get("analyzed", True)]
-    st.markdown(f"読み込んだ {len(ps):,} 件のうち、**請求項が未登録 {len(no_text):,} 件**、"
-                f"**請求項あり・未解析 {len(ready):,} 件**、解析済み {sum(p.get('analyzed', True) and bool(p.get('text')) for p in ps):,} 件。")
-    st.markdown("##### ① 請求項の表をまとめて読み込む")
-    st.caption("「文献番号」と「請求項」の2列がある CSV／Excel を読み込むと、文献番号が一致する特許に請求項を入れます"
-               "（【請求項１】【請求項２】…が続けて入っている場合は請求項1だけを使います）。")
+    st.markdown("**まとめて足す**（「文献番号」と「請求項」の2列がある表）")
+    st.caption("文献番号が一致する特許に請求項を入れます（【請求項１】【請求項２】…が続いていれば請求項1だけを使います）。")
     upc = st.file_uploader("請求項の表（.csv / .xlsx）", type=["csv", "xlsx", "xls"], key="claims_upload")
     if upc is not None:
         try:
@@ -1004,8 +973,7 @@ def add_claims_tab():
                 st.rerun()
         except Exception as e:  # noqa: BLE001
             st.error(f"読み込めませんでした: {e}")
-    st.markdown("##### ② 1件ずつ貼り付ける")
-    st.caption("公報（J-PlatPat など）の【請求項１】をコピーして貼り付けます。")
+    st.markdown("**1件ずつ足す**（J-PlatPat の【請求項１】をコピーして貼り付け）")
     if no_text:
         pid = st.selectbox("請求項が未登録の特許", [p["id"] for p in no_text], format_func=patent_label, key="claim_pid")
         p = PATENTS[pid]
@@ -1018,10 +986,7 @@ def add_claims_tab():
             st.rerun()
     else:
         st.caption("請求項が未登録の特許はありません。")
-    st.markdown("##### ③ 登録した請求項を解析する")
-    st.caption("1件あたり数秒〜1分ほどかかります（LLMの呼び出しを含む）。")
-    if st.button(f"🚀 請求項あり・未解析の {len(ready)} 件を解析する", type="primary", disabled=not ready):
-        analyze_dataset_patents([p["id"] for p in ready])
+    st.caption("請求項を足したら、上の「🚀 解析する」で解析します。")
 
 
 def run_ingest(ing):
@@ -1077,15 +1042,12 @@ def finish_ingest(ing, partial=False):
         st.session_state.ingest = None
     n_an = sum(p["analyzed"] for p in ps)
     # 画面の上のほうは読み込み前のデータで描かれているので、読み込み後に描き直す
-    st.session_state["_ingest_msg"] = (
-        f"「{ing['name']}」（{len(ps)}件、うち解析済み {n_an} 件）を読み込みました。"
-        + ("請求項のない特許は、上の「📝 請求項を追加」から請求項を足して解析できます。" if n_an < len(ps) else "")
-        + "エクスポートページから解析済みデータ（JSON）を保存しておくと、次回はすぐ開けます。")
+    st.session_state["_ingest_msg"] = f"「{ing['name']}」の {len(ps)} 件を読み込みました。次は ② で AI に解析させます。"
     st.rerun()
 
 
 # ===========================================================================
-# 🧪 解析と確認（請求項を1件解析する／読み込んだ特許を確認する）
+# 🧪 請求項を1件だけ試す
 # ===========================================================================
 
 def analyze_body():
@@ -1143,7 +1105,7 @@ def analyze_body():
     b1, b2, _ = st.columns([1.6, 1.4, 3])
     do_save = b1.button("✅ 確定して保存", type="primary", use_container_width=True, key=f"{kb}_save",
                         help="✔ を付けた関係を保存します。データの特許を選んでいればその特許の確認結果に、"
-                             "選んでいなければワークスペースに保存します（エクスポートページから書き出せます）")
+                             "選んでいなければワークスペースに保存します（「保存（エクスポート）」ページから書き出せます）")
     csv_box = b2.empty()
     if st.session_state.get("_an_msg"):
         st.success(st.session_state.pop("_an_msg"))
@@ -1179,7 +1141,7 @@ def analyze_body():
         else:
             st.session_state.workspace.append({"id": f"解析{len(st.session_state.workspace) + 1}",
                                                "text": res["text"], "relations": confirmed})
-            st.session_state["_an_msg"] = "ワークスペースに保存しました（エクスポートページから書き出せます）。"
+            st.session_state["_an_msg"] = "ワークスペースに保存しました（「保存（エクスポート）」ページから書き出せます）。"
         st.rerun()
 
     st.markdown("**確定すると、こうなります（SAO の図）**")
@@ -1327,7 +1289,7 @@ py -3.12 -m streamlit run app.py
 - **Ollamaモデル名**：入れたモデルの名前（例：`qwen3.5:9b`）。`ollama list` に出る名前をそのまま入力します。
 - **Ollamaホスト**：ふつうは空欄のままで大丈夫です（`http://localhost:11434` を使います）。別のPCの Ollama を使う場合だけ入力します。
 
-「解析と確認」→「請求項を貼り付けて解析する」で請求項を1件解析し、処理の流れの「① 構成要素の取り出し（LLM）」に構成要素の数が表示されれば、LLM が正しく使われています。「LLMを呼べませんでした」と出る場合は、次の「困ったとき」を見てください。
+「請求項を1件だけ試す」で請求項を1件解析し、処理の流れの「① 構成要素の取り出し（LLM）」に構成要素の数が表示されれば、LLM が正しく使われています。「LLMを呼べませんでした」と出る場合は、次の「困ったとき」を見てください。
 
 ## 8. 困ったとき
 
@@ -1390,7 +1352,7 @@ def page_rules():
     st.markdown(
         "1. `rulebook.py`（統合版では patent_pipeline.py の中）の一覧に1行足し、実装した場所をその番号のスイッチで囲む\n"
         "2. **run_rules_check.bat** をダブルクリック（LLM不要・532件・約10分）。前回からのF1の変化が表示される\n"
-        "3. 規則を足すきっかけになった請求項で、正しく直ることを「解析と確認」で確かめる\n"
+        "3. 規則を足すきっかけになった請求項で、正しく直ることを「請求項を1件だけ試す」で確かめる\n"
         "4. 規則ごとの効果を測るときは、`--disable R31` のようにその規則だけ止めて同じ確認を回す")
     hist = APP_DIR / "rules_history.json"
     if hist.exists():
@@ -1405,59 +1367,95 @@ def page_rules():
             pass
 
 
-def flow_steps():
-    """解析と確認の流れ（① 読み込み → ② 請求項 → ③ 解析 → ④ 確認）と、いまの進み具合。次にやることを1つだけ示す。"""
-    ps = DATA["patents"]
+def progress_counts():
+    ps = DATA["patents"] if DATA else []
     reviews = st.session_state.reviews
     n = len(ps)
     n_text = sum(1 for p in ps if p.get("text"))
     ready = [p["id"] for p in ps if p.get("text") and not p.get("analyzed", True)]
     n_an = n_text - len(ready)
     n_rv = sum(1 for p in ps if p["id"] in reviews and p.get("text"))
-    steps = [("読み込み", f"{n:,} 件", True),
-             ("請求項", f"{n_text:,} / {n:,} 件", n_text == n),
-             ("AIが解析", f"{n_an:,} / {n_text:,} 件", n_text > 0 and not ready),
-             ("人が確認", f"{n_rv:,} / {n_an:,} 件", n_an > 0 and n_rv >= n_an)]
-    cur = next((i for i, s in enumerate(steps) if not s[2] and i != 1), 4)
+    return n, n_text, ready, n_an, n_rv
+
+
+def flow_steps():
+    """① 読み込む → ② AIが解析 → ③ 人が確認 の進み具合を、上に3つの枠で示す。"""
+    n, n_text, ready, n_an, n_rv = progress_counts()
+    steps = [("データを読み込む", f"{n:,} 件" if n else "まだ", n > 0),
+             ("AIが解析する", f"{n_an:,} / {n_text:,} 件" if n_text else "―", n_text > 0 and not ready),
+             ("人が確認する", f"{n_rv:,} / {n_an:,} 件" if n_an else "―", n_an > 0 and n_rv >= n_an)]
+    cur = next((i for i, s_ in enumerate(steps) if not s_[2]), 3)
     chips = []
     for i, (name, cnt, done) in enumerate(steps):
         if done:
-            bg, bd, mark = "rgba(22,163,74,.10)", "#16a34a", "✓"
+            bg, bd, mark = "rgba(22,163,74,.10)", "#16a34a", "✓ できた"
         elif i == cur:
-            bg, bd, mark = "rgba(37,99,235,.10)", "#2563eb", "▶"
+            bg, bd, mark = "rgba(37,99,235,.12)", "#2563eb", "▶ いまここ"
         else:
-            bg, bd, mark = "rgba(148,163,184,.08)", "rgba(148,163,184,.6)", str(i + 1)
-        chips.append(f"<div style='flex:1;min-width:120px;border:2px solid {bd};background:{bg};border-radius:10px;"
-                     f"padding:6px 10px'><div style='font-size:.8rem;opacity:.75'>{mark}　{i + 1}. {name}</div>"
-                     f"<div style='font-size:1.1rem;font-weight:700'>{cnt}</div></div>")
-    st.markdown("<div style='display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 10px'>" +
-                "<div style='align-self:center;opacity:.5'>→</div>".join(chips) + "</div>", unsafe_allow_html=True)
+            bg, bd, mark = "rgba(148,163,184,.08)", "rgba(148,163,184,.6)", "これから"
+        chips.append(f"<div style='flex:1;min-width:150px;border:2px solid {bd};background:{bg};border-radius:12px;"
+                     f"padding:8px 12px'><div style='font-size:.8rem;opacity:.8'>{'①②③'[i]} {mark}</div>"
+                     f"<div style='font-size:1.05rem;font-weight:700'>{name}</div>"
+                     f"<div style='font-size:.9rem;opacity:.85'>{cnt}</div></div>")
+    st.markdown("<div style='display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 14px'>" +
+                "<div style='align-self:center;opacity:.5;font-size:1.3rem'>→</div>".join(chips) + "</div>",
+                unsafe_allow_html=True)
+    return cur
+
+
+def step_title(num, text, active):
+    color = "#2563eb" if active else "inherit"
+    st.markdown(f"<div style='font-size:1.35rem;font-weight:700;margin:18px 0 6px;color:{color}'>{num}　{text}</div>",
+                unsafe_allow_html=True)
+
+
+def page_home():
+    """読み込みと解析：① 読み込む ② AIで解析する ③ 1件ずつ確認する を、上から順に1つのページで行う。"""
+    st.title("📥 読み込みと解析")
+    st.caption("上から順に進めます。特許のリストを読み込み、AI に解析させ、その結果を1件ずつ確かめます。")
+    for k in ("_ingest_msg", "_claims_msg"):
+        if st.session_state.get(k):
+            st.success(st.session_state.pop(k))
+    cur = flow_steps()
+    n, n_text, ready, n_an, n_rv = progress_counts()
+
+    step_title("①", "データを読み込む", cur == 0)
+    if not DATA:
+        load_section()
+        return
+    st.markdown(f"📂 **{DATA['meta'].get('name')}**（{n:,} 件）を読み込んでいます。")
+    with st.expander("別のデータを読み込む"):
+        load_section()
+    name_merge_note()
+
+    step_title("②", "AI で解析する", cur == 1)
     if ready:
         c1, c2 = st.columns([3, 2])
-        c1.markdown(f"**次にやること：** 請求項があって、まだ解析していない特許が **{len(ready):,} 件** あります。"
-                    "先に AI で解析してください（1件あたり数秒〜1分）。")
-        if c2.button(f"🚀 {len(ready):,} 件を解析する", type="primary", use_container_width=True, key="flow_analyze"):
+        c1.markdown(f"請求項があって、まだ解析していない特許が **{len(ready):,} 件** あります。"
+                    "1件あたり数秒〜1分かかります。途中で止めても、もう一度押せば続きから進みます。")
+        if c2.button(f"🚀 {len(ready):,} 件を解析する", type="primary", use_container_width=True, key="home_analyze"):
             analyze_dataset_patents(ready)
-    elif n_an == 0:
-        st.info("解析できる請求項がありません。「データの読み込み」ページの「📝 請求項を追加」で請求項を登録してください。")
-    elif n_rv < n_an:
-        st.markdown(f"**次にやること：** 下の表で AI の判定を直し、**「✅ 確定して次へ」** を押します。"
-                    f"残り **{n_an - n_rv:,} 件**。")
-    else:
-        st.success("すべての特許を確認しました。「エクスポート」ページで、確認結果（解析済みデータ）を保存しておきましょう。")
+    elif n_text:
+        st.markdown(f"✓ 請求項のある {n_text:,} 件は、すべて解析しました。")
     if n_text < n:
-        st.caption(f"請求項が無い特許が {n - n_text:,} 件あります（「データの読み込み」→「📝 請求項を追加」で足せます）。")
-    return n_an
+        with st.expander(f"請求項が無い特許が {n - n_text:,} 件あります（ここで請求項を足せます）"):
+            add_claims_tab()
+    if not n_an:
+        return
+
+    step_title("③", "1件ずつ確認する", cur == 2)
+    if n_rv >= n_an:
+        st.success("すべての特許を確認しました。「保存（エクスポート）」ページで結果を保存しておきましょう。")
+    else:
+        st.caption(f"AI の判定を表で直して「✅ 確定して次へ」を押します。残り {n_an - n_rv:,} 件。")
+    review_body()
 
 
 def review_body():
     if not DATA or not DATA.get("patents"):
-        st.info("確認する特許がありません。まず「データの読み込み」ページで特許リストを読み込んでください。")
+        st.info("確認する特許がありません。まず「読み込みと解析」ページで特許のリストを読み込んでください。")
         return
     reviews = st.session_state.reviews
-    n_an = flow_steps()
-    if not n_an:
-        return
     with st.expander("絞り込み・並び順", expanded=False):
         f1, f2, f3 = st.columns([2, 2, 1])
         comp = f1.multiselect("出願人", sorted({p["company"] for p in DATA["patents"]}), key="rv_comp")
@@ -1547,16 +1545,9 @@ def review_body():
     sao_graph(kept, key="review", colors=colors)
 
 
-def page_extract():
-    st.title("🧪 解析と確認")
-    modes = ["読み込んだ特許を1件ずつ確認する", "請求項を1件だけ貼り付けて試す"]
-    mode = st.radio("やること", modes, index=0 if DATA else 1, horizontal=True, key="extract_mode",
-                    label_visibility="collapsed")
-    st.divider()
-    if mode == modes[0]:
-        review_body()
-    else:
-        analyze_body()
+def page_try():
+    st.title("🧪 請求項を1件だけ試す")
+    analyze_body()
 
 
 # ===========================================================================
@@ -1601,7 +1592,7 @@ def show_patent_card(pid):
     st.markdown(f"**{p['title']}**（{pid}）　{p['applicant']}　FI: {p['fi'] or '―'}")
     if not (p.get("text") or "").strip():
         st.caption(f"出願日：{p.get('filing_date') or '―'}／発明の名称の語：{'、'.join(sorted(PC.title_terms(p.get('title')))) or '―'}"
-                   "。この特許には請求項・要約がありません（「データの読み込み」→「請求項を追加」から足すと、SAOも表示されます）。")
+                   "。この特許には請求項・要約がありません（「読み込みと解析」の ② で請求項を足すと、SAOも表示されます）。")
         return
     if PC.text_label(p) != "請求項":
         st.caption(f"解析に使った文：**{PC.text_label(p)}**（請求項が無いため）")
@@ -2266,125 +2257,139 @@ def _show_drawing_result(dt, state):
         st.error(res.get("error", "図面を作れませんでした。"))
         if res.get("tried"):
             st.caption("試した番号：" + "、".join(res["tried"]))
-        st.info("「公報のファイルを読み込む」を選ぶと、自分で用意した公報の PDF や図面の画像と【符号の説明】で、符号を名前に置きかえられます。")
         return
     d = res["doc"]
-    c1, c2, c3, c4 = st.columns([2.2, 1.2, 1.2, 1.2])
-    if d.get("url"):
-        c1.markdown(f"**公報：[{d['id']}]({d['url']})**　{html.escape(d.get('title') or '')}")
-    else:
-        c1.markdown("**読み込んだファイル**")
-    c2.metric("構成要素と符号の対応", f"{sum(1 for L in res['legend'] if L['codes'])} / {len(res['legend'])}")
-    c3.metric("構成要素が写っている図", f"{sum(1 for f in res['figures'] if f['claim_codes'])} / {len(res['figures'])}")
-    if res.get("sim") is not None:
-        c4.metric("請求項の近さ", f"{res['sim']:.2f}", help="データの請求項と、見つけた公報の請求項の文字の重なり（1 が同じ）。"
-                  "特許公報（B）の請求項は、補正で公開公報（A）と変わっていることがあります。")
-    src = [f"見つけ方：{res['found_by']}"]
-    if res.get("image_doc"):
-        src.append(f"図面：{res['image_doc']}")
-    if res.get("fugo_doc") or res.get("fugo_src"):
-        src.append(f"符号の説明：{res.get('fugo_doc') or ''} {res.get('fugo_src') or ''}".strip())
-    src.append("符号の位置：Google Patents の読み取り" + ("＋OCR" if res.get("ocr") else ""))
-    st.caption("／".join(src))
+    n_link = sum(1 for L in res["legend"] if L["codes"])
+    n_fig = sum(1 for f in res["figures"] if f["claim_codes"])
+    head = f"**公報：[{d['id']}]({d['url']})**　" if d.get("url") else ""
+    st.markdown(f"{head}請求項の部品 {len(res['legend'])} 個のうち {n_link} 個の符号が分かり、"
+                f"{len(res['figures'])} 枚の図のうち {n_fig} 枚に出てきます。")
     for n in res["notes"]:
-        st.warning(n, icon="📝")
+        st.info(n, icon="📝")
 
-    st.markdown("#### 構成要素と符号の対応")
-    st.markdown(_drawing_legend_html(res), unsafe_allow_html=True)
-    st.caption("図面の符号の数字を、【符号の説明】（無いときは明細書の本文）の名前に置きかえています。"
-               "太字＋下線＝請求項の構成要素に当たる部品。名前が分からない符号は、数字のまま残しています。")
-
-    st.markdown("#### 図面")
     v1, v2 = st.columns([2, 1])
-    only = v1.checkbox("請求項の構成要素が写っている図だけ表示", value=True, key="dr_only")
+    only = v1.checkbox("請求項の部品が写っている図だけ表示", value=True, key="dr_only")
     two = v2.checkbox("2列で小さく並べる", value=False, key="dr_two")
     figs = [f for f in res["figures"] if f["claim_codes"] or not only]
     if not figs:
-        st.info("請求項の構成要素の符号が見つかった図はありません。上のチェックを外すと、すべての図を表示します。")
+        st.info("請求項の部品の符号が見つかった図はありません。上のチェックを外すと、すべての図を表示します。")
     cols = st.columns(2) if two else [st.container()]
     for i, f in enumerate(figs):
         with cols[i % len(cols)]:
             names = "、".join(dict.fromkeys(res["fugo"].get(c) or res["body"].get(c, c) for c in f["claim_codes"])) or "なし"
             st.image(f["png"], use_container_width=True, caption=f"{f['label']}　請求項の部品：{names}")
+    st.caption("図面の数字を、【符号の説明】（無いときは明細書の本文）の名前に置きかえています。"
+               "太字＋下線＝請求項の部品。名前が分からない数字は、そのまま残しています。")
 
+    with st.expander("請求項の部品と符号の対応表"):
+        st.markdown(_drawing_legend_html(res), unsafe_allow_html=True)
     if res["unknown"]:
-        st.markdown("#### 図面にあるのに【符号の説明】に無い符号")
-        st.caption("書き漏れの手がかり（明細書の本文には出てくることがあります）。OCR の読み違いのこともあります。")
-        st.dataframe(pd.DataFrame([{"符号": c, "出てくる図": "、".join(x.split("：")[0] for x in u["figs"]),
-                                    "本文での名前": u.get("body_name") or "", "Google の英語ラベル": u.get("label") or ""}
-                                   for c, u in res["unknown"].items()]), hide_index=True, use_container_width=True)
+        with st.expander(f"図面にあるのに【符号の説明】に無い数字（{len(res['unknown'])} 個）"):
+            st.caption("書き漏れの手がかり（明細書の本文には出てくることがあります）。読み違いのこともあります。")
+            st.dataframe(pd.DataFrame([{"数字": c, "出てくる図": "、".join(x.split("：")[0] for x in u["figs"]),
+                                        "本文での名前": u.get("body_name") or ""}
+                                       for c, u in res["unknown"].items()]), hide_index=True, use_container_width=True)
     if res["others"]:
-        with st.expander(f"請求項に出てこない符号（実施形態だけの部品 {len(res['others'])} 個）"):
+        with st.expander(f"請求項に出てこない部品（実施形態だけの部品 {len(res['others'])} 個）"):
             st.write("、".join(f"{c} {n}" for c, n in res["others"]))
-    fname = f"図面の構成要件_{d.get('id') or 'file'}.html"
-    st.download_button("📥 この結果を HTML で保存（画像込み・1ファイル）", dt.report_html(res, claim, only_claim_figs=only),
+    fname = f"図面_{d.get('id') or 'file'}.html"
+    st.download_button("📥 この結果を保存（画像込みの HTML）", dt.report_html(res, claim, only_claim_figs=only),
                        file_name=fname, mime="text/html")
 
 
 def page_drawing():
     st.title("🎨 図面で見る")
-    st.caption("公報の図面の符号（数字）を、部品の名前に置きかえて表示します。請求項の構成要素に当たる部品は太字にします。"
-               "公報は Google Patents から自動で探し、図面の画像・【符号の説明】・明細書の本文を読みます（インターネットへの接続が必要です）。")
+    st.caption("公報の図面の数字（符号）を、部品の名前に置きかえて表示します。請求項に出てくる部品は太字になります。")
     dt = _drawing_module()
-    st.info(dt.NOTE, icon="ℹ️")
-    modes = ["データの特許から選ぶ", "文献番号と請求項を入力する", "公報のファイルを読み込む"]
-    mode = st.radio("請求項の選び方", modes, horizontal=True, index=0 if DATA else 1, key="dr_mode")
-    o1, o2, o3 = st.columns(3)
-    only_claim = o1.checkbox("請求項の構成要素だけ名前にする", value=False, key="dr_only_claim",
-                             help="チェックすると、請求項に出てくる部品の符号だけを名前に置きかえ、ほかの符号は数字のまま残します。")
-    fill = False
-    has_ocr = dt.ocr_available()
-    use_ocr = o2.checkbox("図面の文字を OCR で読む", value=has_ocr, disabled=not has_ocr, key="dr_ocr",
-                          help="Google Patents が読み取っていない符号（30a のような英字つきなど）も探します。1図に数秒かかります。"
-                          if has_ocr else "Tesseract（OCR）が入っていないので使えません。入れ方はページの下にあります。")
-    include_review = o3.checkbox("要確認の関係の部品も含める", value=True, key="dr_review",
-                                 help="人手で確定していない特許では、採用の関係に加えて要確認の関係の部品も、請求項の構成要素として太字にします。")
 
-    claim, comps, colors, pid, title, applicant = "", [], {}, "", "", ""
-    if mode == modes[0]:
-        if not DATA or not DATA.get("patents"):
-            st.warning("データがありません。「データの読み込み」ページで特許リストを読み込むか、ほかの選び方を使ってください。")
+    # ── ① 特許を選ぶ
+    step_title("①", "特許を選ぶ", True)
+    use_data = bool(DATA and any(p.get("text") and p.get("relations") for p in DATA["patents"]))
+    how = st.radio("選び方", ["読み込んだデータから選ぶ", "文献番号と請求項を入れる"], horizontal=True,
+                   index=0 if use_data else 1, key="dr_how", label_visibility="collapsed")
+    include_review = st.session_state.get("dr_review", True)
+    claim, cols, pid = "", None, ""
+    if how == "読み込んだデータから選ぶ":
+        if not use_data:
+            st.info("解析済みのデータがありません。「読み込みと解析」で読み込むか、「文献番号と請求項を入れる」を選んでください。")
             return
         ids = [p["id"] for p in DATA["patents"] if p.get("text") and p.get("relations")]
-        if not ids:
-            st.warning("解析済みの請求項がある特許がありません。")
-            return
         pid = st.selectbox("特許", ids, format_func=patent_label, key="dr_pid")
-        p = PATENTS[pid]
-        cols, reviewed = _drawing_components(pid, include_review)
-        claim, title, applicant = p["text"], p.get("title") or "", p.get("applicant") or p.get("company") or ""
-        comps, colors = list(cols), {k: v["border"] for k, v in cols.items()}
-        st.caption(("人手で確定した関係" if reviewed else "AI の判定（採用" + ("＋要確認" if include_review else "") + "）")
-                   + f"の構成要素 {len(comps)} 個を使います。")
-        with st.expander("請求項（構成要素を色でマーク）", expanded=False):
-            st.markdown(f"<div style='font-size:.92rem;line-height:1.9'>{PC.highlight_colored(claim, cols)}</div>",
-                        unsafe_allow_html=True)
-    elif mode == modes[1]:
-        c1, c2 = st.columns([1, 2])
-        pid = c1.text_input("文献番号", placeholder="例：特開2022-144957／特許7800720／WO2024/084656", key="dr_pid_in")
-        title = c1.text_input("発明の名称（番号で見つからないときの検索用・任意）", key="dr_title_in")
-        applicant = c1.text_input("出願人（任意）", key="dr_app_in")
-        claim = c2.text_area("請求項の本文", height=220, key="dr_claim_in")
+        cols, _ = _drawing_components(pid, include_review)
+        claim = PATENTS[pid]["text"]
     else:
-        _drawing_local(dt, fill, use_ocr, include_review, only_claim)
-        return
+        c1, c2 = st.columns([1, 2])
+        pid = c1.text_input("文献番号", placeholder="例：特開2022-144957／特許7800720", key="dr_pid_in")
+        claim = c2.text_area("請求項の本文", height=140, key="dr_claim_in")
 
-    if st.button("🎨 公報を探して図面の符号を名前にする", type="primary", disabled=not (pid and claim.strip()), key="dr_go"):
+    # ── ② 公報を用意する（J-PlatPat）
+    step_title("②", "J-PlatPat で公報を開き、PDF を保存する", True)
+    url = dt.jplatpat_url(pid) if pid else None
+    b1, b2 = st.columns([1.3, 2])
+    if url:
+        b1.link_button("📄 J-PlatPat でこの公報を開く", url, use_container_width=True)
+    else:
+        b1.link_button("📄 J-PlatPat を開く", dt.JPP, use_container_width=True)
+    b2.caption("開いた画面で公報の番号をクリックし、「文献単位PDF」を押して PDF を保存します。"
+               "保存した PDF を下に入れてください（図面の画像でも大丈夫です）。")
+    files = st.file_uploader("公報の PDF（または図面の画像）", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
+                             accept_multiple_files=True, key=f"dr_files_{pid}")
+    with st.expander("【符号の説明】を貼り付ける（PDF から読めなかったときだけ）"):
+        st.caption("J-PlatPat の「テキスト表示」で「詳細な説明」を開き、いちばん最後の【符号の説明】をコピーして貼り付けます。")
+        fugo_text = st.text_area("【符号の説明】", height=140, key=f"dr_fugo_{pid}",
+                                 placeholder="１、１０１  半導体装置\n５  電力変換装置\n３０ａ  第１ヘッダ …")
+    auto = st.checkbox("PDF が無いときは、Google Patents から図面を自動で取ってくる", value=not files, key="dr_auto",
+                       help="J-PlatPat はプログラムでの自動取得が禁止されているので、自動で取るときは Google Patents を使います。")
+
+    with st.expander("詳しい設定"):
+        o1, o2, o3 = st.columns(3)
+        only_claim = o1.checkbox("請求項の部品だけ名前にする", value=False, key="dr_only_claim")
+        has_ocr = dt.ocr_available()
+        use_ocr = o2.checkbox("図面の文字を OCR で読む", value=has_ocr, disabled=not has_ocr, key="dr_ocr",
+                              help=None if has_ocr else "Tesseract（OCR）が入っていないので使えません。")
+        o3.checkbox("要確認の関係の部品も太字にする", value=True, key="dr_review")
+
+    # ── ③ 名前にする
+    step_title("③", "図面の数字を名前にする", True)
+    ready = bool(claim.strip()) and (bool(files) or (auto and pid))
+    if not ready:
+        st.caption("① で特許を選び、② で PDF を入れる（または自動で取るにチェック）と押せます。")
+    if st.button("🎨 図面の数字を名前にする", type="primary", disabled=not ready, key="dr_go"):
         try:
-            if mode == modes[1]:
+            if cols is None:
                 with st.spinner("請求項を解析しています…"):
                     _, rels = llm_extract(claim)
                 cols = pp.component_colors(PC.tidy_relations(rels))
-                comps, colors = list(cols), {k: v["border"] for k, v in cols.items()}
-            bar = st.progress(0.0, text="公報を探しています…")
+            colors = {k: v["border"] for k, v in cols.items()}
+            bar = st.progress(0.0, text="準備しています…")
 
             def prog(msg, frac=None):
                 bar.progress(min(1.0, max(0.0, frac or 0.0)), text=msg)
 
-            res = dt.build(_drawing_fetcher(dt), pid, claim, comps, colors, title=title, applicant=applicant,
-                           use_ocr=use_ocr, fill=fill, progress=prog, style="names", only_claim=only_claim)
+            if files:
+                tmp = Path(tempfile.mkdtemp())
+                pdfs = [f for f in files if f.name.lower().endswith(".pdf")]
+                if pdfs:
+                    path = tmp / pdfs[0].name
+                    path.write_bytes(pdfs[0].getvalue())
+                    res = dt.build_from_pdf(str(path), claim, list(cols), fugo_text, colors, use_ocr=use_ocr,
+                                            progress=prog, only_claim=only_claim, pid=pid)
+                else:
+                    pages = []
+                    for f in files:
+                        q = tmp / f.name
+                        q.write_bytes(f.getvalue())
+                        pages.append(str(q))
+                    res = dt.build_local(pages, claim, list(cols), fugo_text, colors, use_ocr=use_ocr, progress=prog,
+                                         style="names", only_claim=only_claim)
+            else:
+                res = dt.build(_drawing_fetcher(dt), pid, claim, list(cols), colors,
+                               title=(PATENTS.get(pid) or {}).get("title", ""),
+                               applicant=(PATENTS.get(pid) or {}).get("applicant", ""),
+                               use_ocr=use_ocr, fill=False, progress=prog, style="names", only_claim=only_claim,
+                               fugo_override=dt.parse_fugo_text(fugo_text) if fugo_text.strip() else None)
             bar.empty()
-            st.session_state.drawing_result = {"res": res, "claim": claim, "key": (mode, pid)}
+            st.session_state.drawing_result = {"res": res, "claim": claim, "key": pid}
         except dt.FetchError as e:
             st.error(str(e))
             st.session_state.drawing_result = None
@@ -2396,58 +2401,7 @@ def page_drawing():
             st.error(f"図面の処理中にエラーが発生しました：{e}")
             st.session_state.drawing_result = None
     state = st.session_state.get("drawing_result")
-    if state and state.get("key") == (mode, pid):
-        _show_drawing_result(dt, state)
-    _drawing_help(dt)
-
-
-def _drawing_local(dt, fill, use_ocr, include_review, only_claim=False):
-    """公報を自分で用意したとき：PDF か図面の画像＋【符号の説明】を貼り付ける。"""
-    st.caption("自動で見つからない公報は、J-PlatPat などから公報の PDF（または図面の画像）を保存して読み込みます。"
-               "符号の位置は OCR で読むので、Tesseract が必要です。")
-    files = st.file_uploader("公報の PDF または図面の画像（複数可）", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
-                             accept_multiple_files=True, key="dr_files")
-    c1, c2 = st.columns(2)
-    fugo_text = c1.text_area("【符号の説明】（明細書からコピーして貼り付け）", height=200, key="dr_fugo",
-                             placeholder="１、１０１  半導体装置\n５  電力変換装置\n３０ａ  第１ヘッダ …")
-    opts = ["（貼り付ける）"] + ([p["id"] for p in DATA["patents"] if p.get("text")] if DATA else [])
-    src = c2.selectbox("請求項", opts, format_func=lambda x: x if x == opts[0] else patent_label(x), key="dr_local_pid")
-    claim = c2.text_area("請求項の本文", value=PATENTS[src]["text"] if src in PATENTS else "", height=140,
-                         key=f"dr_local_claim_{src}")
-    if st.button("🎨 図面の符号を名前にする", type="primary", disabled=not (files and claim.strip()), key="dr_go_local"):
-        try:
-            if src in PATENTS:
-                cols, _ = _drawing_components(src, include_review)
-            else:
-                with st.spinner("請求項を解析しています…"):
-                    _, rels = llm_extract(claim)
-                cols = pp.component_colors(PC.tidy_relations(rels))
-            tmp = Path(tempfile.mkdtemp())
-            pages = []
-            for f in files:
-                path = tmp / f.name
-                path.write_bytes(f.getvalue())
-                if f.name.lower().endswith(".pdf"):
-                    pages += [q for q in dt.pdf_to_images(str(path)) if dt.looks_like_drawing(q)]
-                else:
-                    pages.append(str(path))
-            bar = st.progress(0.0, text="図面の符号を名前にしています…")
-            res = dt.build_local(pages, claim, list(cols), fugo_text, {k: v["border"] for k, v in cols.items()},
-                                 use_ocr=use_ocr, fill=fill, style="names", only_claim=only_claim,
-                                 progress=lambda m, fr=None: bar.progress(min(1.0, fr or 0.0), text=m))
-            bar.empty()
-            if not res["fugo"]:
-                st.warning("【符号の説明】を読み取れませんでした。「１０  冷却器」のように、符号と名前を並べて貼り付けてください。")
-            st.session_state.drawing_result = {"res": res, "claim": claim, "key": ("local", src)}
-        except ImportError as e:
-            st.error(f"図面の機能に必要な部品（{e.name}）が、このアプリを動かしている Python に入っていません。"
-                     f"`python -m pip install {e.name}` を実行してから、アプリを起動し直してください。")
-            st.session_state.drawing_result = None
-        except Exception as e:  # noqa: BLE001
-            st.error(f"図面の処理中にエラーが発生しました：{e}")
-            st.session_state.drawing_result = None
-    state = st.session_state.get("drawing_result")
-    if state and state.get("key") == ("local", src):
+    if state and state.get("key") == pid:
         _show_drawing_result(dt, state)
     _drawing_help(dt)
 
@@ -2455,18 +2409,15 @@ def _drawing_local(dt, fill, use_ocr, include_review, only_claim=False):
 def _drawing_help(dt):
     with st.expander("しくみと注意"):
         st.markdown(
-            "- **公報の探し方**：文献番号（特開・特表・特許・再表・WO）を Google Patents の番号に変えて開きます。"
-            "見つからないときは、発明の名称と出願人で検索し、請求項の本文がいちばん近い公報を選びます。\n"
-            "- **図面や符号の説明が無い公報**（新しい特許公報など）は、ファミリーの公報（再表・WO など）のものを使います。"
-            "番号の付け方は同じ出願なら同じです。\n"
-            "- **構成要素と符号の対応**：構成要素の名前と【符号の説明】の名前を比べます。「多穴管」は「第1多穴管」「第2多穴管」に"
-            "当たるとし、「第1ヘッダ」と「第2ヘッダ」は別の部品とします。符号の説明に無いときは、明細書の本文の「管１１２」の"
-            "ような書き方から補います。\n"
-            "- **符号の位置**：Google Patents が図面から読み取った数字の位置を使い、OCR（Tesseract）が入っていれば、"
-            "英字つきの符号（30a など）も読みます。\n"
-            "- 取得した公報と図面は、アプリのフォルダの `.drawing_cache` に保存し、2回目からはすぐに表示します。\n"
-            "- **OCR（Tesseract）の入れ方（Windows）**：https://github.com/UB-Mannheim/tesseract/wiki から"
-            "インストーラーを入れ、`pip install pytesseract` を実行します（標準の場所に入れれば自動で見つけます）。")
+            "- **J-PlatPat について**：公報は J-PlatPat の文献固定アドレスで開きます。J-PlatPat はプログラムでの自動取得"
+            "（ロボットアクセス）が禁止されているので、PDF の保存は人が行い、アプリは保存した PDF を読みます。\n"
+            "- **PDF から読むもの**：【符号の説明】と明細書の本文（「管１１２」のような書き方）から、数字と部品の名前の表を作ります。"
+            "図面のページは「【図１】」などの見出しで見分けます。\n"
+            "- **図面の数字の読み取り**：OCR（Tesseract）で読み、表にある数字だけを使います。O と 0、l と 1 のような読み違いは"
+            "表の数字に合わせて直し、縦向きの数字は図を回して読みます。\n"
+            "- **自動で取る**：チェックすると、Google Patents から図面と【符号の説明】を取ってきます。\n"
+            "- 図面は実施形態であり、権利範囲そのものではありません。\n"
+            "- **OCR（Tesseract）の入れ方（Windows）**：setup_drawing.bat を実行します。")
 
 
 # ===========================================================================
@@ -2481,7 +2432,7 @@ def page_export():
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**解析済みデータ（JSON）**")
-        st.caption("このデータセットの解析結果一式。「データの読み込み」で開くと、次回はLLMを呼ばずにすぐ分析できる。")
+        st.caption("このデータセットの解析結果一式。「読み込みと解析」で開くと、次回は解析し直さずにすぐ使えます。")
         st.download_button("⬇️ 解析済みデータを保存", json.dumps(DATA, ensure_ascii=False).encode("utf-8"),
                            file_name=f"{DATA['meta'].get('name', 'dataset')}_sao.json", mime="application/json")
     with c2:
@@ -2518,7 +2469,7 @@ def page_export():
                            json.dumps(gold_json, ensure_ascii=False, indent=1).encode("utf-8"),
                            file_name="gold_sao.json", mime="application/json")
     else:
-        st.info("人手確認で確定した特許がまだありません（「解析と確認」で確定すると書き出せます）。")
+        st.info("人手確認で確定した特許がまだありません（「読み込みと解析」の ③ で確定すると書き出せます）。")
     st.divider()
     st.markdown("#### 人手確認の保存と読み込み")
     st.caption("確認結果はブラウザを閉じると消えます。作業を続けるときは保存したCSVを読み込んでください。")
@@ -2548,19 +2499,19 @@ def page_export():
 # ナビゲーション
 # ---------------------------------------------------------------------------
 nav = st.navigation({
-    "データ": [st.Page(page_data, title="データの読み込み", icon="📥", url_path="data", default=True)],
-    "抽出と確認": [st.Page(page_extract, title="解析と確認", icon="🧪", url_path="extract")],
-    "可視化・分析": [st.Page(page_world, title="Patent World", icon="🌍", url_path="world"),
-                   st.Page(page_network, title="ネットワーク", icon="🕸️", url_path="network"),
-                   st.Page(page_similarity, title="類似性マップ", icon="🗺️", url_path="similarity"),
-                   st.Page(page_radar, title="技術レーダー", icon="🧭", url_path="radar"),
-                   st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution"),
-                   st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
-    "個別ツール": [st.Page(page_compare, title="2つの請求項を比較", icon="🐚", url_path="compare"),
-                st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent"),
-                st.Page(page_drawing, title="図面で見る", icon="🎨", url_path="drawing")],
-    "出力": [st.Page(page_export, title="エクスポート", icon="📤", url_path="export"),
-            st.Page(page_rules, title="規則の一覧", icon="📏", url_path="rules")],
-    "ヘルプ": [st.Page(page_llm_setup, title="ローカルLLMの準備", icon="🛠️", url_path="setup")],
+    "はじめる": [st.Page(page_home, title="読み込みと解析", icon="📥", url_path="home", default=True)],
+    "見る・調べる": [st.Page(page_drawing, title="図面で見る", icon="🎨", url_path="drawing"),
+                 st.Page(page_network, title="ネットワーク", icon="🕸️", url_path="network"),
+                 st.Page(page_similarity, title="類似性マップ", icon="🗺️", url_path="similarity"),
+                 st.Page(page_world, title="Patent World", icon="🌍", url_path="world"),
+                 st.Page(page_radar, title="技術レーダー", icon="🧭", url_path="radar"),
+                 st.Page(page_distribution, title="技術分布", icon="🫧", url_path="distribution"),
+                 st.Page(page_wordcloud, title="ワードクラウド", icon="🔥", url_path="wordcloud")],
+    "1件ずつ使う道具": [st.Page(page_try, title="請求項を1件だけ試す", icon="🧪", url_path="try"),
+                  st.Page(page_compare, title="2つの請求項を比べる", icon="🐚", url_path="compare"),
+                  st.Page(page_dependent, title="従属請求項を展開", icon="🪼", url_path="dependent")],
+    "保存・説明": [st.Page(page_export, title="保存（エクスポート）", icon="📤", url_path="export"),
+              st.Page(page_rules, title="規則の一覧", icon="📏", url_path="rules"),
+              st.Page(page_llm_setup, title="ローカルLLMの準備", icon="🛠️", url_path="setup")],
 }, expanded=True)
 nav.run()
