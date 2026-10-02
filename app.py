@@ -72,7 +72,7 @@ st.set_page_config(page_title="特許分析プラットフォーム", layout="wi
 
 # app.py と patent_pipeline.py は必ず組で差し替える。片方だけ古いと、ページの途中で
 # AttributeError になるので、起動時に確かめて分かりやすく知らせる。
-NEED_PIPELINE = "2026-09-30f"
+NEED_PIPELINE = "2026-09-30g"
 if getattr(PC, "PIPELINE_VERSION", None) != NEED_PIPELINE:
     st.error("patent_pipeline.py が app.py と合っていません（古い patent_pipeline.py のままです）。"
              "GitHub の patent_pipeline.py も、app.py と一緒に渡した新しいファイルに差し替えてください。"
@@ -2295,15 +2295,17 @@ def _show_drawing_result(dt, state):
                "太字＋下線＝請求項の構成要素に当たる部品。名前が分からない符号は、数字のまま残しています。")
 
     st.markdown("#### 図面")
-    only = st.checkbox("請求項の構成要素が写っている図だけ表示", value=True, key="dr_only")
+    v1, v2 = st.columns([2, 1])
+    only = v1.checkbox("請求項の構成要素が写っている図だけ表示", value=True, key="dr_only")
+    two = v2.checkbox("2列で小さく並べる", value=False, key="dr_two")
     figs = [f for f in res["figures"] if f["claim_codes"] or not only]
     if not figs:
         st.info("請求項の構成要素の符号が見つかった図はありません。上のチェックを外すと、すべての図を表示します。")
-    cols = st.columns(2)
+    cols = st.columns(2) if two else [st.container()]
     for i, f in enumerate(figs):
-        with cols[i % 2]:
-            st.image(f["png"], use_container_width=True,
-                     caption=f"{f['label']}　構成要素の符号：{'、'.join(f['claim_codes']) or 'なし'}")
+        with cols[i % len(cols)]:
+            names = "、".join(dict.fromkeys(res["fugo"].get(c) or res["body"].get(c, c) for c in f["claim_codes"])) or "なし"
+            st.image(f["png"], use_container_width=True, caption=f"{f['label']}　請求項の部品：{names}")
 
     if res["unknown"]:
         st.markdown("#### 図面にあるのに【符号の説明】に無い符号")

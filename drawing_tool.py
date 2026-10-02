@@ -111,12 +111,48 @@ def _clean_name(name):
     return name
 
 
+_DOTS = re.compile(r"…+|\.{2,}|‥+|・{3,}")
+
+
+def _parse_dotted(t):
+    """「１１０…放熱装置 １１０ａ、３１０ａ…装着面 １２４ 1、１２４ 2…開口部」のように、符号と名前を「…」でつなぎ、
+    項目を空白で区切った並び。「１２４ 1」（下付きの 124₁）は「1241」にする。"""
+    sub_re = r"(\d+)[ \u3000]+(\d|n)(?=\s*[、,，)）]|\s*(?:…|\.\.|‥))"
+    subs = {m.group(1): m.group(1) + m.group(2) for m in re.finditer(sub_re, t)}
+    t = re.sub(sub_re, r"\1\2", t)
+    t = _DOTS.sub("⇒", t)
+    table, n_ok = {}, 0
+    for item in re.split(r"\s+(?=[^\s⇒]*⇒)", t.strip()):
+        if "⇒" not in item:
+            continue
+        codes, name = item.split("⇒", 1)
+        name = _clean_name(re.split(r"\s{2,}|\n", name.strip())[0])
+        if not name or not (re.search(r"[^\x00-\x7F]", name) or re.fullmatch(r"[A-Z][A-Za-z0-9\- ]+", name)):
+            continue
+        cs = [canon_code(c) for c in re.split(r"[、,，・()（）\s]+", codes) if c.strip()]
+        cs = [c for c in cs if _CODE_ONLY.match(c)]
+        if not cs:
+            continue
+        for c in cs:
+            table.setdefault(c, name)
+        n_ok += 1
+    # 図面では「124₁」の下付きの数字が読めず「124」になることがあるので、もとの番号でも引けるようにする
+    for base, full in subs.items():
+        if base not in table and full in table:
+            table[base] = table[full]
+    return table, n_ok
+
+
 def parse_sign_list(text, min_items=3):
     """【符号の説明】の並び（「１、１０１  半導体装置<改行>５  電力変換装置…」や
     「１　送風機、２　送風機、１０　歯車…」）を {符号: 名前} にする。
     読点は「符号どうしの区切り」と「項目どうしの区切り」の両方に使われるので、
     符号だけのかたまりは次の項目の符号にまとめる。"""
     t = nfkc(text)
+    if len(_DOTS.findall(t)) >= 3:
+        table, n_ok = _parse_dotted(t)
+        if n_ok >= min_items:
+            return table, n_ok, 0
     chunks = [c.strip() for c in re.split(r"[\n、,，;；]+", t) if c.strip()]
     table, pending, n_ok, n_bad = {}, [], 0, 0
     for ch in chunks:
@@ -1108,29 +1144,38 @@ def _leader_side(ink, box):
 
 def render_names(path, hits, names, bold_codes=(), keep_unknown=True):
     """図面の符号の数字を消し、その場所に部品の名前を書く。名前が分からない符号は数字のまま残す。
-    bold_codes（請求項の構成要素に当たる符号）は太字にする。色は使わない。"""
+    bold_codes（請求項の構成要素に当たる符号）は太字＋下線にする。色は使わない。
+    字の大きさは、その図の符号の数字の高さにそろえる（縦書き・回った数字の枠で字が大きくならないように）。"""
     base = Image.open(path).convert("RGB")
     ink = np.array(base.convert("L")) < 140
     W, H = base.size
     draw = ImageDraw.Draw(base)
+    todo = [h for h in hits if names.get(h["code"])]
+    if not todo:
+        return base, []
+    hs = [b[3] - b[1] for b in (h["box"] for h in todo) if (b[3] - b[1]) <= 1.3 * (b[2] - b[0])]
+    typical = float(np.median(hs)) if hs else 28.0
+    size0 = int(min(max(typical * 1.05, 16), H * 0.035))
+    # 1回目：名前にする数字をすべて消す（あとで書く名前を、ほかの数字の消し跡で欠けさせないため）
+    for h in todo:
+        x0, y0, x1, y1 = [int(v) for v in h["box"]]
+        draw.rectangle((x0 - 2, y0 - 2, x1 + 2, y1 + 2), fill=(255, 255, 255))
+    # 2回目：名前を書く
     placed, done = [], []
-    for hct in sorted(hits, key=lambda z: (z["box"][1], z["box"][0])):
-        code = hct["code"]
-        name = names.get(code)
-        if not name:
-            continue
-        x0, y0, x1, y1 = [int(v) for v in hct["box"]]
-        hgt = max(12, y1 - y0)
-        size = int(hgt * 1.0)
+    for h in sorted(todo, key=lambda z: (z["box"][1], z["box"][0])):
+        code, name = h["code"], names[h["code"]]
+        x0, y0, x1, y1 = [int(v) for v in h["box"]]
+        vertical = (y1 - y0) > 1.5 * (x1 - x0)
+        size = size0
         font = _font(size)
         tw = draw.textlength(name, font=font)
-        maxw = W * 0.28
+        maxw = W * 0.25
         if tw > maxw:                                   # 長い名前は字を小さくする
-            size = max(10, int(size * maxw / tw))
+            size = max(12, int(size * maxw / tw))
             font = _font(size)
             tw = draw.textlength(name, font=font)
-        th = size * 1.15
-        side = _leader_side(ink, (x0, y0, x1, y1))
+        th = size * 1.2
+        side = "none" if vertical else _leader_side(ink, (x0, y0, x1, y1))
         cy = (y0 + y1) / 2
         # 引き出し線と反対の向きへ名前をのばす（線が左から来ていれば右へ、右から来ていれば左へ）
         if side == "left":
@@ -1140,28 +1185,22 @@ def render_names(path, hits, names, bold_codes=(), keep_unknown=True):
         else:
             lx = (x0 + x1) / 2 - tw / 2
         ly = cy - th / 2
-        if side == "top":
-            ly = y0
-        elif side == "bottom":
-            ly = y1 - th
         lx = min(max(2, lx), W - tw - 2)
         ly = min(max(2, ly), H - th - 2)
         # ほかの名前と重なるときは、上下に少しずらす
         for k in (0, 1, -1, 2, -2, 3, -3):
-            ry = ly + k * (th + 3)
-            rect = (lx - 3, ry - 2, lx + tw + 3, ry + th + 2)
+            ry = ly + k * (th + 2)
+            rect = (lx - 2, ry - 1, lx + tw + 2, ry + th + 1)
             if 0 <= rect[1] and rect[3] <= H and not any(
                     not (rect[2] < r[0] or r[2] < rect[0] or rect[3] < r[1] or r[3] < rect[1]) for r in placed):
                 ly = ry
                 break
-        # もとの数字を消して、白い下地の上に名前を書く
-        draw.rectangle((x0 - 3, y0 - 3, x1 + 3, y1 + 3), fill=(255, 255, 255))
-        rect = (lx - 3, ly - 2, lx + tw + 3, ly + th + 2)
+        rect = (lx - 2, ly - 1, lx + tw + 2, ly + th + 1)
         draw.rectangle(rect, fill=(255, 255, 255))
         bold = code in bold_codes
         draw.text((lx, ly), name, font=font, fill=(0, 0, 0), stroke_width=1 if bold else 0, stroke_fill=(0, 0, 0))
         if bold:
-            draw.line((lx, ly + th + 1, lx + tw, ly + th + 1), fill=(0, 0, 0), width=max(2, size // 12))
+            draw.line((lx, ly + th, lx + tw, ly + th), fill=(0, 0, 0), width=max(2, size // 12))
         placed.append(rect)
         done.append(code)
     return base, done
