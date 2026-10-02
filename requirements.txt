@@ -19,3 +19,4 @@ ollama
 openai>=1.0
 opencv-python-headless
 pytesseract
+pypdfium2
